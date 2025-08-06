@@ -1,0 +1,9 @@
+{
+  "source_db_1": {
+    "host": "172.17.2.111",
+    "port": 1521,
+    "service": "PRAN",
+    "user": "sos",
+    "password": "sos"
+  }
+}
