@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Node / frontend
+node_modules/
+dist/
+*.log
+
+# Databases / Chroma / artifacts
+backend/chroma_db/
+backend/chroma_storage/
+*.sqlite3
+*.bin
+*.pickle
+
+# Secrets
+.env
+backend/.env
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+
+# Misc
+*.exe

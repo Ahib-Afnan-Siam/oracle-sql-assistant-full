@@ -1,45 +1,155 @@
 // src/components/FeedbackBox.tsx
 import { useState } from "react";
+import { useChat } from "./ChatContext";
 
 const FeedbackBox = () => {
-  const [submitted, setSubmitted] = useState(false);
+  const { lastIds } = useChat();
+  const turnId = lastIds?.turn_id;
+  const sqlSampleId = lastIds?.sql_sample_id ?? null;
+  const summarySampleId = lastIds?.summary_sample_id ?? null;
 
-  const handleFeedback = (type: "good" | "bad" | "improve") => {
-    // 🟡 Placeholder for future backend integration
-    console.log("Feedback submitted:", type);
-    setSubmitted(true);
+  const [submitted, setSubmitted] = useState(false);
+  const [mode, setMode] = useState<"idle" | "improve">("idle");
+  const [comment, setComment] = useState("");
+  const [posting, setPosting] = useState(false);
+
+  // Auto-select task_type without changing your UI
+  const pickTaskType = (): "summary" | "sql" | "overall" => {
+    if (summarySampleId) return "summary";
+    if (sqlSampleId) return "sql";
+    return "overall";
   };
+
+  const sendFeedback = async (
+    feedbackType: "good" | "wrong" | "needs_improvement",
+    improvementComment?: string
+  ) => {
+    if (!turnId) return;
+    const taskType = pickTaskType();
+    const body: any = {
+      turn_id: turnId,
+      task_type: taskType,
+      feedback_type: feedbackType,
+      labeler_role: "end_user",
+    };
+    if (taskType === "sql") body.sql_sample_id = sqlSampleId;
+    if (taskType === "summary") body.summary_sample_id = summarySampleId;
+    if (feedbackType === "needs_improvement") {
+      body.comment = improvementComment ?? "";
+    }
+
+    setPosting(true);
+    try {
+      await fetch("http://localhost:8090/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      setSubmitted(true);
+    } catch (e) {
+      console.error("Feedback submit failed:", e);
+      setSubmitted(true);
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  const handleQuick = (type: "good" | "wrong") => {
+    void sendFeedback(type);
+  };
+
+  const handleImproveClick = () => {
+    setMode("improve");
+  };
+
+  const handleImproveSubmit = () => {
+    if (!comment.trim()) return;
+    void sendFeedback("needs_improvement", comment.trim());
+  };
+
+  // 🔹 Early exits
+  if (!turnId) return null;
+  if (submitted) return null; // Vanish after submit
 
   return (
     <div className="flex justify-center mt-4">
       <div className="bg-white/90 px-6 py-4 rounded-xl border border-gray-200 shadow text-sm text-gray-800 max-w-md w-full text-center">
-        {!submitted ? (
-          <>
-            <p className="font-medium mb-3">Was this response helpful?</p>
-            <div className="flex justify-center gap-3">
-              <button
-                onClick={() => handleFeedback("good")}
-                className="px-3 py-1 rounded-full bg-green-100 hover:bg-green-200 text-green-800 text-xs font-semibold transition"
-              >
-                👍 Good
-              </button>
-              <button
-                onClick={() => handleFeedback("bad")}
-                className="px-3 py-1 rounded-full bg-red-100 hover:bg-red-200 text-red-800 text-xs font-semibold transition"
-              >
-                👎 Wrong
-              </button>
-              <button
-                onClick={() => handleFeedback("improve")}
-                className="px-3 py-1 rounded-full bg-yellow-100 hover:bg-yellow-200 text-yellow-800 text-xs font-semibold transition"
-              >
-                🛠 Needs update
-              </button>
+        <>
+          <p className="font-medium mb-3">Was this response helpful?</p>
+
+          <div className="flex justify-center gap-3">
+            <button
+              onClick={() => handleQuick("good")}
+              disabled={posting || !turnId}
+              className={`px-3 py-1 rounded-full bg-green-100 hover:bg-green-200 text-green-800 text-xs font-semibold transition ${
+                posting || !turnId ? "opacity-60 cursor-not-allowed" : ""
+              }`}
+              title={
+                !turnId
+                  ? "Please wait for the response to finish"
+                  : "Submit good feedback"
+              }
+            >
+              👍 Good
+            </button>
+
+            <button
+              onClick={() => handleQuick("wrong")}
+              disabled={posting || !turnId}
+              className={`px-3 py-1 rounded-full bg-red-100 hover:bg-red-200 text-red-800 text-xs font-semibold transition ${
+                posting || !turnId ? "opacity-60 cursor-not-allowed" : ""
+              }`}
+              title={
+                !turnId
+                  ? "Please wait for the response to finish"
+                  : "Submit wrong feedback"
+              }
+            >
+              👎 Wrong
+            </button>
+
+            <button
+              onClick={handleImproveClick}
+              disabled={posting || !turnId}
+              className={`px-3 py-1 rounded-full bg-yellow-100 hover:bg-yellow-200 text-yellow-800 text-xs font-semibold transition ${
+                posting || !turnId ? "opacity-60 cursor-not-allowed" : ""
+              }`}
+              title={
+                !turnId
+                  ? "Please wait for the response to finish"
+                  : "Suggest improvements"
+              }
+            >
+              🛠 Needs update
+            </button>
+          </div>
+
+          {mode === "improve" && (
+            <div className="mt-3 text-left">
+              <textarea
+                value={comment}
+                onChange={(e) => setComment(e.target.value)}
+                placeholder="What should be improved?"
+                className="w-full border rounded p-2 text-sm"
+                rows={3}
+                disabled={posting}
+              />
+              <div className="mt-2 flex justify-end">
+                <button
+                  onClick={handleImproveSubmit}
+                  disabled={posting || !comment.trim()}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
+                    posting || !comment.trim()
+                      ? "bg-gray-200 text-gray-500 cursor-not-allowed"
+                      : "bg-[#3b0764] text-white"
+                  }`}
+                >
+                  {posting ? "Submitting..." : "Submit"}
+                </button>
+              </div>
             </div>
-          </>
-        ) : (
-          <p className="text-green-600 text-sm font-medium">✅ Thanks for your feedback!</p>
-        )}
+          )}
+        </>
       </div>
     </div>
   );

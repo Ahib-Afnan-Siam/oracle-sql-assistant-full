@@ -5,14 +5,21 @@ import { useChat } from "./ChatContext";
 
 export default function ChatInput() {
   const [input, setInput] = useState("");
-  const { processMessage, isTyping, isPaused, setIsPaused } = useChat();
+  const {
+    processMessage,
+    isTyping,
+    isPaused,
+    setIsPaused,
+    selectedDB, // ✅ get selected DB from context
+  } = useChat();
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = input.trim();
     if (!trimmed || isTyping) return;
 
-    processMessage(trimmed);
+    // ✅ Send both message and selected_db
+    processMessage(trimmed, selectedDB);
     setInput("");
   };
 

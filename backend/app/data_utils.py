@@ -1,5 +1,5 @@
 import logging
-
+import datetime
 logger = logging.getLogger(__name__)
 
 def calculate_swing(rows: list, column_name: str) -> float:
@@ -32,3 +32,21 @@ def calculate_swing(rows: list, column_name: str) -> float:
     except Exception as e:
         logger.error(f"Swing calculation error: {str(e)}")
         return 0.0
+    
+def serialize_oracle_results(rows: list) -> list:
+    """Handle Oracle-specific types for JSON"""
+    def convert_value(v):
+        if v is None:
+            return None
+        if hasattr(v, 'read'):  # LOBs
+            return v.read()
+        if isinstance(v, (datetime.date, datetime.datetime)):
+            return v.isoformat()
+        if isinstance(v, bytes):
+            return v.decode('utf-8', errors='ignore')
+        return str(v)
+    
+    return [
+        {k: convert_value(v) for k, v in row.items()}
+        for row in rows
+    ]

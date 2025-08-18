@@ -1,3 +1,4 @@
+// src/components/ChatContext.tsx
 import React, {
   createContext,
   useContext,
@@ -9,22 +10,48 @@ import React, {
 
 type TableData = (string | number | null)[][];
 
+type OracleError = {
+  code?: string;
+  error?: string;
+  message?: string;
+  sql?: string;
+  missing_tables?: string[];
+  valid_columns?: string[];
+  validation_details?: any;
+  suggestion?: string;
+};
+
 type Message = {
   sender: "user" | "bot";
-  content: string | TableData;
+  content: string | TableData | OracleError;
   id: string;
-  type: "user" | "status" | "summary" | "table";
+  type: "user" | "status" | "summary" | "table" | "error";
+};
+
+type LastIds = {
+  turn_id?: number;
+  sql_sample_id?: number | null;
+  summary_sample_id?: number | null;
 };
 
 interface ChatContextType {
   messages: Message[];
-  addMessage: (message: Message) => void;
-  updateMessage: (id: string, content: string | TableData) => void; 
+  addMessage: (message: Message) => string;
+  updateMessage: (
+    id: string,
+    content: string | TableData | OracleError,
+    overrides?: Partial<Message>
+  ) => void;
   clearMessages: () => void;
-  processMessage: (userMessage: string) => void;
+  processMessage: (userMessage: string, selectedDB: string) => void;
   isTyping: boolean;
   isPaused: boolean;
   setIsPaused: (val: boolean) => void;
+  selectedDB: string;
+  setSelectedDB: (db: string) => void;
+
+  // ✅ expose IDs so FeedbackBox or others can post /feedback
+  lastIds: LastIds;
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
@@ -33,38 +60,35 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isTyping, setIsTyping] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [selectedDB, setSelectedDB] = useState("source_db_1");
+
+  // ✅ holds turn/sql/summary IDs for feedback
+  const [lastIds, setLastIds] = useState<LastIds>({});
+
   const abortControllerRef = useRef<AbortController | null>(null);
   const statusMessageIdRef = useRef<string | null>(null);
   const summaryStartedRef = useRef(false);
   const currentSummaryMessageIdRef = useRef<string | null>(null);
   const currentSummaryContentRef = useRef<string>("");
 
-  // Generate unique ID for messages
-  const generateId = () => `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const generateId = () =>
+    `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
   const addMessage = (message: Message) => {
-    const newMessage = { 
-      ...message, 
-      id: message.id || generateId() 
-    };
-    setMessages(prev => [...prev, newMessage]);
+    const newMessage = { ...message, id: message.id || generateId() };
+    setMessages((prev) => [...prev, newMessage]);
     return newMessage.id;
   };
 
-  // Update existing message content
-  const updateMessage = (id: string, content: string | TableData) => {
-    setMessages(prev => 
-      prev.map(msg => 
-        msg.id === id 
-          ? { ...msg, content }
-          : msg
-      )
+  // allow changing type via overrides
+  const updateMessage = (
+    id: string,
+    content: string | TableData | OracleError,
+    overrides?: Partial<Message>
+  ) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, ...overrides, content } : m))
     );
-  };
-
-  // Clear specific type of messages
-  const clearMessagesByType = (type: Message["type"]) => {
-    setMessages(prev => prev.filter(msg => msg.type !== type));
   };
 
   const clearMessages = () => {
@@ -73,36 +97,61 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
     summaryStartedRef.current = false;
     currentSummaryMessageIdRef.current = null;
     currentSummaryContentRef.current = "";
+    setLastIds({}); // ✅ also clear IDs when starting a new chat
   };
 
-  const processMessage = async (userMessage: string) => {
+  function stageToLabel(phase?: string, stage?: string, sql?: string) {
+    const label =
+      stage === "sql_gen"
+        ? "🧠 Generating SQL…"
+        : stage === "sql_ready"
+        ? "✅ SQL ready"
+        : stage === "validate"
+        ? "🔍 Validating SQL…"
+        : stage === "validate_ok"
+        ? "✅ Validation passed"
+        : stage === "execute"
+        ? "🏃 Executing query…"
+        : stage === "parsing"
+        ? "📦 Parsing rows…"
+        : stage === "summary_start"
+        ? "📝 Generating summary/report…"
+        : stage === "summary_stream"
+        ? phase || "📝 Summarizing…"
+        : stage === "done"
+        ? "✅ Done"
+        : phase || "Working…";
+
+    if (sql && (stage === "sql_ready" || stage === "execute")) {
+      return `${label}\n\n\`\`\`sql\n${sql}\n\`\`\``;
+    }
+    return label;
+  }
+
+  const processMessage = async (userMessage: string, selectedDB: string) => {
     if (!userMessage.trim()) return;
 
-    // Clear any previous abort controller
+    setIsPaused(false);
+
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
-    
-    // Create new abort controller
     abortControllerRef.current = new AbortController();
     const controller = abortControllerRef.current;
 
-    // Store original query for reference
-    const originalQuery = userMessage;
-    
-    // Add user message
-    addMessage({ 
-      sender: "user", 
-      content: originalQuery, 
+    addMessage({
+      sender: "user",
+      content: userMessage,
       id: generateId(),
-      type: "user"
+      type: "user",
     });
-    
-    // Reset state
+
+    // reset transient state
     statusMessageIdRef.current = null;
     summaryStartedRef.current = false;
     currentSummaryMessageIdRef.current = null;
     currentSummaryContentRef.current = "";
+    setLastIds({}); // ✅ reset IDs at the beginning of a new question
     setIsTyping(true);
 
     const rows: TableData = [];
@@ -110,19 +159,19 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
     let displayMode: string | null = null;
 
     try {
-      // Use original query in API call
-      const response = await fetch(
-        `http://localhost:8090/chat/stream?question=${encodeURIComponent(originalQuery)}`,
-        {
-          method: "GET",
-          signal: controller.signal,
-        }
-      );
+      const response = await fetch("http://localhost:8090/chat/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          question: userMessage,
+          selected_db: selectedDB,
+        }),
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+      });
 
       const reader = response.body?.getReader();
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
-
       if (!reader) throw new Error("No reader available");
 
       while (true) {
@@ -134,104 +183,160 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
         }
 
         buffer += decoder.decode(value, { stream: true });
-
-        const parts = buffer.split("\n\n");
+        // Handle both \n\n and \r\n\r\n chunk boundaries
+        const parts = buffer.split(/\r?\n\r?\n/);
         buffer = parts.pop() || "";
 
         for (const part of parts) {
           if (!part.startsWith("data:")) continue;
 
+          let parsed: any;
           try {
-            const line = part.replace(/^data:\s*/, "");
-            const parsed = JSON.parse(line);
+            const line = part.replace(/^data:\s*/, "").trim();
+            if (!line) continue;
+            parsed = JSON.parse(line);
+          } catch (e) {
+            console.warn("SSE JSON parse warning:", e, part);
+            continue;
+          }
 
-            // Capture display mode from backend
-            if (parsed.display_mode) {
-              displayMode = parsed.display_mode;
+          // display_mode passthrough
+          if (parsed.display_mode) displayMode = parsed.display_mode;
+
+          // ✅ capture IDs from server (turn_ready / sql_sample_ready / summary_sample_ready)
+          if (
+            parsed.ids &&
+            (parsed.stage === "turn_ready" ||
+              parsed.stage === "sql_sample_ready" ||
+              parsed.stage === "summary_sample_ready")
+          ) {
+            setLastIds((prev) => ({ ...prev, ...parsed.ids }));
+          }
+          // ✅ capture final combined IDs packet
+          if (parsed.stage === "feedback_ids" && parsed.ids) {
+            setLastIds((prev) => ({ ...prev, ...parsed.ids }));
+          }
+
+          // Ignore final "done" – summary already shown in same bubble
+          if (parsed.stage === "done") {
+            if (!summaryStartedRef.current && statusMessageIdRef.current) {
+              const id = statusMessageIdRef.current;
+              const label = stageToLabel(parsed.phase, parsed.stage);
+              updateMessage(id, label, { type: "status" });
+              setTimeout(() => {
+                setMessages((prev) => prev.filter((m) => m.id !== id));
+              }, 300);
             }
+            continue;
+          }
 
-            // Phase updates
-            if (parsed.phase) {
-              if (statusMessageIdRef.current) {
-                clearMessagesByType("status");
-              }
-              
-              const id = addMessage({ 
-                sender: "bot", 
-                content: parsed.phase, 
+          // 1) summary_start → keep status bubble; don't morph yet
+          if (parsed.stage === "summary_start") {
+            if (parsed.display_mode) displayMode = parsed.display_mode;
+            const label = stageToLabel(parsed.phase, parsed.stage);
+            if (!statusMessageIdRef.current) {
+              statusMessageIdRef.current = addMessage({
+                sender: "bot",
+                content: label,
                 id: generateId(),
-                type: "status"
+                type: "status",
+              });
+            } else {
+              updateMessage(statusMessageIdRef.current, label, { type: "status" });
+            }
+            summaryStartedRef.current = true;
+            continue;
+          }
+
+          // 2) Status updates (but NOT while streaming summary)
+          if (
+            parsed.phase &&
+            parsed.stage !== "summary_stream" &&
+            parsed.stage !== "summary_chunk" &&
+            parsed.stage !== "done"
+          ) {
+            const content = stageToLabel(parsed.phase, parsed.stage, parsed.sql);
+            if (!statusMessageIdRef.current) {
+              const id = addMessage({
+                sender: "bot",
+                content,
+                id: generateId(),
+                type: "status",
               });
               statusMessageIdRef.current = id;
+            } else {
+              updateMessage(statusMessageIdRef.current, content);
             }
+          }
 
-            if (parsed.error) {
-              clearMessagesByType("status");
-              addMessage({ 
-                sender: "bot", 
-                content: `❌ ${parsed.error}`,
-                type: "summary"
-              });
-              setIsTyping(false);
-              return;
-            }
-
-            if (parsed.columns) {
-              columns = parsed.columns;
-            } else if (parsed.rows) {
-              rows.push(...parsed.rows);
-            }
-
-            // Handle summary chunks
-            if (parsed.summary && (displayMode === "summary" || displayMode === "both")) {
-              if (!summaryStartedRef.current) {
-                clearMessagesByType("status");
-                summaryStartedRef.current = true;
-              }
-              
-              if (!currentSummaryMessageIdRef.current) {
-                // Create new message for first chunk
-                const id = addMessage({ 
-                  sender: "bot", 
-                  content: parsed.summary, 
-                  id: generateId(),
-                  type: "summary"
-                });
-                currentSummaryMessageIdRef.current = id;
-                currentSummaryContentRef.current = parsed.summary;
-              } else {
-                // Append to existing message
-                currentSummaryContentRef.current += "\n\n" + parsed.summary;
-                updateMessage(
-                  currentSummaryMessageIdRef.current, 
-                  currentSummaryContentRef.current
-                );
-              }
-            }
-          } catch (err) {
-            console.error("Streaming JSON parse error:", err, part);
-            clearMessagesByType("status");
-            addMessage({ 
-              sender: "bot", 
-              content: "⚠️ JSON parsing error.",
-              type: "summary"
+          // 3) Errors
+          if (parsed.error) {
+            addMessage({
+              sender: "bot",
+              content: parsed.error as OracleError,
+              id: generateId(),
+              type: "error",
             });
             setIsTyping(false);
             return;
           }
+
+          // 4) Columns/rows stream
+          if (parsed.columns) {
+            columns = parsed.columns;
+          } else if (parsed.rows) {
+            if (Array.isArray(parsed.rows)) rows.push(...parsed.rows);
+          }
+          if (parsed.partial_results?.rows) {
+            if (Array.isArray(parsed.partial_results.rows)) {
+              rows.push(...parsed.partial_results.rows);
+            }
+          }
+          if (parsed.results?.columns && Array.isArray(parsed.results.columns)) {
+            columns = parsed.results.columns;
+          }
+          if (parsed.results?.rows && Array.isArray(parsed.results.rows)) {
+            rows.push(...parsed.results.rows);
+          }
+
+          // 5) Summary chunks (morph on first chunk)
+          if (parsed.summary) {
+            if (!currentSummaryMessageIdRef.current) {
+              if (statusMessageIdRef.current) {
+                currentSummaryMessageIdRef.current = statusMessageIdRef.current;
+                updateMessage(statusMessageIdRef.current, "", { type: "summary" });
+                statusMessageIdRef.current = null;
+              } else {
+                const id = addMessage({
+                  sender: "bot",
+                  content: "",
+                  id: generateId(),
+                  type: "summary",
+                });
+                currentSummaryMessageIdRef.current = id;
+              }
+              currentSummaryContentRef.current = "";
+            }
+
+            currentSummaryContentRef.current +=
+              (currentSummaryContentRef.current ? "\n\n" : "") + parsed.summary;
+
+            updateMessage(
+              currentSummaryMessageIdRef.current,
+              currentSummaryContentRef.current
+            );
+            continue;
+          }
         }
       }
 
-      // Clear final status message
-      clearMessagesByType("status");
-      
-      // Add table if displayMode allows it and we have data
+      // Add table only when not pure-summary and we actually have rows
       if (displayMode !== "summary" && columns.length > 0 && rows.length > 0) {
-        addMessage({ 
-          sender: "bot", 
+        addMessage({
+          sender: "bot",
           content: [columns, ...rows],
           id: generateId(),
-          type: "table"
+          type: "table",
         });
       }
 
@@ -239,15 +344,16 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
     } catch (err: any) {
       if (err.name !== "AbortError") {
         console.error("Streaming failed:", err);
-        clearMessagesByType("status");
-        addMessage({ 
-          sender: "bot", 
+        addMessage({
+          sender: "bot",
           content: "⚠️ Error during processing.",
-          type: "summary"
+          type: "summary",
+          id: generateId(),
         });
       }
       setIsTyping(false);
     } finally {
+      // reset refs (do not remove messages)
       statusMessageIdRef.current = null;
       summaryStartedRef.current = false;
       currentSummaryMessageIdRef.current = null;
@@ -255,12 +361,9 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
     }
   };
 
-  // Clean up on unmount
   useEffect(() => {
     return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
+      if (abortControllerRef.current) abortControllerRef.current.abort();
     };
   }, []);
 
@@ -275,6 +378,9 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
         isTyping,
         isPaused,
         setIsPaused,
+        selectedDB,
+        setSelectedDB,
+        lastIds, // ✅ exposed
       }}
     >
       {children}
@@ -283,7 +389,7 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
 };
 
 export const useChat = (): ChatContextType => {
-  const context = useContext(ChatContext);
-  if (!context) throw new Error("useChat must be used within ChatProvider");
-  return context;
+  const ctx = useContext(ChatContext);
+  if (!ctx) throw new Error("useChat must be used within ChatProvider");
+  return ctx;
 };

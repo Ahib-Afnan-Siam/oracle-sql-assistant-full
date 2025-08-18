@@ -1,29 +1,53 @@
+# app/schema_loader_chroma.py
 import logging
+import os
 from tqdm import tqdm
-from app.db_connector import connect_to_source
-from app.embeddings import get_embedding
-from app.config import SOURCES
 import chromadb
 from chromadb.config import Settings
+import re
 
-COLLECTION_NAME = "schema_docs"
+from app.db_connector import connect_to_source
+from app.embeddings import get_embedding, encode_texts_batch
+from app.config import SOURCES
 
+import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
-def get_chroma_client():
-    return chromadb.PersistentClient(
-        path="chroma_db",
-        settings=Settings(anonymized_telemetry=False)
-    )
+from chromadb.telemetry.posthog import Posthog
+def _no_capture(*args, **kwargs):
+    return None
+Posthog.capture = _no_capture
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Semantic descriptions
+COLLECTION_PREFIX = "schema_docs"
+
+# --------- Ingest switches / limits via env ---------
+INCLUDE_VALUE_SAMPLES = os.getenv("INCLUDE_VALUE_SAMPLES", "false").lower() == "true"
+INCLUDE_NUMERIC_RANGES = os.getenv("INCLUDE_NUMERIC_RANGES", "false").lower() == "true"
+SCHEMA_MAX_TABLES = int(os.getenv("SCHEMA_MAX_TABLES", "0"))  # 0 = no cap
+SCHEMA_MAX_COLS_PER_TABLE = int(os.getenv("SCHEMA_MAX_COLS_PER_TABLE", "0"))  # 0 = no cap
+EMB_BATCH_SIZE = int(os.getenv("EMB_BATCH_SIZE", "64"))
+CHROMA_ADD_BATCH_SIZE = int(os.getenv("CHROMA_ADD_BATCH_SIZE", "512"))
+
+# Value sampling caps
+MAX_DISTINCT_SAMPLES = int(os.getenv("MAX_DISTINCT_SAMPLES", "8"))
+TEXT_TYPES = {"CHAR", "NCHAR", "NVARCHAR2", "VARCHAR2", "CLOB"}
+NUM_TYPES  = {"NUMBER", "FLOAT", "BINARY_FLOAT", "BINARY_DOUBLE"}
+
+def get_chroma_client(source_id: str):
+    # Mirror vector_store_chroma telemetry setting & persistence
+    return chromadb.PersistentClient(
+        path=f"chroma_storage/{source_id}",
+        settings=Settings(anonymized_telemetry=False)
+    )
+
+# ---------------- COLUMN_HINTS ----------------
 COLUMN_HINTS = {
     "DEPTNO": "Department number",
     "DNAME": "Department name",
     "LOC": "Location of department",
-
     "EMPNO": "Employee ID",
     "ENAME": "Employee name",
     "JOB": "Job title",
@@ -31,7 +55,6 @@ COLUMN_HINTS = {
     "HIREDATE": "Date of hire",
     "SAL": "Salary",
     "COMM": "Commission",
-    
     "ID": "Generic identifier (could be task or record)",
     "TASK_NAME": "Full name of the task",
     "TASK_SHORT_NAME": "Abbreviated task name",
@@ -39,7 +62,6 @@ COLUMN_HINTS = {
     "STATUS_ACTIVE": "Active status flag",
     "TASK_GROUP": "Task grouping or category",
     "TASK_OWNER": "Responsible person or role",
-
     "A_DATE": "Activity or record date",
     "LOCATION_NAME": "Location description",
     "BU_NAME": "Business unit name",
@@ -49,277 +71,258 @@ COLUMN_HINTS = {
     "TOTAL_PRESENTS": "Total number of presents",
     "OT_HOUR": "Overtime hours",
     "OT_AMOUNT": "Overtime payment amount",
-    "LOCATIONID": "Location ID",
-    "BUID": "Business unit ID",
-    "SECTIONID": "Section ID",
-    "SUID": "Subunit ID",
-    "LINEID": "Line ID",
-
-    "COMP_ID": "Company ID",
-    "COMP_NAME": "Company name",
-    "COMP_ADDR": "Company address",
-    "COMP_CNCL": "Cancel flag for company",
-
-    "DEPT_NAME": "Name of department",
-    "DEPT_CTPR": "Department contact person",
-    "DEPT_MOBI": "Department mobile",
-    "DEPT_EMAL": "Department email",
-    "DEPT_CNCL": "Cancel status of department",
-
-    "LIMP_ID": "Link map ID",
-    "LIMP_FLIN": "From line",
-    "LIMP_TLIN": "To line",
-    "LIMP_CNCL": "Cancel flag",
-
-    "LNSM_ID": "Line shift mapping ID",
-    "LNSM_DATE": "Mapping date",
-    "LNSM_PFLN": "Production floor line",
-    "LNSM_STAT": "Status code",
-    "LNSM_RMAK": "Remarks",
-
-    "LOCT_ID": "Location ID",
-    "LOCT_NAME": "Location name",
-    "LOCT_ADDR": "Location address",
-    "LOCT_STA": "Location status",
-
-    "NPTD_DATE": "Non-productive time date",
-    "NPTD_NPTT": "NPT type",
-    "NPTD_NPTM": "NPT reason or name",
-    "NPTD_STME": "Start time",
-    "NPTD_ETME": "End time",
-    "NPTD_UNIT": "Unit",
-    "NPTD_LINE": "Line name",
-    "NPTD_BUYR": "Buyer",
-    "NPTD_STYL": "Style",
-    "NPTD_CLST": "Cluster",
-
-    "NPTM_NAMR": "NPT master name",
-    "NPTM_DEPT": "Department",
-    "NPTM_CNCL": "Cancel flag",
-    "NPTM_SVRT": "Severity or version",
-
     "BUYER_NAME": "Buyer name",
-    "STYLEPO": "Style PO",
     "STYLE": "Garment style",
-    "ITEM_NAME": "Item name",
-    "FACTORY": "Factory name",
     "POQTY": "Purchase order quantity",
-    "CUTQTY": "Cut quantity",
-    "SINPUT": "Sewing input",
     "SOUTPUT": "Sewing output",
     "SHIPQTY": "Shipment quantity",
-    "LEFTQTY": "Leftover quantity",
-    "FOBP": "FOB price",
-    "SMV": "Standard minute value",
-    "CM": "Cost of manufacturing",
-    "CEFFI": "Cutting efficiency",
-    "AEFFI": "Actual efficiency",
-    "CMER": "Cost per merchandiser",
-    "ACM": "Average CM",
-    "EXMAT": "Extra material",
-    "SHIPDATE": "Shipment date",
-
-    "PFLN_ID": "Production floor line ID",
-    "PFLN_UNLC": "Unit location",
-    "PFLN_NAME": "Line name",
-    "PFLN_CNNM": "Contact name",
-    "PFLN_CNEM": "Contact email",
-    "PFLN_CNMB": "Contact mobile",
-    "PFLN_CNID": "Contact ID",
-    "PFLN_TYPE": "Line type",
-    "PFLN_COMP": "Company",
-
-    "PROD_DATE": "Production date",
-    "FLOOR_NAME": "Factory floor name",
-    "PM_OR_APM_NAME": "PM or APM in charge",
-    "FLOOR_EF": "Floor efficiency",
-    "DHU": "Defects per hundred units",
     "DEFECT_QTY": "Defect quantity",
     "PRODUCTION_QTY": "Produced quantity",
-    "DEFECT_PERS": "Defect percentage",
-    "UNCUT_THREAD": "Uncut thread count",
-    "DIRTY_STAIN": "Dirty or stained items",
-    "BROKEN_STITCH": "Broken stitches",
-    "SKIP_STITCH": "Skipped stitches",
-    "OPEN_SEAM": "Open seams",
-    "LAST_UPDATE": "Last update timestamp",
-    "AC_PRODUCTION_HOUR": "Actual production hours",
-    "AC_WORKING_HOUR": "Actual working hours",
-
-    "PROT_ID": "Protocol ID",
-    "PROT_DESC": "Protocol description",
-
-    "SMSG": "Message",
-    "SMSG_TIME": "Timestamp",
-    "SMSG_DATE": "Message date",
-    "SMSG_USER": "Message user",
-    "SMSG_STAT": "Message status",
-    "SMSG_NOTE": "Message notes",
-    "SMSG_CLSU": "Closed by user",
-    "SMSG_CLSC": "Close comment",
-    "SMSG_CLSD": "Close date",
-    "SMSG_COMP": "Company involved",
-
-    "SSIS_ID": "Session issue ID",
-    "SSIS_ISSM": "Issue name",
-    "SSIS_CNCL": "Cancellation flag",
-
-    "USER_ID": "User ID",
-    "USERNAME": "Username",
+    "FLOOR_EF": "Floor efficiency",
+    "CM": "Cost of manufacturing",
+    "SMV": "Standard minute value",
     "FULL_NAME": "Full name",
-    "PHONE_NUMBER": "Phone number",
     "EMAIL_ADDRESS": "Email address",
-    "IMAGE": "User image",
     "IS_ACTIVE": "Active flag",
     "PIN": "User PIN",
-    "FILENAME": "Uploaded file name",
-    "LAST_UPDATED": "Last updated timestamp",
-    "ADDED_DATE": "Added to system",
-    "UPDATE_DATE": "Updated on",
-    "MIME_TYPE": "MIME type",
-    "LAST_LOGIN": "Last login time",
+    "LAST_LOGIN": "Last login time"
 }
 
+def generate_table_description(table_name: str) -> str:
+    t = table_name.lower()
+    if "emp" in t or "employee" in t:
+        return "Table containing employee data such as personal details, salaries, and job roles."
+    elif "dept" in t or "department" in t:
+        return "Table containing department details including department name and location."
+    elif "task" in t or "tna" in t:
+        return "Table containing task details related to Time and Action management."
+    elif "order" in t:
+        return "Table containing order details including order information, quantities, and statuses."
+    elif "transaction" in t:
+        return "Table storing transaction details related to various processes."
+    elif "details" in t:
+        return "Table containing detailed information related to specific records."
+    elif "mst" in t:
+        return "Master table containing key reference data for a specific entity."
+    elif "inventory" in t or "inv" in t:
+        return "Table containing inventory-related data, including stock and transactions."
+    elif "comment" in t:
+        return "Table containing comments or notes related to specific records or transactions."
+    elif "consume" in t:
+        return "Table storing data about consumption of resources, such as materials or goods."
+    elif "charge" in t:
+        return "Table containing information about charges, fees, or costs associated with records."
+    elif "contract" in t:
+        return "Table storing contract details including contract amendments and related information."
+    elif "tc" in t:
+        return "Table containing transaction or receipt details related to specific processes."
+    else:
+        return f"Table '{table_name}' contains unspecified data."
 
-# Synonyms to improve match
-COLUMN_SYNONYMS = {
-    "DEPTNO": ["department number", "dept no", "dept id"],
-    "DNAME": ["department name", "dept name"],
-    "LOC": ["location of department", "location"],
+def create_table_descriptions(tables):
+    return {table: generate_table_description(table) for table in tables}
 
-    "EMPNO": ["employee id", "emp id", "employee number"],
-    "ENAME": ["employee name", "name", "emp name"],
-    "JOB": ["job title", "designation", "role", "position"],
-    "MGR": ["manager id", "supervisor id"],
-    "HIREDATE": ["hire date", "joining date", "date of hire"],
-    "SAL": ["salary", "pay", "monthly salary"],
-    "COMM": ["commission", "bonus"],
+def _safe_id_fragment(s: str) -> str:
+    s = (s or "")[:128]
+    return re.sub(r"[\s\r\n\t]+", "_", s)
 
-    "ID": ["record id", "task id", "generic id"],
-    "TASK_NAME": ["task name", "full task name"],
-    "TASK_SHORT_NAME": ["task short name", "task code"],
-    "TASK_TYPE": ["task type", "task category"],
-    "STATUS_ACTIVE": ["status", "active flag", "is active"],
-    "TASK_GROUP": ["task group", "group name"],
-    "TASK_OWNER": ["task owner", "responsible person"],
+def _sample_text_values(cursor, table: str, column: str):
+    if not INCLUDE_VALUE_SAMPLES:
+        return []
+    sql = f"""
+        SELECT {column} AS val, COUNT(*) AS c
+        FROM {table}
+        WHERE {column} IS NOT NULL
+        GROUP BY {column}
+        ORDER BY COUNT(*) DESC
+        FETCH FIRST {MAX_DISTINCT_SAMPLES} ROWS ONLY
+    """
+    try:
+        cursor.execute(sql)
+        out = []
+        for r in cursor:
+            v = r[0]
+            if hasattr(v, "read"):
+                v = v.read()
+            if isinstance(v, bytes):
+                try:
+                    v = v.decode("utf-8", errors="ignore")
+                except Exception:
+                    v = str(v)
+            out.append((str(v), int(r[1])))
+        return out
+    except Exception as e:
+        logger.debug(f"[ValueSample] Skip {table}.{column}: {e}")
+        return []
 
-    "A_DATE": ["activity date", "date"],
-    "LOCATION_NAME": ["location name", "location"],
-    "BU_NAME": ["business unit name", "unit name"],
-    "SECTION_NAME": ["section name", "section"],
-    "LINE_NAME": ["line name", "production line"],
-    "SUBUNIT_NAME": ["subunit name", "team name"],
-    "TOTAL_PRESENTS": ["total presents", "present count", "attendance count"],
-    "OT_HOUR": ["overtime hours", "ot"],
-    "OT_AMOUNT": ["ot amount", "overtime pay"],
-
-    "COMP_ID": ["company id"],
-    "COMP_NAME": ["company name"],
-    "COMP_ADDR": ["company address"],
-    "COMP_CNCL": ["cancel flag"],
-
-    "DEPT_NAME": ["department name", "dept name"],
-    "DEPT_CTPR": ["contact person"],
-    "DEPT_MOBI": ["mobile", "phone"],
-    "DEPT_EMAL": ["email", "department email"],
-    "DEPT_CNCL": ["department cancel"],
-
-    "LOCT_NAME": ["location name"],
-    "LOCT_ADDR": ["location address"],
-    "LOCT_STA": ["location status"],
-
-    "BUYER_NAME": ["buyer", "buyer name"],
-    "STYLEPO": ["style po", "style purchase order"],
-    "STYLE": ["style", "garment style"],
-    "ITEM_NAME": ["item name", "product name"],
-    "FACTORY": ["factory", "factory name"],
-    "POQTY": ["po quantity", "purchase quantity"],
-    "SHIPQTY": ["shipment quantity", "shipped"],
-    "SHIPDATE": ["shipment date", "delivery date"],
-
-    "PROD_DATE": ["production date", "prod date"],
-    "FLOOR_NAME": ["floor name", "factory floor"],
-    "PM_OR_APM_NAME": ["pm name", "apm name"],
-    "FLOOR_EF": ["efficiency", "floor efficiency"],
-    "DHU": ["defects per hundred", "dhu"],
-    "DEFECT_QTY": ["defect quantity", "defects"],
-    "PRODUCTION_QTY": ["produced quantity", "output quantity"],
-    "DEFECT_PERS": ["defect percentage", "defect rate"],
-    "UNCUT_THREAD": ["uncut threads"],
-    "DIRTY_STAIN": ["dirty items", "stains"],
-    "BROKEN_STITCH": ["broken stitch", "stitch issues"],
-    "SKIP_STITCH": ["skip stitch", "stitch error"],
-    "OPEN_SEAM": ["open seam", "open stitching"],
-
-    "FULL_NAME": ["full name", "name"],
-    "USERNAME": ["username", "user name"],
-    "EMAIL_ADDRESS": ["email", "email address"],
-    "PHONE_NUMBER": ["phone", "phone number"],
-    "USER_ID": ["user id", "uid"],
-    "IS_ACTIVE": ["active", "status"],
-    "PIN": ["pin", "user pin"]
-}
-
-
-def enrich_column(col_name: str, col_type: str) -> str:
-    desc = COLUMN_HINTS.get(col_name.upper(), "No description available")
-    synonyms = COLUMN_SYNONYMS.get(col_name.upper(), [])
-    line = f"- {col_name} ({col_type}): {desc}"
-    if synonyms:
-        line += f" [Synonyms: {', '.join(synonyms)}]"
-    return line
+def _sample_numeric_range(cursor, table: str, column: str):
+    if not INCLUDE_NUMERIC_RANGES:
+        return None
+    # Skip MEDIAN to avoid sort cost
+    sql = f"SELECT MIN({column}), AVG({column}), MAX({column}) FROM {table}"
+    try:
+        cursor.execute(sql)
+        r = cursor.fetchone()
+        return r if r and r[0] is not None and r[2] is not None else None
+    except Exception as e:
+        logger.debug(f"[ValueRange] Skip {table}.{column}: {e}")
+        return None
 
 def load_schema_to_chroma():
-    source_db = SOURCES[0]
+    for source in SOURCES:
+        source_id = source["id"]
+        collection_name = f"{COLLECTION_PREFIX}_{source_id}"
 
-    with connect_to_source(source_db) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT table_name FROM user_tables")
-        tables = [row[0] for row in cursor.fetchall()]
+        logger.info(f"\n🔄 Loading schema for DB: {source_id}")
+        chroma_client = get_chroma_client(source_id)
 
-        chroma_client = get_chroma_client()
-        if COLLECTION_NAME in [c.name for c in chroma_client.list_collections()]:
-            chroma_client.delete_collection(name=COLLECTION_NAME)
-        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+        # Clean old collection
+        try:
+            existing = [c.name for c in chroma_client.list_collections()]
+            if collection_name in existing:
+                chroma_client.delete_collection(name=collection_name)
+        except Exception as e:
+            logger.warning(f"Could not clean old collection '{collection_name}': {e}")
 
-        total_loaded = 0
-        for table in tqdm(tables, desc="Batches"):
-            cursor.execute(f"""
-                SELECT column_name, data_type
-                FROM user_tab_columns
-                WHERE table_name = :table_name
-                ORDER BY column_id
-            """, [table])
-            columns = cursor.fetchall()
-            if not columns:
-                continue
+        collection = chroma_client.get_or_create_collection(name=collection_name)
 
-            # Build enriched schema chunk
-            chunk_lines = [f"TABLE: {table}"]
-            chunk_lines.append(f"This table stores data related to {table.lower().replace('_', ' ')}.")
-            chunk_lines.append("COLUMNS:")
-            column_names = []
+        total_tables = 0
+        total_columns = 0
+        value_docs = 0
+        range_docs = 0
 
-            for col_name, col_type in columns:
-                chunk_lines.append(enrich_column(col_name, col_type))
-                column_names.append(col_name)
+        try:
+            with connect_to_source(source_id) as (conn, _):
+                cursor = conn.cursor()
+                cursor.execute("SELECT table_name FROM user_tables")
+                tables = [row[0] for row in cursor.fetchall()] or []
 
-            chunk_lines.append(f"KEYWORDS: {table.upper()}, {', '.join(column_names)}")
-            chunk_text = "\n".join(chunk_lines)
-            embedding = get_embedding(chunk_text)
-            doc_id = f"{table}_schema"
+                if SCHEMA_MAX_TABLES > 0:
+                    tables = tables[:SCHEMA_MAX_TABLES]
 
-            collection.add(
-                documents=[chunk_text],
-                embeddings=[embedding],
-                ids=[doc_id],
-                metadatas=[{"source_table": table}]
-            )
+                table_descriptions = create_table_descriptions(tables)
 
-            logger.info(f"[✓] Loaded: {table} → {len(columns)} columns")
-            total_loaded += 1
+                # ---------- TABLE DOCS (batched) ----------
+                table_docs, table_ids, table_metas = [], [], []
+                for table in tables:
+                    table_desc = table_descriptions.get(table.upper(), "No description available for this table")
+                    content = f"Table '{table}' from {source_id.upper()} database. Description: {table_desc}"
+                    doc_id = f"{source_id}.{table}"
+                    table_docs.append(content)
+                    table_ids.append(doc_id)
+                    table_metas.append({"source_table": table, "source_id": source_id, "kind": "table"})
+                table_embs = encode_texts_batch(table_docs, batch_size=EMB_BATCH_SIZE)
 
-    logger.info(f"\n✅ Total Tables Loaded into ChromaDB: {total_loaded}")
+                # Add tables in large batches
+                for i in range(0, len(table_docs), CHROMA_ADD_BATCH_SIZE):
+                    collection.add(
+                        documents=table_docs[i:i+CHROMA_ADD_BATCH_SIZE],
+                        embeddings=table_embs[i:i+CHROMA_ADD_BATCH_SIZE],
+                        ids=table_ids[i:i+CHROMA_ADD_BATCH_SIZE],
+                        metadatas=table_metas[i:i+CHROMA_ADD_BATCH_SIZE],
+                    )
+                    total_tables += len(table_ids[i:i+CHROMA_ADD_BATCH_SIZE])
+
+                # ---------- COLUMNS + OPTIONAL VALUE/RANGE (stream batched) ----------
+                for table in tqdm(tables, desc=f"{source_id} Tables"):
+                    cursor.execute("""
+                        SELECT column_name, data_type
+                        FROM user_tab_columns
+                        WHERE table_name = :table_name
+                        ORDER BY column_id
+                    """, [table])
+                    cols = cursor.fetchall() or []
+
+                    if SCHEMA_MAX_COLS_PER_TABLE > 0:
+                        cols = cols[:SCHEMA_MAX_COLS_PER_TABLE]
+
+                    # build column docs first
+                    col_docs, col_ids, col_metas = [], [], []
+                    for col_name, col_type in cols:
+                        desc = COLUMN_HINTS.get(col_name.upper(), "No description available")
+                        col_doc = (
+                            f"Column '{col_name}' in table '{table}' from {source_id.upper()} database. "
+                            f"Type: {col_type}. Purpose: {desc}"
+                        )
+                        col_id = f"{source_id}.{table}.{col_name}"
+                        col_docs.append(col_doc)
+                        col_ids.append(col_id)
+                        col_metas.append({
+                            "source_table": table,
+                            "source_id": source_id,
+                            "column": col_name,
+                            "type": col_type,
+                            "kind": "column"
+                        })
+
+                    # embed columns in batch
+                    if col_docs:
+                        col_embs = encode_texts_batch(col_docs, batch_size=EMB_BATCH_SIZE)
+                        # push to collection in chunks
+                        for i in range(0, len(col_docs), CHROMA_ADD_BATCH_SIZE):
+                            collection.add(
+                                documents=col_docs[i:i+CHROMA_ADD_BATCH_SIZE],
+                                embeddings=col_embs[i:i+CHROMA_ADD_BATCH_SIZE],
+                                ids=col_ids[i:i+CHROMA_ADD_BATCH_SIZE],
+                                metadatas=col_metas[i:i+CHROMA_ADD_BATCH_SIZE]
+                            )
+                            total_columns += len(col_ids[i:i+CHROMA_ADD_BATCH_SIZE])
+
+                    # Optional value/range docs (kept tiny)
+                    for col_name, col_type in cols:
+                        dtype = str(col_type or "").upper()
+                        # text samples
+                        if INCLUDE_VALUE_SAMPLES and any(t in dtype for t in TEXT_TYPES):
+                            samples = _sample_text_values(cursor, table, col_name)
+                            if samples:
+                                v_docs, v_ids, v_metas = [], [], []
+                                for val, cnt in samples:
+                                    pv = val[:256]
+                                    v_docs.append(f"VALUE '{pv}' appears in {source_id}.{table}.{col_name} (frequency ~{cnt}).")
+                                    v_ids.append(f"{source_id}.{table}.{col_name}::VAL::{_safe_id_fragment(pv)}")
+                                    v_metas.append({
+                                        "source_table": table, "source_id": source_id,
+                                        "column": col_name, "kind": "column_value",
+                                        "value": pv, "freq": cnt
+                                    })
+                                v_embs = encode_texts_batch(v_docs, batch_size=EMB_BATCH_SIZE)
+                                for i in range(0, len(v_docs), CHROMA_ADD_BATCH_SIZE):
+                                    collection.add(
+                                        documents=v_docs[i:i+CHROMA_ADD_BATCH_SIZE],
+                                        embeddings=v_embs[i:i+CHROMA_ADD_BATCH_SIZE],
+                                        ids=v_ids[i:i+CHROMA_ADD_BATCH_SIZE],
+                                        metadatas=v_metas[i:i+CHROMA_ADD_BATCH_SIZE]
+                                    )
+                                    value_docs += len(v_ids[i:i+CHROMA_ADD_BATCH_SIZE])
+
+                        # numeric range (min/avg/max only)
+                        if INCLUDE_NUMERIC_RANGES and any(t in dtype for t in NUM_TYPES):
+                            rng = _sample_numeric_range(cursor, table, col_name)
+                            if rng:
+                                mn, avg, mx = rng
+                                doc = f"RANGE for {source_id}.{table}.{col_name}: min {mn}, avg {avg}, max {mx}."
+                                rid = f"{source_id}.{table}.{col_name}::RANGE"
+                                emb = get_embedding(doc)
+                                collection.add(
+                                    documents=[doc], embeddings=[emb], ids=[rid],
+                                    metadatas=[{
+                                        "source_table": table, "source_id": source_id,
+                                        "column": col_name, "kind": "column_range",
+                                        "min": mn, "avg": avg, "max": mx
+                                    }]
+                                )
+                                range_docs += 1
+
+                # ✅ No explicit persist() needed with PersistentClient
+                logger.info(
+                    f"✅ {source_id}: {total_tables} table docs, {total_columns} column docs"
+                    + (f", {value_docs} value docs" if INCLUDE_VALUE_SAMPLES else "")
+                    + (f", {range_docs} range docs" if INCLUDE_NUMERIC_RANGES else "")
+                    + " indexed."
+                )
+
+        except Exception as e:
+            logger.error(f"❌ Failed to load {source_id}: {e}", exc_info=True)
 
 if __name__ == "__main__":
     load_schema_to_chroma()

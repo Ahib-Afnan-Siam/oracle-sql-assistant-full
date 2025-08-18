@@ -4,45 +4,128 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Bot, User } from "lucide-react";
 
+type OracleError = {
+  error: string;
+  message?: string;
+  valid_columns?: string[];
+  sql?: string;
+  missing_tables?: string[];
+};
+
 type Message = {
   sender: "user" | "bot";
-  content: string | (string | number | null)[][];
+  content: string | (string | number | null)[][] | OracleError;
   id: string;
-  type: "user" | "status" | "summary" | "table";
+  type: "user" | "status" | "summary" | "table" | "error";
 };
 
 interface Props {
   message: Message;
 }
 
+const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
+  let errorData: OracleError | null = null;
+  try {
+    errorData = typeof error === "string" ? JSON.parse(error) : error;
+  } catch {
+    errorData = {
+      error: typeof error === "string" ? error : "Unknown error",
+      message: typeof error === "string" ? error : "An unexpected error occurred",
+    };
+  }
+
+  if (!errorData?.error) {
+    return (
+      <div className="text-red-600">
+        ⚠️ {typeof error === "string" ? error : "Unknown error"}
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-red-50 p-3 rounded-lg border border-red-200">
+      <div className="font-bold text-red-800 flex items-start gap-2">
+        <span>⚠️</span>
+        <span>{errorData.message || errorData.error}</span>
+      </div>
+
+      {errorData.missing_tables?.length ? (
+        <div className="mt-2">
+          <p className="text-sm font-semibold text-gray-700">Missing tables:</p>
+          <div className="flex flex-wrap gap-1 mt-1">
+            {errorData.missing_tables.map((t: string) => (
+              <span
+                key={t}
+                className="bg-red-100 text-red-800 px-2 py-1 rounded text-xs"
+              >
+                {t}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {errorData.sql ? (
+        <div className="mt-3 bg-gray-800 text-gray-100 p-2 rounded text-xs font-mono overflow-x-auto">
+          <div className="text-gray-400 text-xs mb-1">Generated SQL:</div>
+          <code>{errorData.sql}</code>
+        </div>
+      ) : null}
+
+      {errorData.valid_columns?.length ? (
+        <div className="mt-3">
+          <p className="text-sm font-semibold text-gray-700">Available columns:</p>
+          <ul className="list-disc pl-5 text-sm text-gray-700 mt-1">
+            {errorData.valid_columns.map((col: string) => (
+              <li key={col} className="py-0.5">
+                <code className="bg-gray-100 px-1 rounded">{col}</code>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      <div className="mt-3 text-xs text-gray-500">
+        Need help? Try rephrasing your question or check the column names.
+      </div>
+    </div>
+  );
+};
+
 const MessageBubble: React.FC<Props> = ({ message }) => {
-  const { sender, content, type } = message;
-  const [displayedContent, setDisplayedContent] = useState("");
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const { sender, content, type, id } = message;
 
+  // typing effect for summary only
+  const [displayed, setDisplayed] = useState("");
+  const [idx, setIdx] = useState(0);
+
+  // reset when a new message arrives or the type changes
   useEffect(() => {
-    if (typeof content !== "string") return;
-    setDisplayedContent("");
-    setCurrentIndex(0);
-  }, [content]);
+    if (type !== "summary") return;
+    setDisplayed("");
+    setIdx(0);
+  }, [id, type]);
 
+  // type until we reach current content length
   useEffect(() => {
-    if (typeof content !== "string" || currentIndex >= content.length) return;
+    if (type !== "summary" || typeof content !== "string") return;
+    if (idx >= content.length) return;
 
-    const timer = setTimeout(() => {
-      setDisplayedContent((prev) => prev + content.charAt(currentIndex));
-      setCurrentIndex((prev) => prev + 1);
-    }, type === "summary" ? 10 : 0);
+    const t = setTimeout(() => {
+      setDisplayed(content.slice(0, idx + 1));
+      setIdx((v) => v + 1);
+    }, 10);
 
-    return () => clearTimeout(timer);
-  }, [currentIndex, content, type]);
+    return () => clearTimeout(t);
+  }, [idx, content, type]);
 
-  const bubbleStyle = {
+  const bubbleStyle: Record<Message["type"], string> = {
     user: "bg-purple-600 text-white",
     bot: "bg-white text-gray-900 border border-gray-300 shadow-sm",
     status: "bg-yellow-50 text-gray-600 italic",
     table: "bg-white text-gray-900 border border-gray-200 shadow",
     summary: "bg-gray-100 text-gray-800",
+    error: "bg-red-50 border-red-200",
   };
 
   const renderContent = () => {
@@ -50,16 +133,20 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
       return (
         <div className="flex items-center space-x-2">
           <span className="text-xs animate-pulse">•</span>
-          <span className="text-sm">{content}</span>
+          <span className="text-sm">{String(content)}</span>
         </div>
       );
     }
 
     if (typeof content === "string") {
-      const displayText = type === "summary" ? displayedContent : content;
+      if (content.startsWith("{") || (content.includes("ORA-") && content.includes(":"))) {
+        return <OracleErrorDisplay error={content} />;
+      }
+
+      const text = type === "summary" ? displayed : content;
       return (
         <ReactMarkdown
-          children={displayText}
+          children={text}
           remarkPlugins={[remarkGfm]}
           components={{
             table: (props) => (
@@ -73,9 +160,7 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
             ),
             td: (props) => (
               <td className="border px-2 py-1 text-sm">
-                {props.children === null || props.children === undefined
-                  ? "—"
-                  : props.children}
+                {props.children ?? "—"}
               </td>
             ),
             ol: (props) => <ol className="list-decimal pl-5 my-2" {...props} />,
@@ -84,6 +169,9 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
             p: (props) => <p className="my-2" {...props} />,
             strong: (props) => <strong className="font-semibold" {...props} />,
             em: (props) => <em className="italic" {...props} />,
+            code: (props) => (
+              <code className="bg-gray-100 px-1 rounded font-mono text-sm" {...props} />
+            ),
           }}
         />
       );
@@ -95,19 +183,19 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
           <table className="table-auto border-collapse w-full">
             <thead className="bg-gray-200">
               <tr>
-                {content[0]?.map((cell, idx) => (
-                  <th key={idx} className="border px-2 py-1 font-semibold text-sm">
+                {content[0]?.map((cell, i) => (
+                  <th key={i} className="border px-2 py-1 font-semibold text-sm">
                     {cell}
                   </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {content.slice(1).map((row, i) => (
-                <tr key={i}>
-                  {row.map((cell, j) => (
-                    <td key={j} className="border px-2 py-1 text-sm">
-                      {cell === null || cell === undefined ? "—" : cell}
+              {content.slice(1).map((row, r) => (
+                <tr key={r}>
+                  {row.map((cell, c) => (
+                    <td key={c} className="border px-2 py-1 text-sm">
+                      {cell ?? "—"}
                     </td>
                   ))}
                 </tr>
@@ -116,6 +204,10 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
           </table>
         </div>
       );
+    }
+
+    if (typeof content === "object" && content && "error" in content) {
+      return <OracleErrorDisplay error={content} />;
     }
 
     return null;
@@ -127,7 +219,6 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
         sender === "user" ? "ml-auto justify-end flex-row-reverse" : ""
       }`}
     >
-      {/* ✅ Avatar section using Lucide icons */}
       <div className="pt-1 flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 shadow-sm">
         {sender === "user" ? (
           <User size={16} className="text-purple-600" />
@@ -136,16 +227,15 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
         )}
       </div>
 
-      {/* ✅ Message bubble */}
       <div
         className={`rounded-2xl px-4 py-2 mb-1 text-sm max-w-[80%] ${
-          bubbleStyle[type] || bubbleStyle.bot
+          bubbleStyle[type]
         }`}
       >
         {renderContent()}
         {type === "summary" &&
           typeof content === "string" &&
-          currentIndex < content.length && <span className="animate-pulse">|</span>}
+          idx < content.length && <span className="animate-pulse">|</span>}
       </div>
     </div>
   );

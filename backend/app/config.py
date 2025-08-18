@@ -67,5 +67,23 @@ OLLAMA_ANALYTICAL_URL = OLLAMA_ANALYTICAL["url"]
 OLLAMA_ANALYTICAL_MODEL = OLLAMA_ANALYTICAL["model"]
 OLLAMA_ANALYTICAL_TIMEOUT = OLLAMA_ANALYTICAL["timeout"]
 
+# ---- SQL model decoding options (all optional, with safe defaults)
+OLLAMA_SQL_TEMP = float(os.getenv("OLLAMA_SQL_TEMP", "0.1"))
+OLLAMA_SQL_TOP_P = float(os.getenv("OLLAMA_SQL_TOP_P", "0.9"))
+OLLAMA_SQL_TOP_K = int(os.getenv("OLLAMA_SQL_TOP_K", "40"))
+OLLAMA_SQL_REPEAT_PENALTY = float(os.getenv("OLLAMA_SQL_REPEAT_PENALTY", "1.1"))
+OLLAMA_SQL_NUM_PREDICT = int(os.getenv("OLLAMA_SQL_NUM_PREDICT", "512"))
+OLLAMA_SQL_NUM_CTX = int(os.getenv("OLLAMA_SQL_NUM_CTX", "4096"))
+OLLAMA_SQL_SEED = int(os.getenv("OLLAMA_SQL_SEED", "7"))
+
+# ...existing imports...
+# app/config.py
+SUMMARY_ENGINE = os.getenv("SUMMARY_ENGINE", "llm").strip().lower()
+SUMMARY_MAX_ROWS = int(os.getenv("SUMMARY_MAX_ROWS", 120))
+SUMMARY_CHAR_BUDGET = int(os.getenv("SUMMARY_CHAR_BUDGET", 24000))
+
 # ChromaDB Path
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", os.path.join(os.path.dirname(__file__), "..", "chroma_db"))
+
+#Feedback system
+FEEDBACK_DB_ID = os.getenv("FEEDBACK_DB_ID", "source_db_1")

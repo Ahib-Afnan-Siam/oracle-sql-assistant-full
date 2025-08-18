@@ -1,9 +1,20 @@
-{
-  "source_db_1": {
+[
+  {
+    "id": "source_db_1",
+    "type": "oracle",
     "host": "172.17.2.111",
     "port": 1521,
-    "service": "PRAN",
+    "service_name": "PRAN",
     "user": "sos",
     "password": "sos"
+  },
+  {
+    "id": "source_db_2",
+    "type": "oracle",
+    "host": "172.17.2.43",
+    "port": 1521,
+    "service_name": "PRAN",
+    "user": "erp",
+    "password": "erp"
   }
-}
+]
