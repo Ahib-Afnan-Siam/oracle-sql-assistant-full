@@ -2,8 +2,9 @@
 import React, { useState, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Bot, User } from "lucide-react";
+import { Bot, User, Copy, RotateCcw, Check } from "lucide-react";
 import DataTable from "./DataTable";
+import { useChat } from "./ChatContext";
 
 type OracleError = {
   error: string;
@@ -101,10 +102,14 @@ const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
 
 const MessageBubble: React.FC<Props> = ({ message }) => {
   const { sender, content, type, id } = message;
+  const { processMessage, selectedDB, messages } = useChat();
 
   // typing effect for summary only
   const [displayed, setDisplayed] = useState("");
   const [idx, setIdx] = useState(0);
+  
+  // Copy functionality
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     if (type !== "summary") return;
@@ -121,6 +126,54 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
     }, 10);
     return () => clearTimeout(t);
   }, [idx, content, type]);
+
+  // Copy function
+  const handleCopy = async () => {
+    try {
+      let textToCopy = "";
+      
+      if (typeof content === "string") {
+        textToCopy = content;
+      } else if (Array.isArray(content)) {
+        // For table data, create a formatted text representation
+        const [headers, ...rows] = content;
+        textToCopy = `${headers.join('\t')}\n${rows.map(row => row.join('\t')).join('\n')}`;
+      } else if (typeof content === "object" && content && ("error" in content || "message" in content)) {
+        const errorData = content as OracleError;
+        textToCopy = errorData.message || errorData.error || "Error occurred";
+      }
+      
+      await navigator.clipboard.writeText(textToCopy);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy:", err);
+    }
+  };
+
+  // Retry function - finds the last user message and resends it
+  const handleRetry = () => {
+    // Find the user message that triggered this bot response
+    const currentIndex = messages.findIndex(m => m.id === id);
+    let userMessage = "";
+    
+    // Look backwards from current message to find the last user message
+    for (let i = currentIndex - 1; i >= 0; i--) {
+      if (messages[i].sender === "user" && typeof messages[i].content === "string") {
+        userMessage = messages[i].content as string;
+        break;
+      }
+    }
+    
+    if (userMessage) {
+      processMessage(userMessage, selectedDB);
+    }
+  };
+
+  // Don't show action buttons for user messages, status messages, or during typing
+  const showActionButtons = sender === "bot" && 
+                           type !== "status" && 
+                           !(type === "summary" && typeof content === "string" && idx < content.length);
 
   const bubbleStyle: Record<Message["type"], string> = {
     user: "bg-purple-600 text-white",
@@ -182,22 +235,9 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
   // widen table bubbles
   const widthClass = type === "table" ? "max-w-[95%]" : "max-w-[78%] md:max-w-[70%]";
 
-  // (kept for parity with your previous structure)
-  const bubbleNode = (
-    <div className={`rounded-2xl px-4 py-2 mb-1 text-sm ${widthClass} ${bubbleStyle[type]}`}>
-      {renderContent()}
-      {type === "summary" && typeof content === "string" && idx < content.length && (
-        <span className="animate-pulse">|</span>
-      )}
-    </div>
-  );
-
   return (
-    // 1) push the message cluster to left (bot) or right (user)
     <div className={`w-full flex ${sender === "user" ? "justify-end" : "justify-start"}`}>
-      {/* 2) inside that cluster, place avatar and bubble with a small gap
-            for user we just reverse the row so avatar sits on the outside */}
-      <div className={`flex items-start gap-2 ${sender === "user" ? "flex-row-reverse" : ""} max-w-[90%]`}>
+      <div className={`group flex items-start gap-2 ${sender === "user" ? "flex-row-reverse" : ""} max-w-[90%]`}>
         {/* avatar */}
         <div className="pt-1 flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 shadow-sm shrink-0">
           {sender === "user" ? (
@@ -207,13 +247,50 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
           )}
         </div>
 
-        {/* bubble */}
-        <div className={`rounded-2xl px-4 py-2 mb-1 text-sm ${widthClass} ${bubbleStyle[type]}`}>
-          {renderContent()}
-          {type === "summary" && typeof content === "string" && idx < content.length && (
-            <span className="animate-pulse">|</span>
-          )}
-        </div>
+        {/* For messages without action buttons, use simple bubble structure */}
+        {!showActionButtons ? (
+          <div className={`rounded-2xl px-4 py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
+            {renderContent()}
+            {type === "summary" && typeof content === "string" && idx < content.length && (
+              <span className="animate-pulse">|</span>
+            )}
+          </div>
+        ) : (
+          /* For messages with action buttons, use flex column structure */
+          <div className="flex flex-col gap-1">
+            <div className={`rounded-2xl px-4 py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
+              {renderContent()}
+              {type === "summary" && typeof content === "string" && idx < content.length && (
+                <span className="animate-pulse">|</span>
+              )}
+            </div>
+            
+            {/* Action buttons for bot messages */}
+            <div className="flex items-center gap-1 ml-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+              {/* Copy button */}
+              <button
+                onClick={handleCopy}
+                className="p-1.5 rounded-lg hover:bg-gray-100 transition-colors duration-200 flex items-center gap-1"
+                title="Copy response"
+              >
+                {copied ? (
+                  <Check size={14} className="text-green-600" />
+                ) : (
+                  <Copy size={14} className="text-gray-500 hover:text-gray-700" />
+                )}
+              </button>
+              
+              {/* Retry button */}
+              <button
+                onClick={handleRetry}
+                className="p-1.5 rounded-lg hover:bg-gray-100 transition-colors duration-200 flex items-center gap-1"
+                title="Try again"
+              >
+                <RotateCcw size={14} className="text-gray-500 hover:text-gray-700" />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

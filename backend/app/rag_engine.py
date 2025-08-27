@@ -198,8 +198,167 @@ def _parse_day_token(s: str) -> Optional[_dt]:
 
 def _asked_range(uq: str) -> tuple[Optional[_dt], Optional[_dt]]:
     """
-    Return (start_dt, end_dt) if the user clearly asked for a single date or date range.
-    Uses a few tolerant patterns plus the explicit range extractor from query_engine.
+    Extract date range from user query.
+    Returns (start_date, end_date) or (None, None) if no dates found.
+    """
+    # Try to find date tokens in the query
+    day_tokens = re.findall(
+        r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}|\d{1,2}-[A-Za-z]{3}-\d{2,4})\b",
+        uq or "", re.IGNORECASE
+    )
+    
+    parsed_days = []
+    for token in day_tokens:
+        dt = _parse_day_token(token)
+        if dt:
+            parsed_days.append(dt)
+    
+    if len(parsed_days) == 1:
+        return (parsed_days[0], parsed_days[0])
+    elif len(parsed_days) >= 2:
+        return (min(parsed_days), max(parsed_days))
+    
+    return (None, None)
+
+# -------------------------
+# Enhanced Entity Recognition (Integrated from enhanced_entity_recognizer.py)
+# -------------------------
+
+def extract_enhanced_companies(query: str) -> List[Dict[str, str]]:
+    """Extract company references from query."""
+    company_mappings = {
+        'CAL': {
+            'full_name': 'Chorka Apparel Limited',
+            'variations': ['cal', 'CAL', 'chorka', 'Chorka'],
+            'floor_patterns': [r'CAL.*?Sewing-F\d+', r'Sewing.*?CAL-\d+[A-Z]?']
+        },
+        'WINNER': {
+            'full_name': 'Winner',
+            'variations': ['winner', 'Winner', 'WINNER'],
+            'floor_patterns': [r'Winner.*?BIP.*?sewing', r'Sewing.*?Winner-\d+']
+        },
+        'BIP': {
+            'full_name': 'BIP',
+            'variations': ['bip', 'BIP'],
+            'floor_patterns': [r'Winner.*?BIP']
+        }
+    }
+    
+    companies = []
+    query_lower = query.lower()
+    
+    for company_code, company_info in company_mappings.items():
+        for variation in company_info['variations']:
+            if variation.lower() in query_lower:
+                companies.append({
+                    'code': company_code,
+                    'full_name': company_info['full_name'],
+                    'variation_found': variation
+                })
+                break
+    
+    return companies
+
+def extract_enhanced_floors(query: str) -> List[Dict[str, str]]:
+    """Extract floor references from query."""
+    floor_patterns = {
+        'sewing_floors': [
+            r'Sewing\s+Floor-\d+[A-Z]?',  # Sewing Floor-5B
+            r'Sewing\s+CAL-\d+[A-Z]?',    # Sewing CAL-2A
+            r'CAL\s+Sewing-F\d+',         # CAL Sewing-F1
+            r'Winner.*?BIP.*?sewing',      # Winner BIP sewing
+            r'Sewing\s+Winner-\d+',       # Sewing Winner-1
+        ],
+        'cutting_floors': [
+            r'Cutting\s+Floor-\d+[A-Z]?',
+            r'Cutting\s+CAL-\d+[A-Z]?'
+        ],
+        'finishing_floors': [
+            r'Finishing\s+Floor-\d+[A-Z]?'
+        ]
+    }
+    
+    floors = []
+    
+    for floor_type, patterns in floor_patterns.items():
+        for pattern in patterns:
+            matches = re.finditer(pattern, query, re.IGNORECASE)
+            for match in matches:
+                floors.append({
+                    'type': floor_type.replace('_floors', ''),
+                    'name': match.group(0),
+                    'pattern_matched': pattern
+                })
+    
+    return floors
+
+def extract_enhanced_metrics(query: str) -> List[str]:
+    """Extract metric-related terms from query."""
+    metric_patterns = [
+        r'\bproduction\s+qty\b',
+        r'\bdefect\s+qty\b',
+        r'\bDHU\b',
+        r'\btotal\s+production\b',
+        r'\bmax\s+defect\b',
+        r'\bsalary\b',
+        r'\bstock\b',
+        r'\bon[-\s]?hand\s+qty\b'
+    ]
+    
+    metrics = []
+    for pattern in metric_patterns:
+        if re.search(pattern, query, re.IGNORECASE):
+            metrics.append(pattern.strip(r'\b'))
+    
+    return metrics
+
+def classify_enhanced_query_intent(query: str) -> str:
+    """Enhanced query intent classification based on user patterns."""
+    query_lower = query.lower()
+    
+    # Enhanced intent patterns
+    intent_patterns = {
+        'floor_production_summary': [r'floor.*wise.*production.*summary', r'show.*floor.*production'],
+        'defect_analysis': [r'defect.*qty.*floor', r'max.*defect.*qty', r'total.*defect.*qty'],
+        'employee_lookup': [r'who\s+is\s+\w+', r'salary.*president'],
+        'ranking_query': [
+            r'top.*\d+.*defect', r'max.*defect.*floor', r'biggest.*production',
+            r'which.*floor.*produced.*most', r'which.*floor.*most.*production',
+            r'most.*production.*floor', r'floor.*produced.*most',
+            r'maximum.*production', r'highest.*production'
+        ]
+    }
+    
+    for intent, patterns in intent_patterns.items():
+        if any(re.search(pattern, query_lower) for pattern in patterns):
+            return intent
+    
+    if any(word in query_lower for word in ['production', 'defect', 'floor']):
+        return 'production_data'
+    elif any(word in query_lower for word in ['employee', 'salary', 'president']):
+        return 'employee_data'
+    elif any(word in query_lower for word in ['stock', 'inventory', 'item', 'product']):
+        return 'inventory_data'
+    
+    return 'general'
+
+def analyze_enhanced_query(query: str) -> Dict:
+    """Comprehensive enhanced query analysis."""
+    
+    analysis = {
+        'companies': extract_enhanced_companies(query),
+        'floors': extract_enhanced_floors(query),
+        'metrics': extract_enhanced_metrics(query),
+        'intent': classify_enhanced_query_intent(query),
+        'query_type': classify_enhanced_query_intent(query)
+    }
+    
+    return analysis
+
+def _asked_range(uq: str) -> tuple[Optional[_dt], Optional[_dt]]:
+    """
+    Extract date range from user query.
+    Returns (start_date, end_date) or (None, None) if no dates found.
     """
     # 1) explicit range via query_engine (e.g., "between 01/01/2025 and 05/01/2025")
     rng = extract_explicit_date_range(uq or "")
@@ -939,9 +1098,23 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
     """
     logger.info(f"[RAG] Q: {user_query} (DB: {selected_db})")
     uq = (user_query or "").strip()
+    
+    # Enhanced query analysis (integrated from enhanced modules)
+    enhanced_analysis = analyze_enhanced_query(uq)
+    logger.info(f"[RAG] Enhanced analysis: {enhanced_analysis['intent']} with companies: {[c['code'] for c in enhanced_analysis['companies']]}")
+    
+    # Try enhanced date extraction from query_engine first, fallback to existing methods
+    enhanced_date_range = None
+    try:
+        # Import the enhanced date function from query_engine to avoid naming conflict
+        from app.query_engine import extract_enhanced_date_range as enhanced_date_extractor
+        enhanced_date_range = enhanced_date_extractor(uq)
+        if enhanced_date_range and isinstance(enhanced_date_range, dict) and 'type' in enhanced_date_range:
+            logger.info(f"[RAG] Enhanced date range detected: {enhanced_date_range['type']}")
+    except Exception as e:
+        logger.warning(f"[RAG] Enhanced date extraction failed: {e}")
 
     # 0) Fast paths -------------------------------------------------------------
-
     # 0.a) Raw SELECT passthrough (validated)
     if re.match(r'(?is)^\s*select\b', uq):
         sql = normalize_dates(uq.rstrip(";"))

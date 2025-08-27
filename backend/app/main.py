@@ -114,9 +114,18 @@ async def log_requests(request: Request, call_next):
 # ---------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",  # Vite dev server alternative port
+        "http://127.0.0.1:5174",
+        "http://localhost:3000",  # Additional frontend ports
+        "http://127.0.0.1:3000",
+        "http://localhost:8090",  # Allow same-origin requests
+        "http://127.0.0.1:8090"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -124,6 +133,26 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"ok": True}
+
+# Test endpoint for CORS debugging
+@app.get("/test")
+def test_endpoint():
+    return {"message": "CORS test successful", "timestamp": time.time()}
+
+# General OPTIONS handler for any endpoint
+@app.options("/{path:path}")
+async def options_handler(request: Request, path: str):
+    logger.info(f"OPTIONS request for /{path} from origin: {request.headers.get('origin')}")
+    return JSONResponse(
+        status_code=200,
+        content={"message": "OK"},
+        headers={
+            "Access-Control-Allow-Origin": request.headers.get("origin", "*"),
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Credentials": "true"
+        }
+    )
 
 # ---------------------------
 # Optional templates

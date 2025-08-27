@@ -35,11 +35,6 @@ _ID_QUERY_RX = re.compile(
     re.IGNORECASE,
 )
 
-_EXTENDED_ID_RX = re.compile(
-    r"\b([A-Z]{2,}-\d{2,}-\d{4,})\b",  # Matches patterns like CTL-25-01175
-    re.IGNORECASE
-)
-
 def _extract_id_lookup(q: str) -> Optional[dict]:
     # Existing numeric ID detection
     m = _ID_QUERY_RX.search(q or "")
@@ -50,14 +45,29 @@ def _extract_id_lookup(q: str) -> Optional[dict]:
             "label": m.group("label").upper(),
         }
     
-    # New pattern for alphanumeric codes
-    m = _EXTENDED_ID_RX.search(q or "")
-    if m:
-        return {
-            "hint_table": "",
-            "value": m.group(1),
-            "label": "CODE",
-        }
+    # Enhanced patterns for various ID formats
+    extended_patterns = [
+        # CTL codes (CTL-25-01175, CTL-Fb-22-02071)
+        (r'\b(CTL-\d{2}-\d{5,6})\b', 'CTL_CODE'),
+        (r'\b(CTL-[A-Z]{2,4}-\d{2}-\d{5})\b', 'CTL_EXTENDED'),
+        # Barcode numbers
+        (r'\b(\d{11,14})\b', 'BARCODE'),
+        # Challan numbers
+        (r'\b(\d{4,5}-\d{2}\.\d{2}\.\d{4})\b', 'CHALLAN'),
+        # Inventory IDs
+        (r'inventory\s+(?:id\s+)?(\d+)', 'INVENTORY_ID'),
+        (r'\bid\s+(\d+)', 'GENERIC_ID')
+    ]
+    
+    for pattern, code_type in extended_patterns:
+        m = re.search(pattern, q or "", re.IGNORECASE)
+        if m:
+            return {
+                "hint_table": "",
+                "value": m.group(1),
+                "label": code_type,
+            }
+    
     return None
 
 def _list_id_like_columns(selected_db: str, limit_tables: int = 800) -> List[Dict[str,str]]:
@@ -194,6 +204,165 @@ def extract_single_day_range(user_query: str) -> Optional[Dict[str, str]]:
     if not dt: return None
     d = _to_oracle_date(dt)
     return {"start": d, "end": d}
+
+# -------------------------
+# Enhanced Date Parser (Integrated from enhanced_date_parser.py)
+# -------------------------
+
+def extract_enhanced_date_range(query: str) -> Optional[Dict[str, str]]:
+    """
+    Enhanced date extraction that handles various date formats from user queries.
+    Based on analysis of actual user query patterns.
+    """
+    if not query:
+        return None
+        
+    query_upper = query.upper()
+    
+    # Enhanced date patterns from user queries
+    enhanced_patterns = [
+        # DD/MM/YYYY format (most common)
+        (r'(\d{1,2})/(\d{1,2})/(\d{4})', 'dmy_slash'),
+        # DD-MM-YYYY format
+        (r'(\d{1,2})-(\d{1,2})-(\d{4})', 'dmy_dash'),
+        # DD-MON-YY format (Oracle style)
+        (r'(\d{1,2})-([A-Z]{3})-(\d{2,4})', 'dd_mon_yy'),
+        # MON-YY format (month-year)
+        (r'([A-Z]{3})-(\d{2,4})', 'mon_yy'),
+        # Month YYYY format
+        (r'([A-Z]{3,9})\s+(\d{4})', 'month_yyyy'),
+        # YYYY-MM-DD ISO format
+        (r'(\d{4})-(\d{1,2})-(\d{1,2})', 'iso_date'),
+    ]
+    
+    for pattern, format_type in enhanced_patterns:
+        match = re.search(pattern, query_upper)
+        if match:
+            try:
+                date_obj = _parse_enhanced_date_match(match, format_type)
+                if date_obj:
+                    return _to_enhanced_oracle_date_range(date_obj, format_type)
+            except Exception as e:
+                logger.warning(f"Enhanced date parsing failed for {match.group(0)}: {e}")
+                continue
+    
+    # Try relative date parsing
+    relative_result = _extract_relative_dates(query)
+    if relative_result:
+        return relative_result
+    
+    return None
+
+def _parse_enhanced_date_match(match, format_type: str) -> Optional[datetime]:
+    """Parse regex match based on format type."""
+    
+    if format_type == 'dmy_slash' or format_type == 'dmy_dash':
+        day, month, year = match.groups()
+        return datetime(int(year), int(month), int(day))
+        
+    elif format_type == 'dd_mon_yy':
+        day, month_str, year = match.groups()
+        month = _MON_ABBR.get(month_str.upper())
+        if not month:
+            return None
+        year_int = int(year)
+        if year_int < 100:
+            year_int += 2000
+        return datetime(year_int, month, int(day))
+        
+    elif format_type == 'mon_yy':
+        month_str, year = match.groups()
+        month = _MON_ABBR.get(month_str.upper())
+        if not month:
+            return None
+        year_int = int(year)
+        if year_int < 100:
+            year_int += 2000
+        return datetime(year_int, month, 1)  # First day of month
+        
+    elif format_type == 'month_yyyy':
+        month_str, year = match.groups()
+        month = _MON_ABBR.get(month_str.upper())
+        if not month:
+            # Try full month names
+            month = _MONTH_ALIASES.get(month_str.upper())
+            if month:
+                month = _MON_ABBR.get(month)
+        if not month:
+            return None
+        return datetime(int(year), month, 1)
+        
+    elif format_type == 'iso_date':
+        year, month, day = match.groups()
+        return datetime(int(year), int(month), int(day))
+        
+    return None
+
+def _to_enhanced_oracle_date_range(date_obj: datetime, format_type: str) -> Dict[str, str]:
+    """Convert datetime to Oracle date range."""
+    
+    if format_type in ['mon_yy', 'month_yyyy']:
+        # For month-year formats, create month range
+        start_date = date_obj.replace(day=1)
+        # Get last day of month
+        if date_obj.month == 12:
+            end_date = date_obj.replace(year=date_obj.year + 1, month=1, day=1)
+        else:
+            end_date = date_obj.replace(month=date_obj.month + 1, day=1)
+        end_date = end_date - timedelta(days=1)
+        
+        return {
+            'start': f"TO_DATE('{start_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'end': f"TO_DATE('{end_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'type': 'month_range'
+        }
+    else:
+        # For specific dates, use single day
+        oracle_date = f"TO_DATE('{date_obj.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')"
+        return {
+            'start': oracle_date,
+            'end': oracle_date,
+            'type': 'single_day'
+        }
+
+def _extract_relative_dates(query: str) -> Optional[Dict[str, str]]:
+    """Handle relative date expressions like 'last month', 'last 7 days'."""
+    
+    query_lower = query.lower()
+    today = datetime.now()
+    
+    # Last month
+    if 'last month' in query_lower:
+        if today.month == 1:
+            last_month = today.replace(year=today.year - 1, month=12, day=1)
+        else:
+            last_month = today.replace(month=today.month - 1, day=1)
+        
+        # Get last day of previous month
+        if last_month.month == 12:
+            end_date = last_month.replace(year=last_month.year + 1, month=1, day=1)
+        else:
+            end_date = last_month.replace(month=last_month.month + 1, day=1)
+        end_date = end_date - timedelta(days=1)
+        
+        return {
+            'start': f"TO_DATE('{last_month.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'end': f"TO_DATE('{end_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'type': 'month_range'
+        }
+    
+    # Last 7 days
+    if 'last 7 days' in query_lower:
+        end_date = today
+        start_date = today - timedelta(days=7)
+        
+        return {
+            'start': f"TO_DATE('{start_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'end': f"TO_DATE('{end_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'type': 'week_range'
+        }
+    
+    return None
 
 # replace the old _NAME_LITERAL_RX usage with:
 _WHERE_BLOCK_RX = re.compile(r"(?is)\bWHERE\b(.*?)(?=\bGROUP\b|\bORDER\b|\bFETCH\b|\bOFFSET\b|\bLIMIT\b|$)")

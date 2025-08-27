@@ -27,3 +27,13 @@ Thumbs.db
 
 # Misc
 *.exe
+
+# Chroma / DB artifacts (root and backend/)
+chroma_db/
+chroma_storage/
+backend/chroma_db/
+backend/chroma_storage/
+
+# Virtual envs
+venv/
+.venv/
