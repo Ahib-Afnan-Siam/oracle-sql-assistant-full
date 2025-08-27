@@ -78,7 +78,7 @@ OLLAMA_SQL_SEED = int(os.getenv("OLLAMA_SQL_SEED", "7"))
 
 # ...existing imports...
 # app/config.py
-SUMMARY_ENGINE = os.getenv("SUMMARY_ENGINE", "llm").strip().lower()
+SUMMARY_ENGINE = (os.getenv("SUMMARY_ENGINE") or "py").strip().lower()
 SUMMARY_MAX_ROWS = int(os.getenv("SUMMARY_MAX_ROWS", 120))
 SUMMARY_CHAR_BUDGET = int(os.getenv("SUMMARY_CHAR_BUDGET", 24000))
 

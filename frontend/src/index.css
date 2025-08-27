@@ -16,3 +16,11 @@ body {
   background-position: center;
   background-attachment: fixed;
 }
+/* Smooth blink for the status bubble */
+@keyframes soft-blink {
+  0%, 100% { opacity: .55; }
+  50%      { opacity: 1; }
+}
+.status-blink {
+  animation: soft-blink 1.2s ease-in-out infinite;
+}

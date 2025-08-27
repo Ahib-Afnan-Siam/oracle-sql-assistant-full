@@ -26,6 +26,8 @@ COLLECTION_PREFIX = "schema_docs"
 # --------- Ingest switches / limits via env ---------
 INCLUDE_VALUE_SAMPLES = os.getenv("INCLUDE_VALUE_SAMPLES", "false").lower() == "true"
 INCLUDE_NUMERIC_RANGES = os.getenv("INCLUDE_NUMERIC_RANGES", "false").lower() == "true"
+INCLUDE_ALIASES = os.getenv("INCLUDE_ALIASES", "true").lower() == "true"
+
 SCHEMA_MAX_TABLES = int(os.getenv("SCHEMA_MAX_TABLES", "0"))  # 0 = no cap
 SCHEMA_MAX_COLS_PER_TABLE = int(os.getenv("SCHEMA_MAX_COLS_PER_TABLE", "0"))  # 0 = no cap
 EMB_BATCH_SIZE = int(os.getenv("EMB_BATCH_SIZE", "64"))
@@ -44,6 +46,7 @@ def get_chroma_client(source_id: str):
     )
 
 # ---------------- COLUMN_HINTS ----------------
+# (Kept as lightweight hints; the system stays dynamic and doesn’t rely on them.)
 COLUMN_HINTS = {
     "DEPTNO": "Department number",
     "DNAME": "Department name",
@@ -126,6 +129,18 @@ def _safe_id_fragment(s: str) -> str:
     s = (s or "")[:128]
     return re.sub(r"[\s\r\n\t]+", "_", s)
 
+def _aliases(s: str) -> list[str]:
+    """
+    Generate generic alias tokens for robust matching:
+    - Upper-case original
+    - Compact: remove spaces, hyphens, underscores
+    """
+    u = (s or "").upper()
+    compact = re.sub(r'[\s\-_]+', '', u)
+    # Use a set to dedupe; return as list
+    out = list({u, compact})
+    return out
+
 def _sample_text_values(cursor, table: str, column: str):
     if not INCLUDE_VALUE_SAMPLES:
         return []
@@ -155,6 +170,13 @@ def _sample_text_values(cursor, table: str, column: str):
         logger.debug(f"[ValueSample] Skip {table}.{column}: {e}")
         return []
 
+# Optional value/range docs (kept tiny)
+# Only sample values for ID-like columns to avoid index bloat
+IDLIKE_RX = re.compile(
+    r"(?:^|_)(ID|CODE|NO|NUM|NUMBER|BARCODE|CHALLAN|ORDER|SO|PO|INVOICE|JOB|LOT|REF|TRACK|DOC|VOUCHER)(?:$|_)",
+    re.IGNORECASE
+)
+
 def _sample_numeric_range(cursor, table: str, column: str):
     if not INCLUDE_NUMERIC_RANGES:
         return None
@@ -167,6 +189,22 @@ def _sample_numeric_range(cursor, table: str, column: str):
     except Exception as e:
         logger.debug(f"[ValueRange] Skip {table}.{column}: {e}")
         return None
+
+# --------- Exclude patterns (LIKE-style) ---------
+EXCLUDE_TABLE_PATTERNS = [
+    p.strip() for p in os.getenv("EXCLUDE_TABLE_PATTERNS", "AI_%").split(",") if p.strip()
+]
+
+def _like_to_regex(pat: str) -> re.Pattern:
+    # Convert SQL LIKE to regex: % -> .*, _ -> .
+    pat = pat.replace(".", r"\.")
+    pat = pat.replace("%", ".*").replace("_", ".")
+    return re.compile(rf"^{pat}$", re.IGNORECASE)
+
+_EXCLUDE_TABLE_RX = [_like_to_regex(p) for p in EXCLUDE_TABLE_PATTERNS]
+
+def _is_excluded_table(name: str) -> bool:
+    return any(rx.match(name) for rx in _EXCLUDE_TABLE_RX)
 
 def load_schema_to_chroma():
     for source in SOURCES:
@@ -190,12 +228,21 @@ def load_schema_to_chroma():
         total_columns = 0
         value_docs = 0
         range_docs = 0
+        alias_table_docs = 0
+        alias_column_docs = 0
 
         try:
             with connect_to_source(source_id) as (conn, _):
                 cursor = conn.cursor()
                 cursor.execute("SELECT table_name FROM user_tables")
                 tables = [row[0] for row in cursor.fetchall()] or []
+
+                # NEW: filter out excluded tables
+                before = len(tables)
+                tables = [t for t in tables if not _is_excluded_table(t)]
+                after = len(tables)
+                if before != after:
+                    logger.info(f"[Index] Skipped {before - after} tables by EXCLUDE_TABLE_PATTERNS={EXCLUDE_TABLE_PATTERNS}")
 
                 if SCHEMA_MAX_TABLES > 0:
                     tables = tables[:SCHEMA_MAX_TABLES]
@@ -222,6 +269,25 @@ def load_schema_to_chroma():
                         metadatas=table_metas[i:i+CHROMA_ADD_BATCH_SIZE],
                     )
                     total_tables += len(table_ids[i:i+CHROMA_ADD_BATCH_SIZE])
+
+                # ---------- TABLE ALIAS DOCS (optional; batched) ----------
+                if INCLUDE_ALIASES and tables:
+                    alias_docs, alias_ids, alias_meta = [], [], []
+                    for table in tables:
+                        for a in _aliases(table):
+                            alias_docs.append(f"Alias token for table '{table}': {a}")
+                            alias_ids.append(f"{source_id}.{table}::ALIAS::{a}")
+                            alias_meta.append({"source_table": table, "source_id": source_id, "kind": "alias"})
+                    if alias_docs:
+                        alias_embs = encode_texts_batch(alias_docs, batch_size=EMB_BATCH_SIZE)
+                        for i in range(0, len(alias_docs), CHROMA_ADD_BATCH_SIZE):
+                            collection.add(
+                                documents=alias_docs[i:i+CHROMA_ADD_BATCH_SIZE],
+                                embeddings=alias_embs[i:i+CHROMA_ADD_BATCH_SIZE],
+                                ids=alias_ids[i:i+CHROMA_ADD_BATCH_SIZE],
+                                metadatas=alias_meta[i:i+CHROMA_ADD_BATCH_SIZE],
+                            )
+                            alias_table_docs += len(alias_ids[i:i+CHROMA_ADD_BATCH_SIZE])
 
                 # ---------- COLUMNS + OPTIONAL VALUE/RANGE (stream batched) ----------
                 for table in tqdm(tables, desc=f"{source_id} Tables"):
@@ -268,16 +334,36 @@ def load_schema_to_chroma():
                             )
                             total_columns += len(col_ids[i:i+CHROMA_ADD_BATCH_SIZE])
 
-                    # Optional value/range docs (kept tiny)
+                    # ---------- COLUMN ALIAS DOCS (optional; batched) ----------
+                    if INCLUDE_ALIASES and cols:
+                        alias_docs_c, alias_ids_c, alias_meta_c = [], [], []
+                        for col_name, _col_type in cols:
+                            for a in _aliases(col_name):
+                                alias_docs_c.append(f"Alias token for column '{col_name}' of '{table}': {a}")
+                                alias_ids_c.append(f"{source_id}.{table}.{col_name}::ALIAS::{a}")
+                                alias_meta_c.append({"source_table": table, "column": col_name, "source_id": source_id, "kind": "alias"})
+                        if alias_docs_c:
+                            alias_embs_c = encode_texts_batch(alias_docs_c, batch_size=EMB_BATCH_SIZE)
+                            for i in range(0, len(alias_docs_c), CHROMA_ADD_BATCH_SIZE):
+                                collection.add(
+                                    documents=alias_docs_c[i:i+CHROMA_ADD_BATCH_SIZE],
+                                    embeddings=alias_embs_c[i:i+CHROMA_ADD_BATCH_SIZE],
+                                    ids=alias_ids_c[i:i+CHROMA_ADD_BATCH_SIZE],
+                                    metadatas=alias_meta_c[i:i+CHROMA_ADD_BATCH_SIZE],
+                                )
+                                alias_column_docs += len(alias_ids_c[i:i+CHROMA_ADD_BATCH_SIZE])
+
+                    # ---------- VALUE SAMPLES / NUMERIC RANGES ----------
                     for col_name, col_type in cols:
                         dtype = str(col_type or "").upper()
-                        # text samples
-                        if INCLUDE_VALUE_SAMPLES and any(t in dtype for t in TEXT_TYPES):
+
+                        # ---- TEXT SAMPLES (ID-like columns only) ----
+                        if INCLUDE_VALUE_SAMPLES and any(t in dtype for t in TEXT_TYPES) and IDLIKE_RX.search(col_name):
                             samples = _sample_text_values(cursor, table, col_name)
                             if samples:
                                 v_docs, v_ids, v_metas = [], [], []
                                 for val, cnt in samples:
-                                    pv = val[:256]
+                                    pv = (val or "")[:256]
                                     v_docs.append(f"VALUE '{pv}' appears in {source_id}.{table}.{col_name} (frequency ~{cnt}).")
                                     v_ids.append(f"{source_id}.{table}.{col_name}::VAL::{_safe_id_fragment(pv)}")
                                     v_metas.append({
@@ -295,7 +381,7 @@ def load_schema_to_chroma():
                                     )
                                     value_docs += len(v_ids[i:i+CHROMA_ADD_BATCH_SIZE])
 
-                        # numeric range (min/avg/max only)
+                        # ---- NUMERIC RANGE (optional) ----
                         if INCLUDE_NUMERIC_RANGES and any(t in dtype for t in NUM_TYPES):
                             rng = _sample_numeric_range(cursor, table, col_name)
                             if rng:
@@ -316,6 +402,8 @@ def load_schema_to_chroma():
                 # ✅ No explicit persist() needed with PersistentClient
                 logger.info(
                     f"✅ {source_id}: {total_tables} table docs, {total_columns} column docs"
+                    + (f", {alias_table_docs} table-alias docs" if INCLUDE_ALIASES else "")
+                    + (f", {alias_column_docs} column-alias docs" if INCLUDE_ALIASES else "")
                     + (f", {value_docs} value docs" if INCLUDE_VALUE_SAMPLES else "")
                     + (f", {range_docs} range docs" if INCLUDE_NUMERIC_RANGES else "")
                     + " indexed."

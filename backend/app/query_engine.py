@@ -1,333 +1,387 @@
 # app/query_engine.py
+"""
+Lightweight SQL utilities used by the RAG pipeline.
+
+This module intentionally contains **no** LLM orchestration logic.
+It exposes a stable set of helpers for:
+- Date normalization & detection
+- Safe SQL building from a validated plan
+- Predicate/type guards
+- Execution utilities
+- Display decisions & summarization
+- Entity-lookup fallbacks (needle → candidates → probes)
+
+Used by: app/rag_engine.py
+"""
+
 import logging
 import re
-import traceback
-from typing import List, Dict, Any, AsyncGenerator, Tuple, Optional
-from datetime import datetime, date
+from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime, date, timedelta
+from calendar import monthrange
 from decimal import Decimal
 from statistics import median
-#from tabulate import tabulate
-from time import time
-import cx_Oracle
-import json  # ← add
-from app.summarizer import summarize_with_mistral, _pipe_snapshot, stream_summary  # ← add 2 symbols
-from app.config import SUMMARY_ENGINE, SUMMARY_MAX_ROWS, SUMMARY_CHAR_BUDGET       # ← add 2 constants
-from app.vector_store_chroma import hybrid_schema_value_search
-from app.ollama_llm import call_ollama
+import os
 from app.db_connector import connect_to_source
-from app.config import OLLAMA_SQL_MODEL
-import asyncio
-import difflib
-
+from app.vector_store_chroma import hybrid_schema_value_search
+from functools import lru_cache as _memo
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# --------------------------------------------------------------------------------------
-# Simple TTL caches (in-memory)
-# --------------------------------------------------------------------------------------
-RESULT_CACHE_TTL_SEC = 10 * 60          # 10 minutes
-LLM_CACHE_TTL_SEC    = 30 * 60          # 30 minutes
-
-_result_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
-_llm_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
-
-_SAMPLE_SQL_RX = re.compile(
-    r"(?is)^\s*select\s+\*\s+from\s+[A-Za-z0-9_\"\.]+\s+fetch\s+first\s+\d+\s+rows\s+only\s*$"
+# near other helpers
+_ID_QUERY_RX = re.compile(
+    r"\b(?:(?P<table>[A-Za-z][A-Za-z0-9_]{1,})\s+)?(?P<label>id|no|number|code)\s+(?P<val>\d+)\b",
+    re.IGNORECASE,
 )
 
-def _is_sample_sql(sql: str) -> bool:
-    s = (sql or "").strip()
-    if not _SAMPLE_SQL_RX.match(s):
-        return False
-    # consider no WHERE/JOINS as pure sample
-    return not re.search(r"\bwhere\b|\bjoin\b|\bnatural\b", s, re.IGNORECASE)
+_EXTENDED_ID_RX = re.compile(
+    r"\b([A-Z]{2,}-\d{2,}-\d{4,})\b",  # Matches patterns like CTL-25-01175
+    re.IGNORECASE
+)
 
-_SQL_WS = re.compile(r"\s+")
-def _norm_sql_key(sql: str) -> str:
-    s = (sql or "").strip().rstrip(";")
-    return _SQL_WS.sub(" ", s)
+def _extract_id_lookup(q: str) -> Optional[dict]:
+    # Existing numeric ID detection
+    m = _ID_QUERY_RX.search(q or "")
+    if m:
+        return {
+            "hint_table": (m.group("table") or "").upper(),
+            "value": int(m.group("val")),
+            "label": m.group("label").upper(),
+        }
+    
+    # New pattern for alphanumeric codes
+    m = _EXTENDED_ID_RX.search(q or "")
+    if m:
+        return {
+            "hint_table": "",
+            "value": m.group(1),
+            "label": "CODE",
+        }
+    return None
 
-def _cache_get_result(db: str, sql: str) -> Optional[Dict[str, Any]]:
-    if _is_sample_sql(sql) or _is_nondeterministic(sql):
-        return None  # never serve cached sample
-    key = (db, _norm_sql_key(sql))
-    entry = _result_cache.get(key)
-    if not entry:
-        return None
-    if time() - entry["ts"] > RESULT_CACHE_TTL_SEC:
-        _result_cache.pop(key, None)
-        return None
-    return entry
+def _list_id_like_columns(selected_db: str, limit_tables: int = 800) -> List[Dict[str,str]]:
+    sql = """
+    SELECT table_name, column_name, data_type
+      FROM user_tab_columns
+     WHERE REGEXP_LIKE(column_name, '(^|_)(ID|NO|NUM|NUMBER|CODE)$', 'i')
+     FETCH FIRST :lim ROWS ONLY
+    """
+    out = []
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        cur.execute(sql, lim=limit_tables)
+        for t, c, dt in cur.fetchall():
+            out.append({"table": t, "column": c, "dtype": (dt or "").upper()})
+    return [x for x in out if not _is_banned_table(x["table"])]
 
-MAX_CACHE_ITEMS = 500
 
-def _trim_cache(c: Dict[Tuple[str,str], Dict[str,Any]]):
-    if len(c) <= MAX_CACHE_ITEMS:
-        return
-    # drop oldest first
-    for k, _ in sorted(c.items(), key=lambda kv: kv[1]["ts"])[: len(c) - MAX_CACHE_ITEMS]:
-        c.pop(k, None)
+# Whitelist for TO_CHAR date buckets
+_TOCHAR_WHITELIST = {"MON-YY", "MON-YYYY", "YYYY-MM", "YYYY", "DD-MON-YYYY"}
+_TOCHAR_RX = re.compile(r"""(?is)^\s*TO_CHAR\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*'([A-Za-z\-]+)'\s*\)\s*$""")
 
-_NONDET_RX = re.compile(r"\b(SYSDATE|SYSTIMESTAMP|CURRENT_DATE|DBMS_RANDOM)\b", re.I)
+_DATE_YMD  = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATE_DMY  = re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+_DATE_DMON = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2,4}$")
+_YEAR_TOKEN = re.compile(r"\b(19|20)\d{2}\b")
+_MON_YYYY  = re.compile(r"^[A-Za-z]{3}-\d{2,4}$")
 
-def _is_nondeterministic(sql: str) -> bool:
-    if _NONDET_RX.search(sql or ""):
-        return True
-    if re.search(r"\bROWNUM\b", sql or "", re.I) and not re.search(r"\bORDER\s+BY\b", sql or "", re.I):
-        return True
-    return False
+# e.g. "24 May 2024" or "1 Jan 24"
+_DATE_DMON_SPACE = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}$")
 
-def _cache_set_result(db: str, sql: str, columns, rows, *, cache_ok: bool = True) -> None:
-    if not cache_ok:
-        return
-    if _is_sample_sql(sql) or _is_nondeterministic(sql):
-        return
-    _result_cache[(db, _norm_sql_key(sql))] = {
-        "ts": time(), "columns": columns, "rows": rows, "row_count": len(rows)
-    }
-    _trim_cache(_result_cache)
-
-def cached_call_ollama(prompt: str, model: str) -> str:
-    key = (model, prompt)
-    entry = _llm_cache.get(key)
-    if entry and time() - entry["ts"] <= LLM_CACHE_TTL_SEC:
-        return entry["text"]
-    text = call_ollama(prompt, model=model)
-    _llm_cache[key] = {"ts": time(), "text": text}
-    _trim_cache(_llm_cache)
-    return text
-
-# ----------------------------------------------------------------------
-# Timeframe guidance (kept dynamic)
-# ----------------------------------------------------------------------
-TIMEFRAME_GUIDANCE = """
-TIMEFRAME TRANSLATION (Oracle):
-- today → WHERE <date_col> >= TRUNC(SYSDATE)
-- yesterday / last day → WHERE <date_col> >= TRUNC(SYSDATE-1) AND <date_col> < TRUNC(SYSDATE)
-- last 7 days → WHERE <date_col> >= TRUNC(SYSDATE) - 7
-- this week → WHERE <date_col> >= TRUNC(SYSDATE, 'D')
-- last week → WHERE <date_col> >= TRUNC(SYSDATE, 'D') - 7 AND <date_col> < TRUNC(SYSDATE, 'D')
-- this month → WHERE <date_col> >= TRUNC(SYSDATE, 'MM')
-- last month → WHERE <date_col> >= TRUNC(ADD_MONTHS(SYSDATE,-1),'MM') AND <date_col> < TRUNC(SYSDATE,'MM')
-- this quarter → WHERE <date_col> >= TRUNC(SYSDATE, 'Q')
-- last quarter → WHERE <date_col> >= ADD_MONTHS(TRUNC(SYSDATE,'Q'), -3) AND <date_col> < TRUNC(SYSDATE,'Q')
-- this year → WHERE <date_col> >= TRUNC(SYSDATE, 'YYYY')
-- last year → WHERE <date_col> >= ADD_MONTHS(TRUNC(SYSDATE,'YYYY'), -12) AND <date_col> < TRUNC(SYSDATE,'YYYY')
-
-Prefer date columns whose names contain: date, dt, time, created, updated, txn_date, order_date, post_date, delivery_date, etc.
-Use TRUNC on date columns when comparing to day/month/quarter boundaries.
-"""
-
-# ----------------------------------------------------------------------
-# Date normalization for Oracle + explicit date range extraction
-# ----------------------------------------------------------------------
-DATE_FORMATS = {
-    "default": "DD-MON-YYYY",
-    "variants": [
-        "YYYY-MM-DD",
-        "MM/DD/YYYY",
-        "DD-MON-YY",
-        "MON-DD-YYYY",
-        "DD/MM/YYYY",
-        "DD/MM/YY",
-    ],
+# below _MON3/_MON_ABBR
+_MONTH_ALIASES = {
+    "JANUARY":"JAN","FEBRUARY":"FEB","MARCH":"MAR","APRIL":"APR","MAY":"MAY",
+    "JUNE":"JUN","JULY":"JUL","AUGUST":"AUG","SEPTEMBER":"SEP","SEPT":"SEP",
+    "OCTOBER":"OCT","NOVEMBER":"NOV","DECEMBER":"DEC",
+    "AUGUEST":"AUG",  # common typo seen in logs
 }
 
-def normalize_dates(sql: str) -> str:
-    for fmt in DATE_FORMATS["variants"]:
-        sql = re.sub(
-            fr"TO_DATE\('([^']+)'\s*,\s*'{fmt}'\)",
-            f"TO_DATE('\\1', '{DATE_FORMATS['default']}')",
-            sql,
-            flags=re.IGNORECASE,
-        )
+def _mon_to_abbr(word: str) -> Optional[str]:
+    w = (word or "").strip().upper()
+    if w in _MON_ABBR:       # already 3-letter abbr
+        return w
+    return _MONTH_ALIASES.get(w)
+
+# now finds "Jan 2025" inside a sentence
+_MON_YYYY_ANY = re.compile(r"\b([A-Za-z]{3,9})[-\s]\d{2,4}\b", re.I)
+# NEW: strip standalone month words like "Jan" / "January"
+_MONTH_WORD_RX = re.compile(
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", re.I
+)
+
+# NEW: common filler words we never want as a literal
+_STOPWORDS = {
+    "total","of","in","with","list","name","names","the","a","an","by","for",
+    "qty","quantity","production","output","report","summary","show","table",
+    "and","or","please","kindly","give","provide"    
+}
+
+# ---- Known org full-name → short code mappings (all source DBs) -------------
+_ORG_SYNONYMS = [
+    # CAL — Chorka Apparels Ltd (handle minor spelling variations)
+    (re.compile(r"\bchorka\s+app(?:arel|arels?)\s+ltd\b", re.I), "CAL"),
+    # CTL — Chorka Textile
+    (re.compile(r"\bchorka\s+textile\b", re.I), "CTL"),
+]
+
+_TABLE_DENYLIST = {
+    t.strip().upper()
+    for t in (os.getenv("TABLE_DENYLIST") or "").split(",")
+    if t.strip()
+}
+
+def _is_banned_table(name: str) -> bool:
+    return (name or "").upper() in _TABLE_DENYLIST
+
+def _filter_banned_tables(names: list[str]) -> list[str]:
+    return [n for n in (names or []) if n and not _is_banned_table(n)]
+
+def _shortcode_for_org(label: str) -> Optional[str]:
+    for rx, code in _ORG_SYNONYMS:
+        if rx.search(label or ""):
+            return code
+    return None
+
+DEFAULT_TIME_DAYS = int(os.getenv("DEFAULT_TIME_DAYS", "0"))  # 0 = no implicit range
+
+
+def _is_single_day_literal(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(_DATE_YMD.match(s) or _DATE_DMY.match(s) or _DATE_DMON.match(s) or _DATE_DMON_SPACE.match(s))
+
+def _parse_tochar_expr(expr: str) -> Optional[Tuple[str, str]]:
+    m = _TOCHAR_RX.match(expr or "")
+    if not m:
+        return None
+    col, fmt = m.group(1), m.group(2).upper()
+    if fmt not in _TOCHAR_WHITELIST:
+        return None
+    return (col, fmt)
+
+# --- Single-day literal → range(start=end=that day) --------------------------
+_SINGLE_DAY_RX = re.compile(
+    r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}|\d{1,2}-[A-Za-z]{3}-\d{2,4})\b",
+    re.IGNORECASE,
+)
+
+def _parse_single_day_literal(s: str) -> Optional[datetime]:
+    s = s.strip()
+    if _DATE_YMD.match(s):
+        return datetime.strptime(s, "%Y-%m-%d")
+    if _DATE_DMY.match(s):
+        # 21/08/25 or 21/08/2025
+        d, m, y = [int(x) for x in re.split(r"[/-]", s)]
+        if y < 100: y += 2000 if y < 50 else 1900
+        return datetime(y, m, d)
+    if _DATE_DMON_SPACE.match(s):
+        # 21 Aug 2025 / 21 Aug 25
+        d_str, mon_str, y_str = s.split()
+        y = int(y_str);  y = 2000 + y if y < 100 else y
+        return datetime(y, _MON_ABBR[mon_str[:3].upper()], int(d_str))
+    if _DATE_DMON.match(s):
+        # 21-AUG-25 / 21-AUG-2025
+        d, mon3, y = re.match(r"^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$", s).groups()
+        y = int(y); y = 2000 + y if y < 100 else y
+        return datetime(y, _MON_ABBR[mon3.upper()], int(d))
+    return None
+
+def extract_single_day_range(user_query: str) -> Optional[Dict[str, str]]:
+    m = _SINGLE_DAY_RX.search(user_query or "")
+    if not m: return None
+    dt = _parse_single_day_literal(m.group(1))
+    if not dt: return None
+    d = _to_oracle_date(dt)
+    return {"start": d, "end": d}
+
+# replace the old _NAME_LITERAL_RX usage with:
+_WHERE_BLOCK_RX = re.compile(r"(?is)\bWHERE\b(.*?)(?=\bGROUP\b|\bORDER\b|\bFETCH\b|\bOFFSET\b|\bLIMIT\b|$)")
+
+def _has_text_literal_predicate(sql: str) -> bool:
+    m = _WHERE_BLOCK_RX.search(sql or "")
+    if not m:
+        return False
+    w = m.group(1) or ""
+
+    # strip date/function literals
+    w = re.sub(r"(?is)TO_DATE\s*\(\s*'[^']+'\s*,\s*'[^']+'\s*\)", "X", w)
+    w = re.sub(r"(?is)TO_CHAR\s*\(\s*[^)]+?\s*,\s*'[^']+'\s*\)", "X", w)
+
+    # any remaining quoted literal likely belongs to a text predicate
+    return bool(re.search(r"'[^']+'", w))
+
+def ensure_label_filter(sql: str, user_query: str, selected_db: str) -> str:
+    """
+    Add a label/code filter inferred from the user's query to the main table in `sql`,
+    but only if the SQL does not already contain a text literal predicate.
+
+    Behaviors:
+      - Skips English "X-wise" phrasing (meaning "by X") — not a label filter.
+      - First, tries code detection (e.g., IDs like CTL-22-004522, barcodes, challan nos.)
+        using _extract_id_lookup(). If found, injects an equality-style predicate on a
+        suitable text/code column; if not found on base table, tries direct FK parents.
+      - Otherwise, scans candidate literals from the question, maps known org names to
+        shortcodes, and injects a LIKE/normalized-LIKE predicate on a suitable text column.
+        If no base-table match, tries direct FK parents.
+    """
+    # Fast exits
+    if not sql or _has_text_literal_predicate(sql):
+        return sql
+
+    # Skip English “X-wise” phrasing (“by X”), not a label
+    if re.search(r"\b\w+(?:\s*-\s*|\s+)wise\b", (user_query or "").lower()):
+        logger.debug("[ensure_label_filter] skip: '-wise' phrasing detected")
+        return sql
+
+    table = extract_main_table(sql or "")
+    if not table:
+        return sql
+
+    # Helper: inject a predicate at the right spot (before GROUP/ORDER/... or append)
+    def _inject_predicate(_sql: str, _pred: str) -> str:
+        parts = re.split(r"(?i)\bWHERE\b", _sql, maxsplit=1)
+        if len(parts) == 2:
+            head, tail = parts[0], (parts[1] or "").strip()
+            return f"{head}WHERE {_pred} AND {tail}" if tail else f"{head}WHERE {_pred}"
+        m = re.search(r"(?i)\b(GROUP|ORDER|FETCH|OFFSET|LIMIT)\b", _sql or "")
+        return (_sql[:m.start()] + f" WHERE {_pred} " + _sql[m.start():]) if m else (_sql + f" WHERE {_pred}")
+
+    # ---------- 1) Code detection path (strict/equality style) ----------
+    # Example: CTL-22-004522, barcode 22990000228077, etc.
+    try:
+        code_info = _extract_id_lookup(user_query)
+    except Exception:
+        code_info = None
+
+    if code_info:
+        code_value = str(code_info.get("value", "")).strip()
+        logger.debug("[ensure_label_filter] code_info=%r table=%s", code_info, table)
+        if code_value:
+            # Try base table first
+            best_col = _guess_text_column_for_literal(selected_db, table, code_value)
+            if best_col:
+                esc = code_value.replace("'", "''")
+                norm = re.sub(r"[\s\-]", "", esc).upper()
+                pred = (
+                    f"( UPPER({best_col}) = UPPER('{esc}') "
+                    f"  OR UPPER(REPLACE(REPLACE({best_col},'-',''),' ','')) = UPPER('{norm}') )"
+                )
+                return _inject_predicate(sql, pred)
+
+            # If no column on the base table matched, try direct FK parents (e.g., JOBS → JOB_CODE)
+            try:
+                parents = _fk_parents_for_child(selected_db, table)
+            except Exception:
+                parents = []
+            for fk in parents:
+                ptab = fk.get("parent_table")
+                if not ptab:
+                    continue
+                ptext = _guess_text_column_for_literal(selected_db, ptab, code_value)
+                if not ptext:
+                    continue
+                # Found a matching text/code column on parent: inject EXISTS join filter
+                esc = code_value.replace("'", "''")
+                norm = re.sub(r"[\s\-]", "", esc).upper()
+                # Build parent-side equality predicate
+                parent_pred = (
+                    f"( UPPER({ptext}) = UPPER('{esc}') "
+                    f"  OR UPPER(REPLACE(REPLACE({ptext},'-',''),' ','')) = UPPER('{norm}') )"
+                )
+                return _inject_exists_on_parent(
+                    sql,
+                    child_table=table,
+                    parent_table=ptab,
+                    parent_text_col=ptext,
+                    child_fk_col=fk.get("child_col"),
+                    parent_pk_col=fk.get("parent_col"),
+                    literal=code_value,
+                    parent_pred_override=parent_pred,
+                )
+
+    # ---------- 2) Generic literal path (LIKE / normalized LIKE) ----------
+    cands = _candidate_literals_from_question(user_query)
+    logger.debug("[ensure_label_filter] cands=%r table=%s", cands, table)
+
+    for literal in cands:
+        # Map known full names to their short codes (e.g., "Chorka Apparels Ltd" → "CAL")
+        mapped = _shortcode_for_org(literal) or literal
+
+        # Try base table first
+        best_col = _guess_text_column_for_literal(selected_db, table, mapped)
+        if best_col:
+            esc = mapped.replace("'", "''")
+            norm = re.sub(r"[\s\-]", "", esc).upper()
+            pred = (
+                f"( UPPER({best_col}) LIKE UPPER('%{esc}%') "
+                f"  OR UPPER(REPLACE(REPLACE({best_col},'-',''),' ','')) LIKE UPPER('%{norm}%') )"
+            )
+            return _inject_predicate(sql, pred)
+
+        # If no column on the base table matched, try direct FK parents (e.g., JOBS → JOB_TITLE)
+        try:
+            parents = _fk_parents_for_child(selected_db, table)
+        except Exception:
+            parents = []
+        for fk in parents:
+            ptab = fk.get("parent_table")
+            if not ptab:
+                continue
+            ptext = _guess_text_column_for_literal(selected_db, ptab, mapped)
+            if not ptext:
+                continue
+            # Found a matching text column on parent: inject EXISTS join filter
+            esc = mapped.replace("'", "''")
+            norm = re.sub(r"[\s\-]", "", esc).upper()
+            parent_pred = (
+                f"( UPPER({ptext}) LIKE UPPER('%{esc}%') "
+                f"  OR UPPER(REPLACE(REPLACE({ptext},'-',''),' ','')) LIKE UPPER('%{norm}%') )"
+            )
+            return _inject_exists_on_parent(
+                sql,
+                child_table=table,
+                parent_table=ptab,
+                parent_text_col=ptext,
+                child_fk_col=fk.get("child_col"),
+                parent_pk_col=fk.get("parent_col"),
+                literal=mapped,
+                parent_pred_override=parent_pred,
+            )
+
+    # Nothing to add
     return sql
 
+# --- table exclude patterns used during runtime metadata build ---
+EXCLUDE_TABLE_PATTERNS = [
+    p.strip() for p in os.getenv("EXCLUDE_TABLE_PATTERNS", "AI_%").split(",") if p.strip()
+]
 
-_MON3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+def _like_to_regex(pat: str) -> re.Pattern:
+    # Convert SQL LIKE to regex: % -> .*, _ -> .
+    pat = pat.replace(".", r"\.")
+    pat = pat.replace("%", ".*").replace("_", ".")
+    return re.compile(rf"^{pat}$", re.IGNORECASE)
 
-def _parse_day_first_date(s: str) -> Optional[datetime]:
-    try:
-        parts = re.split(r"[/-]", s.strip())
-        if len(parts) != 3:
-            return None
-        d, m, y = [int(p) for p in parts]
-        if y < 100:
-            y += 2000 if y < 50 else 1900
-        return datetime(y, m, d)
-    except Exception:
-        return None
+_EXCLUDE_TABLE_RX = [_like_to_regex(p) for p in EXCLUDE_TABLE_PATTERNS]
 
-def _to_oracle_date(dt: datetime) -> str:
-    return f"TO_DATE('{dt.day:02d}-{_MON3[dt.month-1]}-{dt.year}','DD-MON-YYYY')"
+def _is_excluded_table(name: str) -> bool:
+    return any(rx.match(name) for rx in _EXCLUDE_TABLE_RX)
 
-def apply_date_range_constraint(sql: str, rng: Optional[Dict[str, str]]) -> str:
-    if not rng:
-        return sql
-    col = rng["column"]
-    between = f"{col} BETWEEN {rng['start']} AND {rng['end']}"
-    # already present?
-    if re.search(rf"\b{re.escape(col)}\b.*\bBETWEEN\b", sql, re.IGNORECASE):
-        return sql
+# ------------------------------------------------------------------------------
+# Small, optional cache stubs (no-op by default)
+# ------------------------------------------------------------------------------
+def _cache_get_result(db: str, sql: str) -> Optional[Dict[str, Any]]:
+    return None
 
-    # Split once on the first WHERE and reassemble with parentheses
-    parts = re.split(r"(?i)\bWHERE\b", sql, maxsplit=1)
-    if len(parts) == 2:
-        before, after = parts[0], parts[1].strip()
-        if after:
-            return f"{before}WHERE ({between}) AND ({after})"
-        else:
-            return f"{before}WHERE {between}"
+def _cache_set_result(db: str, sql: str, columns, rows, *, cache_ok: bool = True) -> None:
+    return None
 
-    # No WHERE yet: inject before GROUP/ORDER/FETCH if present
-    m = re.search(r"(?i)\b(GROUP|ORDER|FETCH)\b", sql)
-    if m:
-        return sql[:m.start()] + f" WHERE {between} " + sql[m.start():]
-    return sql + f" WHERE {between}"
-
-
-# ----------------------------------------------------------------------
-# Prompt construction (dynamic; no hardcoded tables/terms)
-# ----------------------------------------------------------------------
-def _extract_table_hints(schema_chunks: List[str]) -> str:
-    tables = []
-    for s in schema_chunks:
-        for line in s.splitlines():
-            m = re.search(r"\bTABLE\s+([A-Za-z0-9_\.]+)", line, flags=re.IGNORECASE)
-            if m:
-                tables.append(m.group(1).strip())
-    seen, ordered = set(), []
-    for t in tables:
-        u = t.upper()
-        if u not in seen:
-            seen.add(u)
-            ordered.append(t)
-    return ", ".join(ordered[:80]) if ordered else ""
-
-def _is_report_like(user_query: str) -> bool:
-    uq = user_query.lower()
-    return bool(re.search(r"\b(report|summary|summarize|overview|update|insight|analysis|analyze|status|review)\b", uq))
-
-def generate_sql_prompt(schema_chunks: list, user_query: str) -> str:
-    context = "\n\n".join(schema_chunks)
-    allowed = _extract_table_hints(schema_chunks)
-    report_like = _is_report_like(user_query)
-
-    projection_rules = (
-        "Project only the minimal column(s) necessary to answer."
-        if not report_like else
-        "Prefer a compact descriptive projection: one identifier (id/name/code), one date or period if available, one category (e.g., floor/line/unit/department), and up to two numeric measures most relevant to the question."
-    )
-
-    raw_table_hint = (
-        "If the user asks to 'show/list <table>' or '<table> table' or says 'grid', "
-        "return an UNFILTERED sample:\n"
-        "SELECT * FROM <that_table> FETCH FIRST 200 ROWS ONLY.\n"
-        "Do NOT add any WHERE filters unless explicitly requested."
-    )
-
-    date_range_hint = _date_range_hint_for_prompt(user_query)
-    single_table_for_report = _explicit_single_table_report_request(user_query, schema_chunks)
-    no_join_guard = (
-        f"- The user asked for a report/summary of table {single_table_for_report}. "
-        f"Use ONLY {single_table_for_report}. Do NOT join any other table.\n"
-        if single_table_for_report else ""
-    )
-
-    return f"""
-You are an expert Oracle SQL generator.
-
-Return exactly ONE syntactically valid SELECT statement (no markdown fences, no explanation).
-It must directly answer the user's question using ONLY the SCHEMA CONTEXT.
-
-STRICT RULES:
-- {projection_rules}
-{no_join_guard}- If the user specifies a date/time window, include ONLY that window. Otherwise add **no** time filter.
-- When a date range is typed like "<col> between DD/MM/YYYY and DD/MM/YYYY" (or "from ... to ..."),
-  use: WHERE <col> BETWEEN TO_DATE('dd-mon-yyyy','DD-MON-YYYY') AND TO_DATE('dd-mon-yyyy','DD-MON-YYYY').
-  Use TRUNC(<col>) only when comparing to day/month/quarter boundaries from the guidance.
-- Do NOT use DISTINCT unless the user explicitly asks for 'distinct' or 'unique'.
-- Avoid SELECT * unless the user explicitly asks for 'all columns' OR it is a raw table/show/list/grid request.
-- Never combine SELECT * with GROUP BY. If you use GROUP BY, project only grouped columns and aggregates explicitly.
-- Use only literal values explicitly present in the question.
-- No bind variables.
-- Choose tables/columns only if they are present in the SCHEMA CONTEXT.
-- If the question mentions floors/lines/units (textile/garments domain), prefer tables/columns that include those concepts **if and only if they appear in the SCHEMA CONTEXT**.
-- {raw_table_hint}
-- {TIMEFRAME_GUIDANCE}
-
-{date_range_hint}
-
-ALLOWED TABLES (hints): {allowed if allowed else "not specified"}
-
-SCHEMA CONTEXT:
-{context}
-
-QUESTION:
-{user_query}
-
-SQL:
-""".strip()
-
-
-# ----------------------------------------------------------------------
-# Validation helpers
-# ----------------------------------------------------------------------
-def is_valid_sql(sql: str, source_id: str) -> bool:
-    # Basic guards
-    s = (sql or "").strip()
-    if not s.lower().startswith("select"):
-        return False
-    # single SELECT only (no stacked statements / semicolons)
-    if ";" in s or s.lower().count(" select ") > 0 and s.lower().find("select", 1) != -1:
-        return False
-    # refuse bind-style placeholders (your pipeline removes them anyway)
-    if re.search(r":\w+", s, re.IGNORECASE):
-        return False
-    # optionally cap length to avoid abuse
-    if len(s) > 100000:
-        return False
-
-    try:
-        with connect_to_source(source_id) as (conn, _):
-            cursor = conn.cursor()
-            # parse only; do not execute
-            cursor.prepare(s)   # python-oracledb / cx_Oracle parse step
-            return True
-    except Exception as e:
-        logger.warning(f"[Validation Fail] {e}")
-        return False
-
-
-def retry_with_stricter_prompt(user_query: str, schema_chunks: list, error: str) -> str:
-    prompt = f"""
-A previous SQL attempt failed with: {error.split(':')[0]}
-
-Re-generate ONE Oracle SELECT that directly answers the user's question.
-
-RULES:
-- Follow timeframe guidance exactly.
-- Use only tables/columns from SCHEMA CONTEXT.
-- No bind variables; no explanations; no markdown.
-- If it's a report/summary/update, include a compact descriptive projection (id/name/code, date, category, up to two numeric measures).
-
-SCHEMA CONTEXT:
-{'\n\n'.join(schema_chunks)}
-
-QUESTION:
-{user_query}
-
-SQL:
-"""
-    sql = cached_call_ollama(prompt, model=OLLAMA_SQL_MODEL)
-    return normalize_dates(sql.strip().strip("`").rstrip(";"))
-
-# ----------------------------------------------------------------------
-# Utilities
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Core execution utilities
+# ------------------------------------------------------------------------------
 def to_jsonable(value):
-    if hasattr(value, "read"):  # LOB
+    if hasattr(value, "read"):
         return value.read()
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="ignore")
@@ -335,285 +389,460 @@ def to_jsonable(value):
         return value.isoformat()
     return value
 
-def handle_bind_variables(sql: str, user_query: str) -> str:
-    if re.search(r":\w+", sql, re.IGNORECASE):
-        sql = re.sub(r"WHERE\s+.*?=.*?:\w+.*?(?=;|$)", "", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"(AND|OR)\s+.*?=.*?:\w+", "", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"\s+WHERE\s*$", "", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"\s+(AND|OR)\s*$", "", sql, flags=re.IGNORECASE)
-    return sql
-
 def _set_case_insensitive_session(cursor):
     try:
         cursor.execute("ALTER SESSION SET NLS_COMP=LINGUISTIC")
         cursor.execute("ALTER SESSION SET NLS_SORT=BINARY_CI")
     except Exception as e:
-        logger.warning(f"Could not set CI session: {e}")
+        logger.warning(f"Could not set case-insensitive session: {e}")
 
-def _case_insensitive_rewrite(sql: str) -> str:
-    m = re.search(r"\bWHERE\b(.*)$", sql, flags=re.IGNORECASE | re.DOTALL)
+def run_sql(sql: str, selected_db: str, *, cache_ok: bool = True) -> List[Dict[str, Any]]:
+    cached = _cache_get_result(selected_db, sql)
+    if cached:
+        logger.debug("[DB] cache_hit=1 db=%s", selected_db)
+        return cached["rows"]
+
+    logger.debug("[DB] SQL: %s", (sql or "").replace("\n", " ")[:2000])
+
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        _set_case_insensitive_session(cur)
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = [{cols[i]: to_jsonable(r[i]) for i in range(len(cols))} for r in cur]
+
+    logger.debug("[DB] rows=%d cols=%d", len(rows), len(cols))
+
+    _cache_set_result(selected_db, sql, cols, rows, cache_ok=cache_ok)
+    return rows
+
+# ------------------------------------------------------------------------------
+# Date normalization & explicit/relative/month-token date-range parsing
+# ------------------------------------------------------------------------------
+_MON3 = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+_MON_ABBR = {m: i+1 for i, m in enumerate(_MON3)}
+
+def _to_oracle_date(dt: datetime) -> str:
+    return f"TO_DATE('{dt.day:02d}-{_MON3[dt.month-1]}-{dt.year}','DD-MON-YYYY')"
+
+_TO_DATE_RX = re.compile(r"(?is)TO_DATE\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)")
+
+def _parse_literal_with_format(lit: str, fmt: str) -> Optional[datetime]:
+    fmt = (fmt or "").upper().strip()
+    py_map = {
+        "YYYY-MM-DD": "%Y-%m-%d",
+        "MM/DD/YYYY": "%m/%d/%Y",
+        "DD/MM/YYYY": "%d/%m/%Y",
+        "DD/MM/YY":   "%d/%m/%y",
+        "DD-MON-YY":  "%d-%b-%y",
+        "DD-MON-YYYY":"%d-%b-%Y",
+        "MON-DD-YYYY":"%b-%d-%Y",
+    }
+    pat = py_map.get(fmt)
+    if not pat:
+        return None
+    try:
+        dt = datetime.strptime(lit, pat)
+        return dt
+    except Exception:
+        return None
+
+def normalize_dates(sql: str) -> str:
+    def repl(m: re.Match) -> str:
+        lit, fmt = m.group(1), m.group(2)
+        dt = _parse_literal_with_format(lit, fmt)
+        return _to_oracle_date(dt) if dt else m.group(0)
+    return _TO_DATE_RX.sub(repl, sql or "")
+
+# --- Explicit date-range detection in natural text --------------------------------
+def _parse_day_first_date(s: str) -> Optional[datetime]:
+    try:
+        s = s.strip()
+
+        # NEW: "24 May 2024" / "24 May 24"
+        if _DATE_DMON_SPACE.match(s):
+            d_str, mon_str, y_str = s.split()
+            d = int(d_str)
+            y = int(y_str)
+            if y < 100:
+                y += 2000 if y < 50 else 1900
+            mon3 = mon_str[:3].upper()
+            if mon3 in _MON_ABBR:
+                return datetime(y, _MON_ABBR[mon3], d)
+
+        # existing: numeric "24/05/2024" or "24-05-2024"
+        parts = re.split(r"[/-]", s)
+        if len(parts) == 3 and parts[1].isdigit():
+            d, m, y = [int(p) for p in parts]
+            if y < 100:
+                y += 2000 if y < 50 else 1900
+            return datetime(y, m, d)
+        return None
+    except Exception:
+        return None
+
+_DATE_RANGE_PATTERNS = [
+    re.compile(
+        r"\b(?P<col>[A-Za-z_][A-Za-z0-9_]*)\s*(?:is|was|are|were|will\s+be|shall\s+be)\s+between\s+"
+        r"(?P<d1>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(?:and|to)\s+(?P<d2>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?P<col>[A-Za-z_][A-Za-z0-9_]*)\s*(?:between|from)\s+"
+        r"(?P<d1>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(?:and|to)\s+(?P<d2>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        re.IGNORECASE,
+    ),
+]
+_DATE_RANGE_STOPWORDS = {"be","is","was","are","were","will","shall"}
+
+def _try_match_date_range(text: str):
+    for rx in _DATE_RANGE_PATTERNS:
+        m = rx.search(text or "")
+        if not m:
+            continue
+        col = (m.group("col") or "").strip()
+        if col.lower() in _DATE_RANGE_STOPWORDS:
+            continue
+        d1 = _parse_day_first_date(m.group("d1"))
+        d2 = _parse_day_first_date(m.group("d2"))
+        if d1 and d2:
+            if d2 < d1:
+                d1, d2 = d2, d1
+            return col, d1, d2
+    return None
+
+# add near the top (helpers)
+_GENERIC_TOKENS_RX = re.compile(r'\b(sewing|cutting|finishing|ironing|knitting|printing|embroidery|washing|qty|quantity|production|output|pieces?|pcs?|floor|line|department|section|unit)\b', re.I)
+
+def _candidate_literals_from_question(q: str) -> list[str]:
+    q = q or ""
+    # strip dates & months
+    q = _SINGLE_DAY_RX.sub(" ", q)
+    q = _MON_YYYY_ANY.sub(" ", q)   # catches "Jan 2025", "May-24", etc.
+    q = _MONTH_WORD_RX.sub(" ", q)  # catches "Jan", "January"
+    q = _YEAR_TOKEN.sub(" ", q)
+
+    # tokenize and drop stopwords/generics
+    raw = re.findall(r"[A-Za-z0-9]+", q)
+    tokens = [t for t in raw if t.lower() not in _STOPWORDS]
+    tokens = [t for t in tokens if not _GENERIC_TOKENS_RX.fullmatch(t)]
+
+    if not tokens:
+        return []
+
+    cands: list[str] = []
+
+    # 1) prefer short ALL-CAPS codes (3–6 chars) like "CAL"
+    for t in tokens:
+        if 3 <= len(t) <= 6 and t.isupper():
+            cands.append(t)
+
+    # 2) short phrases for label-y things ("Winner BIP")
+    if len(tokens) >= 2:
+        cands.append(" ".join(tokens[:2]))
+    if len(tokens) >= 3:
+        cands.append(" ".join(tokens[:3]))
+
+    # 3) a compact “longest” phrase (cap to keep it sane)
+    phrase = " ".join(tokens[:6]).strip()
+    if phrase:
+        cands.append(phrase)
+
+    # uniq + length rule (allow 3 chars when ALL-CAPS, e.g., CAL)
+    out, seen = [], set()
+    for c in cands:
+        k = c.lower()
+        if k in seen:
+            continue
+        if len(c) >= 4 or (len(c) == 3 and c.isupper()):
+            seen.add(k)
+            out.append(c)
+    return out
+
+def extract_explicit_date_range(user_query: str) -> Optional[Dict[str, str]]:
+    hit = _try_match_date_range(user_query)
+    if not hit:
+        return None
+    col, d1, d2 = hit
+    return {"column": col, "start": _to_oracle_date(d1), "end": _to_oracle_date(d2)}
+
+# --- NEW: Month-token and relative-date parsing -----------------------------------
+def _month_token_to_range(tok: str) -> Optional[Tuple[datetime, datetime]]:
+    s = tok.strip()
+    m = re.match(r'^([A-Za-z]{3,9})[-\s](\d{2,4})$', s, re.I)
+    if not m: return None
+    mon_word, yy = m.group(1), m.group(2)
+    mon3 = _mon_to_abbr(mon_word) or mon_word[:3].upper()
+    if mon3 not in _MON_ABBR: return None
+    year = int(yy);  year = 2000 + year if year < 100 else year
+    month = _MON_ABBR[mon3]
+    start = datetime(year, month, 1)
+    end = datetime(year, month, monthrange(year, month)[1])
+    return start, end
+
+def _extract_relative_date_range(uq: str) -> Optional[Tuple[datetime, datetime]]:
+    uq = uq.lower()
+    today = datetime.now().date()
+    # last 7 days (inclusive)
+    if "last 7 days" in uq:
+        start = datetime.combine(today - timedelta(days=6), datetime.min.time())
+        end = datetime.combine(today, datetime.max.time())
+        return start, end
+    # last month
+    if "last month" in uq:
+        y, m = (today.year, today.month-1) if today.month > 1 else (today.year-1, 12)
+        start = datetime(y, m, 1)
+        end = datetime(y, m, monthrange(y, m)[1])
+        return start, end
+    # last quarter
+    if "last quarter" in uq:
+        q = (today.month-1)//3 + 1
+        prev_q = 4 if q == 1 else q-1
+        y = today.year-1 if q == 1 else today.year
+        m0 = 3*(prev_q-1)+1
+        start = datetime(y, m0, 1)
+        end = datetime(y, m0+2, monthrange(y, m0+2)[1])
+        return start, end
+    # last year
+    if "last year" in uq:
+        y = today.year - 1
+        start = datetime(y, 1, 1)
+        end = datetime(y, 12, 31)
+        return start, end
+    return None
+
+def extract_month_token_range(user_query: str) -> Optional[Dict[str, str]]:
+#    m = re.search(r'\b([A-Za-z]{3,9})[-\s](\d{2,4})\b', user_query or "", re.IGNORECASE)
+    m = re.search(r'(?<!\d-)\b([A-Za-z]{3,9})[-\s](\d{2,4})\b', user_query or "", re.IGNORECASE)
+    if not m: return None
+    rng = _month_token_to_range(m.group(0))
+    if not rng: return None
+    s, e = rng
+    return {"start": _to_oracle_date(s), "end": _to_oracle_date(e)}
+
+def extract_relative_date_range(user_query: str) -> Optional[Dict[str, str]]:
+    hit = _extract_relative_date_range(user_query or "")
+    if not hit:
+        return None
+    s, e = hit
+    return {"start": _to_oracle_date(s), "end": _to_oracle_date(e)}
+
+def apply_date_range_constraint(sql: str, rng: Optional[Dict[str, str]]) -> str:
+    if not rng:
+        return sql
+    col = rng["column"]
+    between = f"{col} BETWEEN {rng['start']} AND {rng['end']}"
+    parts = re.split(r"(?i)\bWHERE\b", sql or "", maxsplit=1)
+    if len(parts) == 2:
+        before, after = parts[0], parts[1].strip()
+        if after:
+            return f"{before}WHERE ({between}) AND ({after})"
+        else:
+            return f"{before}WHERE {between}"
+    m = re.search(r"(?i)\b(GROUP|ORDER|FETCH|OFFSET|LIMIT)\b", sql or "")
+    if m:
+        return sql[:m.start()] + f" WHERE {between} " + sql[m.start():]
+    return sql + f" WHERE {between}"
+
+def extract_year_only_range(user_query: str) -> Optional[Dict[str, str]]:
+    m = re.search(_YEAR_TOKEN, user_query or "")
     if not m:
-        return sql
-    where = m.group(1)
-    def repl(match):
-        col = match.group(1)
-        val = match.group(2)
-        return f"UPPER({col}) = UPPER('{val}')"
-    new_where = re.sub(
-        r"(\b[A-Za-z_][A-Za-z0-9_]*\b)\s*=\s*'([^']*)'",
-        repl,
-        where,
-        flags=re.IGNORECASE,
-    )
-    if new_where == where:
-        return sql
-    return sql[: m.start(1)] + new_where
+        return None
+    y = int(m.group(0))
+    return {
+        "start": f"TO_DATE('01-JAN-{y}','DD-MON-YYYY')",
+        "end":   f"TO_DATE('31-DEC-{y}','DD-MON-YYYY')",
+    }
 
-# ----------------------------------------------------------------------
-# Display decisions
-# ----------------------------------------------------------------------
+
+# ------------------------------------------------------------------------------
+# Display decisions & wideners
+# ------------------------------------------------------------------------------
 def determine_display_mode(user_query: str, rows: list) -> str:
-    """
-    Decide how to render results.
-    - If the user asks for BOTH (summary + table), return "both".
-    - If they ask only for table/grid, return "table".
-    - If they ask only for summary/report, return "summary".
-    - Otherwise use simple heuristics (row count → table).
-    """
     uq = (user_query or "").strip().lower()
     want_table = bool(re.search(r'\b(show|list|display|table|tabular|rows|grid)\b', uq))
     want_summary = bool(re.search(r'\b(summary|summarise|summarize|overview|report|insights?|analysis|analyze|describe|explain|update|status)\b', uq))
-
-    # Nothing to show yet → keep summary so UI can render a message
     if not rows:
         return "summary"
-
-    # Explicit asks win
     if want_summary and want_table:
         return "both"
     if want_table:
         return "table"
     if want_summary:
         return "summary"
-
-    # WH-questions default to summary unless user said table
     if re.match(r'^\s*(who|what|which|when|where|why|how)\b', uq):
         return "summary"
-
-    # Heuristic fallback
-    if len(rows) > 50:
-        return "table"
     return "table"
 
-# ----------------------------------------------------------------------
-# SQL execution (reads cache; fills cache)
-# ----------------------------------------------------------------------
-def run_sql(sql: str, selected_db: str, *, cache_ok: bool = True) -> list:
-    hit = _cache_get_result(selected_db, sql)
-    if hit:
-        return hit["rows"]
-    with connect_to_source(selected_db) as (conn, _):
-        cur = conn.cursor()
-        _set_case_insensitive_session(cur)
-        cur.execute(sql)
-        cols = [desc[0] for desc in cur.description]
-        rows = [{cols[i]: to_jsonable(row[i]) for i in range(len(cols))} for row in cur]
-    _cache_set_result(selected_db, sql, cols, rows, cache_ok=cache_ok)
-    return rows
+# --- generic-ness detector used by wide projection & widener ------------------
+_GENERIC_MAX_TOKENS = 5
+_SPECIFIC_HINTS_RX = re.compile(
+    r"\b(sum|total|avg|average|count|max|min|rate|percent|percentage|ratio|"
+    r"where|=|>=|<=|between|group\s+by|order\s+by|top\s+\d+|limit|fetch)\b",
+    re.IGNORECASE
+)
+_SINGLE_DATE_RX = re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b")
 
-# ----------------------------------------------------------------------
-# Table extraction + optional widen for summaries
-# ----------------------------------------------------------------------
-_TABLE_FROM_RE = re.compile(
-    r"\bfrom\s+([A-Za-z0-9_\.]+)\s*(?:[A-Za-z0-9_]+)?\s*(?:where|group|order|fetch|union|minus|intersect|$)",
-    flags=re.IGNORECASE | re.DOTALL,
+def _tokenize_words(q: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9]+", q or "")
+
+def _user_requested_time_window(q: str) -> bool:
+    _TIME_KEYWORDS_RX = re.compile(
+        r"\b(today|yesterday|this (?:week|month|quarter|year)|last (?:week|month|quarter|year)|"
+        r"last \d+\s+days?|past \d+\s+days?|last \d+\s+months?|from \d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+(?:to|and)\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
+        re.IGNORECASE,
+    )
+    _MONTH_WITH_YEAR_RX = re.compile(
+        r'\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|'
+        r'aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{2,4}\b', re.I)
+    return (
+        bool(_TIME_KEYWORDS_RX.search(q or "")) or
+        extract_explicit_date_range(q) is not None or
+        bool(_MON_YYYY_ANY.search(q or "")) or
+        bool(_MONTH_WITH_YEAR_RX.search(q or "")) or
+        bool(_SINGLE_DAY_RX.search(q or ""))
+    )
+
+
+def _looks_specific_question(q: str) -> bool:
+    uq = (q or "").strip()
+    if not uq:
+        return False
+    if _SPECIFIC_HINTS_RX.search(uq):
+        return True
+    if _user_requested_time_window(uq) or _SINGLE_DATE_RX.search(uq):
+        return True
+    toks = _tokenize_words(uq)
+    return any(any(ch.isdigit() for ch in t) for t in toks)
+
+def _is_generic_browse(q: str) -> bool:
+    toks = _tokenize_words(q)
+    if not toks:
+        return False
+    if len(toks) > _GENERIC_MAX_TOKENS:
+        return False
+    return not _looks_specific_question(q)
+
+_SELECT_HEAD_RX = re.compile(r"(?is)^\s*select\s+.*?\bfrom\b")
+_GROUP_BY_TAIL = re.compile(
+    r'(?is)\s+group\s+by\b.*?(?=(\s*\border\b|\s*\bfetch\b|\s*\boffset\b|\s*\blimit\b|$))'
 )
 
-# Replace the old regex + function
-_FROM_BLOCK_RE = re.compile(
-    r'(?is)\bfrom\b\s+(.*?)\s*(?:\bwhere\b|\bgroup\b|\border\b|\bfetch\b|\bunion\b|\bminus\b|\bintersect\b|$)'
-)
+
+def _strip_group_by_with_star(sql: str) -> str:
+    if re.match(r'(?is)^\s*select\s+\*\s+from\b', sql or '') and re.search(r'(?is)\bgroup\s+by\b', sql or ''):
+        # keep a spacer so "DEPT ORDER BY" doesn’t become "DEPTORDER BY"
+        out = _GROUP_BY_TAIL.sub(' ', sql)
+        # normalize double spaces that can appear after rewrites
+        out = re.sub(r'\s{2,}', ' ', out)
+        return out.strip()
+    return sql
+
+def enforce_wide_projection_for_generic(user_query: str, sql: str) -> str:
+    if not sql or not _is_generic_browse(user_query):
+        return sql
+    if re.search(r"(?is)^\s*select\s+\*\s+from\b", sql):
+        out = sql
+    else:
+        out = _SELECT_HEAD_RX.sub("SELECT * FROM ", sql, count=1)
+    if not re.search(r"(?is)\bfetch\s+first\s+\d+\s+rows\s+only\b", out):
+        m = re.search(r"(?is)\b(offset|limit)\b", out)
+        if m:
+            out = out[:m.start()].rstrip() + " FETCH FIRST 200 ROWS ONLY " + out[m.start():]
+        else:
+            out = out.rstrip() + " FETCH FIRST 200 ROWS ONLY"
+    out = _strip_group_by_with_star(out)
+    return out
+
+_FROM_BLOCK_RE = re.compile(r'(?is)\bfrom\b\s+(.*?)\s*(?:\bwhere\b|\bgroup\b|\border\b|\bfetch\b|\bunion\b|\bminus\b|\bintersect\b|$)')
 
 def extract_main_table(sql: str) -> Optional[str]:
-    """
-    Return the first table after FROM, even if the query has JOINs/aliases/NATURAL JOIN.
-    """
     if not sql:
         return None
     m = _FROM_BLOCK_RE.search(sql)
     if not m:
         return None
-
     block = m.group(1).strip()
-    # Take the part before any join/comma/ON keyword
     head = re.split(r'(?i)\bjoin\b|\bnatural\b|\bon\b|,', block)[0].strip()
-    # Remove alias; keep only the table token (quoted or unquoted)
     m2 = re.match(r'\s*(?:"([^"]+)"|([A-Za-z0-9_\.]+))', head)
     if not m2:
         return None
     t = m2.group(1) or m2.group(2)
     return t.strip()
 
-
-def _allowed_tables_from_context(schema_chunks: List[str]) -> List[str]:
-    """Pull a deduped list of table names from the schema context."""
-    rx = re.compile(r"\bTABLE\s+([A-Za-z0-9_\.]+)", re.IGNORECASE)
-    seen = set()
-    out: List[str] = []
-    for chunk in schema_chunks or []:
-        for m in rx.finditer(chunk):
-            t = m.group(1).strip()
-            u = t.upper()
-            if u not in seen:
-                seen.add(u)
-                out.append(t)
-    return out
-
-def _norm_token(s: str) -> str:
-    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
-
-def _fuzzy_find_table(user_query: str, schema_tables: List[str], threshold: float = 0.90) -> Optional[str]:
-    """
-    Best fuzzy match between user text and schema table names.
-    Handles spaces vs underscores and small typos. Works with fully qualified names too.
-    """
-    uq = _norm_token(user_query)
-    best, best_ratio = None, 0.0
-    for t in schema_tables or []:
-        for cand in (t, t.split('.')[-1]):  # full and short
-            r = difflib.SequenceMatcher(None, _norm_token(cand), uq).ratio()
-            if r > best_ratio:
-                best, best_ratio = t, r
-    return best if best_ratio >= threshold else None
-
-def _guess_table_from_query(user_query: str, schema_chunks: List[str]) -> Optional[str]:
-    """
-    Heuristic: choose the longest table name that appears (full or unqualified)
-    in the user text. If no literal match, try fuzzy.
-    """
-    if not user_query:
-        return None
-    uq = user_query.lower()
-    candidates: List[Tuple[int, str]] = []
-    allowed = _allowed_tables_from_context(schema_chunks)
-
-    for t in allowed:
-        tl = t.lower()
-        short = tl.split(".")[-1]
-        if tl in uq or short in uq:
-            candidates.append((len(short), t))
-
-    if candidates:
-        candidates.sort(reverse=True)  # prefer longer/stronger match
-        return candidates[0][1]
-
-    # Fuzzy fallback (handles spaces vs underscores, small typos)
-    return _fuzzy_find_table(user_query, allowed)
-
-
-def _explicit_single_table_report_request(user_query: str, schema_chunks: List[str]) -> Optional[str]:
-    """
-    True when user asks for a 'report/summary of <one table>' with no join cues.
-    Returns that table name or None if not applicable.
-    """
-    if not _is_report_like(user_query):
-        return None
-    uq = (user_query or "").lower()
-    # any obvious join/compare language → not single-table
-    if re.search(r"\b(join|merge|link|combine|across|between\s+tables|compare|vs\.?|union)\b", uq):
-        return None
-
-    # count how many allowed table names are mentioned
-    tables = _allowed_tables_from_context(schema_chunks)
-    mentioned = []
-    for t in tables:
-        tl = t.lower()
-        short = tl.split(".")[-1]
-        if tl in uq or short in uq:
-            mentioned.append(t)
-
-    if len(mentioned) == 1:
-        return mentioned[0]
-
-    # fallback: try our guesser
-    return _fuzzy_find_table(user_query, tables)
-
-
-def widen_results_if_needed(rows: list, original_sql: str, selected_db: str, display_mode: str) -> list:
-    if display_mode != "summary":
+def widen_results_if_needed(rows: list, original_sql: str, selected_db: str, display_mode: str, user_query: str) -> list:
+    # Only widen for generic browse-style queries
+    generic = _is_generic_browse(user_query)
+    if not generic:
         return rows
+
+    # Don’t widen non-tabular or empty results
     if not rows or not isinstance(rows[0], dict):
         return rows
-    if len(rows[0].keys()) > 3:
+
+    # Never widen aggregates or grouped queries
+    if re.search(r'(?is)\b(sum|avg|count|min|max)\s*\(', original_sql or '') or re.search(r'(?is)\bgroup\s+by\b', original_sql or ''):
         return rows
+
     table = extract_main_table(original_sql or "")
     if not table:
         return rows
+
+    # Preserve original WHERE when widening
+    m = re.search(r'(?is)\bwhere\b(.*?)(?=\bgroup\b|\border\b|\bfetch\b|\boffset\b|\blimit\b|$)', original_sql or '')
+    widened_sql = f"SELECT * FROM {table}"
+    if m and m.group(1).strip():
+        widened_sql += f" WHERE {m.group(1).strip()}"
+    widened_sql += " FETCH FIRST 200 ROWS ONLY"
+
     try:
-        widened_sql = f"SELECT * FROM {table} FETCH FIRST 200 ROWS ONLY"
         widened = run_sql(widened_sql, selected_db, cache_ok=False)
+        # If widening didn’t help (no rows), keep original
         return widened or rows
     except Exception as e:
         logger.warning(f"Widen failed for {table}: {e}")
         return rows
 
-# ----------------------------------------------------------------------
-# Descriptive, well-detailed summary/report
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Descriptive summarizer (pure Python – stable)
+# ------------------------------------------------------------------------------
 def summarize_results(rows: list, user_query: str) -> str:
+    if len(rows) == 1 and isinstance(rows[0], dict) and len(rows[0]) == 1:
+        k, v = next(iter(rows[0].items()))
+        def _fmt(x): 
+            from decimal import Decimal
+            if isinstance(x, Decimal): x = float(x)
+            s = f"{x:,.2f}"; return s.rstrip("0").rstrip(".")
+        return f"{k.replace('_',' ').title()}: {_fmt(v)}"
     if not rows:
-        return "No results found."
+        return "### Executive summary\n- No results found.\n\n### Key KPIs\n- —\n\n### Coverage & data quality\n- 0 rows returned"
     if not isinstance(rows[0], dict):
-        return f"Rows: {len(rows)}"
+        return f"### Executive summary\n- {len(rows)} row(s) returned\n\n### Key KPIs\n- Non-tabular output"
 
-    from collections import Counter, defaultdict
-    n = len(rows)
     cols = list(rows[0].keys())
-
-    SAMPLE_MAX = 6000
-    sample = rows if n <= SAMPLE_MAX else rows[::max(1, n // SAMPLE_MAX)][:SAMPLE_MAX]
-
-    METRIC_HINT = re.compile(r'(amt|amount|total|price|sal|salary|value|qty|quantity|cost|revenue|sales|score|count|rate|percent|pct|efficiency|output)$', re.I)
-    ID_NAME_HINT = re.compile(r'(?:^|_)(id|no|code|key|num|number)$', re.I)
+    METRIC_HINT = re.compile(r'(amt|amount|total|price|sal|salary|value|qty|quantity|cost|revenue|sales|score|count|rate|percent|p|efficiency|output)$', re.I)
     LABEL_HINT = re.compile(r'(name|title|desc|description|label)$', re.I)
-
+    ID_NAME_HINT = re.compile(r'(?:^|_)(id|code|no|num|number)$', re.I)
     ISO_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}')
     ORA_DATE = re.compile(r'^(\d{2})-([A-Za-z]{3})-(\d{2,4})')
-    MON = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+    # add these two just after your existing HINT regexes
+    KPI_EXTRA_RX  = re.compile(r'(qty|quantity|dhu|eff|rate|percent|pct|defect|rej|stain|dirty)', re.I)
+    RATE_LIKE_RX  = re.compile(r'(rate|pct|percent|dhu|eff)', re.I)
 
     def is_num(v): return isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)
     def is_date_like(v):
         if isinstance(v, (datetime, date)): return True
         if isinstance(v, str): return bool(ISO_DATE.match(v) or ORA_DATE.match(v))
         return False
-    def to_dt(v):
-        if isinstance(v, datetime): return v
-        if isinstance(v, date): return datetime(v.year, v.month, v.day)
-        if isinstance(v, str):
-            s = v.strip()
-            try:
-                return datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                m = ORA_DATE.match(s[:11])
-                if m:
-                    dd = int(m.group(1)); mon = MON.get(m.group(2).upper(), 1); yy = int(m.group(3))
-                    if yy < 100: yy += 2000 if yy < 50 else 1900
-                    try: return datetime(yy, mon, dd)
-                    except Exception: return None
-        return None
     def fmt_num(x):
         if x is None: return "—"
         if isinstance(x, Decimal): x = float(x)
-        s = f"{x:,.2f}"
-        return s.rstrip("0").rstrip(".")
-    def col_vals(c, rl): return [r.get(c) for r in rl]
+        s = f"{x:,.2f}"; return s.rstrip("0").rstrip(".")
 
-    numeric, dates, cats, nulls, label_cols = [], [], [], [], []
+    numeric, dates, cats, label_cols = [], [], [], []
     for c in cols:
-        vals = col_vals(c, sample)
+        vals = [r.get(c) for r in rows]
         non_null = [v for v in vals if v not in (None, "")]
-        if len(vals) - len(non_null):
-            nulls.append((c, len(vals) - len(non_null), len(vals)))
         if not non_null:
             continue
         probe = next((v for v in non_null if v not in (None, "")), None)
@@ -623,7 +852,7 @@ def summarize_results(rows: list, user_query: str) -> str:
             name_is_metric = bool(METRIC_HINT.search(c))
             name_looks_id = bool(ID_NAME_HINT.search(c))
             uniq_ratio = len(set(non_null)) / max(1, len(non_null))
-            if name_looks_id and not name_is_metric:
+            if name_looks_id and not name_is_metric: 
                 continue
             if uniq_ratio > 0.98 and not name_is_metric:
                 continue
@@ -632,136 +861,816 @@ def summarize_results(rows: list, user_query: str) -> str:
             dates.append(c)
         else:
             uniq = len(set(non_null))
-            limit = min(20, max(5, int(0.7 * len(non_null))))
             avg_len = sum(len(str(v)) for v in non_null[:500]) / min(500, len(non_null))
             if LABEL_HINT.search(c):
                 label_cols.append(c)
-            if 1 < uniq <= limit and avg_len <= 40:
+            if 1 < uniq <= min(20, max(5, int(0.7 * len(non_null)))) and avg_len <= 40:
                 cats.append(c)
 
     label = label_cols[0] if label_cols else (cats[0] if cats else (cols[0] if cols else None))
-
     numeric.sort(key=lambda c: (not bool(METRIC_HINT.search(c)), c.lower()))
-    metrics = numeric[:2]
-    cats = cats[:2]
-    dates = dates[:1]
+    metrics = numeric[:2]; cats = cats[:2]; dates = dates[:1]
+    # NEW: capture all KPI-like numeric columns (falls back to first few numerics if none match)
+    all_numeric = [c for c in numeric if KPI_EXTRA_RX.search(c)] or numeric[:3]
+    primary_line = None; primary_metric_summary = None
+    if metrics:
+        c = metrics[0]
+        vals = [float(v) for v in (r.get(c) for r in rows) if isinstance(v, (int,float,Decimal))]
+        if vals:
+            vals.sort(); mn, mx = vals[0], vals[-1]
+            med = median(vals); avg = sum(vals)/len(vals)
+            p80 = vals[min(len(vals)-1, int(round(0.80*(len(vals)-1))))] if len(vals) > 1 else vals[0]
+            total = sum(vals)
+            primary_metric_summary = (c, mn, med, avg, p80, mx, total)
+            primary_line = f"{c}: total {fmt_num(total)}, avg {fmt_num(avg)}, median {fmt_num(med)}."
 
-    bullets = []
-    opening = f"This dataset contains {n:,} row(s) across {len(cols)} column(s)."
-    bullets.append(f"• Scope: {opening}")
+    exec_lines = [f"{len(rows):,} row(s), {len(cols)} column(s)."]
+    if label and metrics: exec_lines.insert(0, f"Key view by **{label}** with metric **{metrics[0]}**.")
+    if primary_line: exec_lines.append(primary_line)
 
-    top_cat_for_narrative = None
-    from collections import Counter
-    for c in cats:
-        vals = [v for v in col_vals(c, sample) if v not in (None, "")]
+    kpi_bullets = []
+    if primary_metric_summary:
+        c, mn, med, avg, p80, mx, total = primary_metric_summary
+        kpi_bullets.append(f"- {c}: min {fmt_num(mn)}, p80 {fmt_num(p80)}, max {fmt_num(mx)}")
+        kpi_bullets.append(f"- {c}: total {fmt_num(total)}, average {fmt_num(avg)}, median {fmt_num(med)}")
+    # NEW: append totals (or averages for rate-like) for the rest of the KPI-like metrics
+    for c in all_numeric:
+        # skip the primary metric if it’s already summarized above
+        if metrics and c == metrics[0]:
+            continue
+        vals = [float(v) for v in (r.get(c) for r in rows) if is_num(v)]
         if not vals:
             continue
-        cnt = Counter(vals)
-        total = sum(cnt.values())
-        top = cnt.most_common(8)
-        parts = [f"{k} ({v:,} • {v/total:.0%})" for k, v in top]
-        bullets.append(f"• {c}: " + ", ".join(parts))
-        if top and top_cat_for_narrative is None:
-            top_cat_for_narrative = (c, top)
-
-    def pctl(sorted_vals, p):
-        if not sorted_vals: return None
-        k = (len(sorted_vals)-1) * p
-        f = int(k); c = f if k.is_integer() else f+1
-        if f == c: return sorted_vals[f]
-        return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
-
-    primary_metric_summary = None
-    for idx, c in enumerate(metrics):
-        vals = [float(v) for v in col_vals(c, sample) if is_num(v)]
-        if not vals:
-            continue
-        vals.sort()
-        mn, mx, med = vals[0], vals[-1], median(vals)
-        avg = sum(vals)/len(vals)
-        p80 = pctl(vals, 0.80)
-        total = sum(vals)
-        bullets.append(f"• {c}: min {fmt_num(mn)}, median {fmt_num(med)}, avg {fmt_num(avg)}, p80 {fmt_num(p80)}, max {fmt_num(mx)}, sum {fmt_num(total)}")
-        if primary_metric_summary is None:
-            primary_metric_summary = (c, mn, med, avg, p80, mx)
-
+        agg = (sum(vals) / len(vals)) if RATE_LIKE_RX.search(c) else sum(vals)
+        prefix = "Avg" if RATE_LIKE_RX.search(c) else "Total"
+        kpi_bullets.append(f"- {c}: {prefix} {fmt_num(agg)}")
+    ll_bullets = []
     if cats and metrics:
         from collections import defaultdict
         cat = cats[0]; metric = metrics[0]
         agg = defaultdict(lambda: {"n": 0, "s": 0.0})
-        for r in sample:
-            k = r.get(cat)
-            v = r.get(metric)
-            if k in (None, "") or not isinstance(v, (int, float, Decimal)):
+        for r in rows:
+            k = r.get(cat); v = r.get(metric)
+            if k in (None, "") or not isinstance(v, (int,float,Decimal)): 
                 continue
-            agg[k]["n"] += 1
-            agg[k]["s"] += float(v)
+            agg[k]["n"] += 1; agg[k]["s"] += float(v)
         if agg:
-            items = sorted(agg.items(), key=lambda kv: kv[1]["n"], reverse=True)[:6]
-            parts = [f"{k}: avg {fmt_num(v['s']/v['n'])}, total {fmt_num(v['s'])} (n={v['n']:,})" for k, v in items]
-            bullets.append(f"• {cat} × {metric}: " + "; ".join(parts))
+            ranked = sorted(agg.items(), key=lambda kv: kv[1]["s"], reverse=True)
+            top = ranked[:3]; bottom = ranked[-2:] if len(ranked) >= 2 else []
+            if top:    ll_bullets.append("- Top categories (total): " + "; ".join(f"{k} {fmt_num(v['s'])}" for k, v in top))
+            if bottom: ll_bullets.append("- Bottom categories (total): " + "; ".join(f"{k} {fmt_num(v['s'])}" for k, v in bottom))
 
-    for c in dates:
-        dts = [to_dt(v) for v in col_vals(c, sample)]
-        dts = [d for d in dts if d]
+    cov_bullets = [f"- Rows: {len(rows):,}"]
+    if dates:
+        c = dates[0]
+        dts = []
+        for v in (r.get(c) for r in rows):
+            if isinstance(v, datetime): dts.append(v)
+            elif isinstance(v, date):  dts.append(datetime(v.year, v.month, v.day))
         if dts:
             early, late = min(dts), max(dts)
-            bullets.append(f"• {c}: from {early.date()} to {late.date()}")
+            cov_bullets.append(f"- {c}: {early.date()} to {late.date()}")
 
-    flagged = [(c, k, k/total) for c, k, total in nulls if total and (k/total) >= 0.10]
-    flagged.sort(key=lambda t: t[2], reverse=True)
-    for c, k, r in flagged[:3]:
-        bullets.append(f"• {c}: {k:,} nulls ({r:.0%})")
+    notes = [
+        "- Figures are derived from the returned rows only.",
+        "- Ask for a time window or specific KPI for a focused breakdown.",
+    ]
 
-    narrative_parts = []
-    if top_cat_for_narrative:
-        c, top = top_cat_for_narrative
-        lead_name, lead_cnt = top[0]
-        total = sum(v for _, v in top)
-        share = f"{lead_cnt/total:.0%}" if total else "—"
-        narrative_parts.append(f"In categorical terms, **{c}** is led by **{lead_name}** ({share}).")
-    if primary_metric_summary:
-        c, mn, med, avg, p80, mx = primary_metric_summary
-        narrative_parts.append(f"The primary metric **{c}** spans {fmt_num(mn)}–{fmt_num(mx)} (median {fmt_num(med)}, average {fmt_num(avg)}, 80th percentile {fmt_num(p80)}).")
+    out = []
+    out.append("### Executive summary"); out.append("- " + " ".join(exec_lines))
+    out.append("\n### Key KPIs"); out.extend(kpi_bullets or ["- No numeric KPIs detected"])
+    if ll_bullets: out.append("\n### Leaders & laggards"); out.extend(ll_bullets)
+    out.append("\n### Coverage & data quality"); out.extend(cov_bullets)
+    out.append("\n### Notes"); out.extend(notes)
+    return "\n".join(out).strip()
 
-    conclusion = (
-        "Overall, the report summarises distribution, key categories, and coverage. "
-        "If you need a floor-wise or line-wise update (e.g., sewing output/efficiency), "
-        "specify the time window and KPI, and I’ll produce a focused breakdown."
+# ------------------------------------------------------------------------------
+# Plan → SQL (deterministic)
+# ------------------------------------------------------------------------------
+from functools import lru_cache
+
+@lru_cache(maxsize=512)
+def _get_table_colmeta(selected_db: str, table: str) -> Dict[str, str]:
+    """
+    Return {COL_NAME_UPPER: DATA_TYPE_UPPER} for a table.
+    Supports OWNER.TABLE too.
+    """
+    owner = None
+    tbl = table
+    if "." in table:
+        owner, tbl = table.split(".", 1)
+
+    sql = (
+        "SELECT column_name, data_type FROM user_tab_columns WHERE table_name = :tbl"
+        if not owner else
+        "SELECT column_name, data_type FROM all_tab_columns WHERE owner=:own AND table_name=:tbl"
+    )
+    meta: Dict[str, str] = {}
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        try:
+            if owner:
+                cur.execute(sql, own=owner.upper(), tbl=tbl.upper())
+            else:
+                cur.execute(sql, tbl=tbl.upper())
+            for name, dtype in cur.fetchall():
+                meta[str(name).upper()] = str(dtype).upper()
+        finally:
+            try: cur.close()
+            except: pass
+    return meta
+
+def _is_numeric(selected_db: str, table: str, col: str) -> bool:
+    meta = _get_table_colmeta(selected_db, table)
+    dt = meta.get(col.upper(), "")
+    return any(k in dt for k in ("NUMBER","INTEGER","FLOAT","BINARY"))
+
+def _is_char(selected_db: str, table: str, col: str) -> bool:
+    dt = _get_table_colmeta(selected_db, table).get(col.upper(), "")
+    return any(k in dt for k in ("CHAR","VARCHAR","NCHAR","CLOB"))
+
+def _is_date(selected_db: str, table: str, col: str) -> bool:
+    meta = _get_table_colmeta(selected_db, table)
+    dt = meta.get(col.upper(), "")
+    return "DATE" in dt or "TIMESTAMP" in dt
+
+def _quote_value(v) -> str:
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return str(v)
+    if isinstance(v, list):
+        parts = ", ".join(_quote_value(x) for x in v)
+        return f"({parts})"
+    s = str(v)
+    return "'" + s.replace("'", "''") + "'"
+
+def pick_best_date_column(table: str, rng: Dict[str, str], selected_db: str) -> Optional[str]:
+    """Probe candidate date columns to see which one has rows in the range."""
+    meta = _get_table_colmeta(selected_db, table)
+    date_cols = [c for c, dt in meta.items() if "DATE" in dt or "TIMESTAMP" in dt]
+    if not date_cols:
+        return None
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        for c in date_cols:
+            probe = f"""
+            SELECT 1 FROM {table}
+             WHERE {c} BETWEEN {rng['start']} AND {rng['end']}
+               AND ROWNUM = 1
+            """
+            try:
+                cur.execute(probe)
+                r = cur.fetchone()
+                if r:
+                    try: cur.close()
+                    except: pass
+                    return c
+            except Exception:
+                continue
+        try: cur.close()
+        except: pass
+    return None
+
+def build_sql_from_plan(plan: Dict[str, Any], selected_db: str, user_query: str) -> str:
+    """
+    Compose SELECT from a validated plan.
+    Supports:
+      - dims: strings OR {"expr": "TO_CHAR(date_col,'MON-YY')", "as": "MONTH"}
+      - metrics: numeric cols
+      - optional filters, date range (from user question), order_by, limit
+      - (optional) two-table join if plan includes {"tables":[...], "joins":[{"left":"T1.COL","right":"T2.COL","type":"INNER"}]}
+
+    Note: dims/metrics/date_col are validated against the FIRST table (see _validate_plan).
+          Filters may reference columns from either side of a 2-table join; in SQL we will
+          qualify those columns with their owning table to avoid ambiguity and check types
+          against the correct table.
+    """
+    table = plan.get("table")
+    dims = plan.get("dims") or []
+    metrics = plan.get("metrics") or []
+    date_col = plan.get("date_col") or None
+    filters = plan.get("filters") or []
+    order_by = plan.get("order_by") or []
+    limit = plan.get("limit", None)
+
+    asked_window = _user_requested_time_window(user_query)
+
+    # Optional multi-table support (strict planner/validator governs correctness)
+    tables_in_plan: List[str] = plan.get("tables") or []
+    joins = plan.get("joins") or []
+
+    # Helpers to resolve a filter column's owning table (when joined) and qualify it
+    def _owner_table_for(col: str) -> Optional[str]:
+        candidates = tables_in_plan[:] if tables_in_plan else ([table] if table else [])
+        for tt in candidates:
+            if col and col.upper() in _get_table_colmeta(selected_db, tt):
+                return tt
+        return None
+
+    def _qcol(col: str) -> str:
+        owner = _owner_table_for(col)
+        return f"{owner}.{col}" if owner and tables_in_plan else col
+
+    select_parts: List[str] = []
+    group_by_parts: List[str] = []
+    where_parts: List[str] = []
+
+    # Decide base table early (we need this to validate dims/metrics later)
+    type_table = table or (tables_in_plan[0] if tables_in_plan else None)
+
+    # -----------------
+    # Filters (owner-aware & qualified)
+    # -----------------
+    for f in filters:
+        col, op, val = f["col"], f["op"], f["val"]
+        parsed = _parse_tochar_expr(col) if isinstance(col, str) else None
+
+        if parsed:
+            # Handle TO_CHAR(<date_col>,'FMT') predicates safely (expression already unambiguous)
+            dcol, fmt = parsed
+            if isinstance(val, str) and op == "=":
+                sval = val.strip()
+                # Normalize MON-YY <-> MON-YYYY as needed
+                if re.match(r"^[A-Za-z]{3}-\d{4}$", sval, re.I) and fmt == "MON-YY":
+                    col = f"TO_CHAR({dcol}, 'MON-YYYY')"
+                elif re.match(r"^[A-Za-z]{3}-\d{2}$", sval, re.I) and fmt == "MON-YYYY":
+                    col = f"TO_CHAR({dcol}, 'MON-YY')"
+                where_parts.append(f"UPPER({col}) = UPPER({_quote_value(sval)})")
+            elif op == "LIKE":
+                lit = val
+                if isinstance(val, str) and not any(ch in val for ch in ("%","_")):
+                    lit = f"%{val.strip()}%"
+                where_parts.append(f"UPPER({col}) LIKE UPPER({_quote_value(lit)})")
+            elif op == "IN" and isinstance(val, list):
+                where_parts.append(f"{col} IN {_quote_value(val)}")
+            else:
+                where_parts.append(f"{col} {op} {_quote_value(val)}")
+
+        else:
+            # Non-TO_CHAR columns — resolve owner for type checks and qualification
+            if op == "BETWEEN" and isinstance(val, list) and len(val) == 2:
+                v1, v2 = val[0], val[1]
+                owner_tbl = _owner_table_for(col)
+                # Date-safe BETWEEN (avoid implicit NLS conversions)
+                if owner_tbl and _is_date(selected_db, owner_tbl, col):
+                    def _date_lit(s: str) -> str:
+                        s = str(s).strip()
+                        if _DATE_YMD.match(s):
+                            return f"DATE '{s}'"
+                        if _DATE_DMON.match(s):
+                            fmt = "DD-MON-YYYY" if len(s.split('-')[-1]) == 4 else "DD-MON-YY"
+                            return f"TO_DATE('{s}','{fmt}')"
+                        if _DATE_DMON_SPACE.match(s):
+                            d_str, mon_str, y_str = s.split()
+                            mon3 = mon_str[:3].upper()
+                            fmt = "DD-MON-YYYY" if len(y_str) == 4 else "DD-MON-YY"
+                            lit = f"{int(d_str):02d}-{mon3}-{y_str}"
+                            return f"TO_DATE('{lit}','{fmt}')"
+                        if _DATE_DMY.match(s):
+                            fmt = "DD/MM/YYYY" if len(s.split('/')[-1]) == 4 else "DD/MM/YY"
+                            return f"TO_DATE('{s}','{fmt}')"
+                        # fallback: keep as-is (won't break validation)
+                        return _quote_value(s)
+                    where_parts.append(
+                        f"{_qcol(col)} BETWEEN {_date_lit(v1)} AND {_date_lit(v2)}"
+                    )
+                else:
+                    where_parts.append(f"{_qcol(col)} BETWEEN {_quote_value(v1)} AND {_quote_value(v2)}")
+                continue
+            elif op == "LIKE":
+                owner_tbl = _owner_table_for(col)
+                if owner_tbl and _is_date(selected_db, owner_tbl, col) and isinstance(val, str):
+                    sval = val.strip()
+                    if not asked_window and (_is_single_day_literal(sval) or _MON_YYYY_ANY.match(sval) or _YEAR_TOKEN.match(sval)):
+                        # avoid accidental single-day/month/year LIKE on date col if no window requested
+                        continue
+
+                    lit = val  # default literal for LIKE
+                    if _MON_YYYY_ANY.match(sval):
+                        year = (sval.split()[-1] if " " in sval else sval.split("-")[-1])
+                        fmt = "MON-YYYY" if len(year) == 4 else "MON-YY"
+                        sval = sval.replace(" ", "-")
+                        lit = sval
+                    elif _MON_YYYY.match(sval):
+                        fmt = "MON-YYYY" if len(sval.split("-")[1]) == 4 else "MON-YY"
+                        lit = sval
+                    elif _DATE_DMON_SPACE.match(sval):
+                        d_str, mon_str, y_str = sval.split()
+                        mon3 = mon_str[:3].upper()
+                        fmt = "DD-MON-YYYY" if len(y_str) == 4 else "DD-MON-YY"
+                        lit = f"{int(d_str):02d}-{mon3}-{y_str}"
+                    elif _DATE_YMD.match(sval):
+                        fmt = "YYYY-MM-DD"
+                    elif _DATE_DMY.match(sval):
+                        fmt = "DD/MM/YYYY" if len(sval.split("/")[-1]) == 4 else "DD/MM/YY"
+                    else:
+                        fmt = "DD-MON-YYYY"
+
+                    if isinstance(lit, str) and not any(ch in lit for ch in ("%","_")):
+                        lit = f"%{lit.strip()}%"
+                    where_parts.append(
+                        f"UPPER(TO_CHAR({_qcol(col)}, '{fmt}')) LIKE UPPER({_quote_value(lit)})"
+                    )
+                else:
+                    lit = val
+                    if isinstance(val, str) and not any(ch in val for ch in ("%","_")):
+                        lit = f"%{val.strip()}%"
+                    where_parts.append(f"UPPER({_qcol(col)}) LIKE UPPER({_quote_value(lit)})")
+
+            else:
+                # Equality / inequality etc.
+                owner_tbl = _owner_table_for(col)
+                if owner_tbl and _is_date(selected_db, owner_tbl, col):
+                    # Skip planner’s JSON placeholders for dates (e.g., {"$gte": ...})
+                    if isinstance(val, dict):
+                        continue  # rely on rng (explicit/month/relative) added later
+
+                    if not isinstance(val, str):
+                        continue  # unsafe equality on date without a parsable string
+
+                    sval = val.strip()
+
+                    # If user did not ask for a window, drop single-day/month/year equals
+                    if (not asked_window and (op in ("=", "LIKE")) and
+                        (_is_single_day_literal(sval) or _MON_YYYY_ANY.match(sval) or _YEAR_TOKEN.match(sval))):
+                        continue
+
+                    if _DATE_YMD.match(sval):
+                        where_parts.append(f"{_qcol(col)} {op} DATE '{sval}'")
+                    elif _DATE_DMON.match(sval):
+                        fmt = "DD-MON-YYYY" if len(sval.split('-')[-1]) == 4 else "DD-MON-YY"
+                        where_parts.append(f"{_qcol(col)} {op} TO_DATE('{sval}','{fmt}')")
+                    elif _DATE_DMON_SPACE.match(sval):
+                        d_str, mon_str, y_str = sval.split()
+                        mon3 = mon_str[:3].upper()
+                        fmt = "DD-MON-YYYY" if len(y_str) == 4 else "DD-MON-YY"
+                        lit = f"{int(d_str):02d}-{mon3}-{y_str}"
+                        where_parts.append(f"{_qcol(col)} {op} TO_DATE('{lit}','{fmt}')")
+                    elif _DATE_DMY.match(sval):
+                        fmt = "DD/MM/YYYY" if len(sval.split('/')[-1]) == 4 else "DD/MM/YY"
+                        where_parts.append(f"{_qcol(col)} {op} TO_DATE('{sval}','{fmt}')")
+                    elif _MON_YYYY_ANY.match(sval) and op == "=":
+                        year = (sval.split()[-1] if " " in sval else sval.split("-")[-1])
+                        fmt = "MON-YYYY" if len(year) == 4 else "MON-YY"
+                        sval_norm = sval.replace(" ", "-")
+                        where_parts.append(f"UPPER(TO_CHAR({_qcol(col)}, '{fmt}')) = UPPER({_quote_value(sval_norm)})")
+                    elif _YEAR_TOKEN.match(sval):
+                        y = int(sval)
+                        where_parts.append(
+                            f"{_qcol(col)} BETWEEN TO_DATE('01-JAN-{y}','DD-MON-YYYY') "
+                            f"AND TO_DATE('31-DEC-{y}','DD-MON-YYYY')"
+                        )
+                    # IMPORTANT: do NOT fall back to a generic quoted compare for date cols
+                else:
+                    where_parts.append(f"{_qcol(col)} {op} {_quote_value(val)}")
+    # --- before deriving rng ---
+    # If a date BETWEEN already exists, skip adding rng to avoid duplicates
+    has_date_between = False
+    if date_col:
+        qd = _qcol(date_col)
+        for w in where_parts:
+            if re.search(rf'(?i)\b{re.escape(qd)}\b\s+BETWEEN\b', w):
+                has_date_between = True
+                break
+    # User explicit date range (explicit > single-day > month-token > relative)
+    rng = (None if has_date_between else
+        extract_explicit_date_range(user_query)
+        or extract_single_day_range(user_query)
+        or extract_month_token_range(user_query)
+        or extract_relative_date_range(user_query)
     )
 
-    return "Detailed report:\n" + " ".join(narrative_parts) + "\n" + "\n".join(bullets) + "\n" + conclusion
+    # If no explicit/month/relative/year, try a single-day token (e.g., 21-AUG-25)
+    if not rng:
+        rng2 = extract_single_day_range(user_query)
+        if rng2:
+            candidate_table = table or (tables_in_plan[0] if tables_in_plan else None)
+            if candidate_table:
+                if date_col and _is_date(selected_db, candidate_table, date_col):
+                    rng = {"column": date_col, "start": rng2["start"], "end": rng2["end"]}
+                else:
+                    best = pick_best_date_column(candidate_table, rng2, selected_db)
+                    if best:
+                        rng = {"column": best, "start": rng2["start"], "end": rng2["end"]}
 
-# ----------------------------------------------------------------------
-# Entity lookup: fast path (value probe)
-# ----------------------------------------------------------------------
-_NAMEISH = {"NAME", "FULL_NAME", "ENAME", "TITLE", "JOB", "POSITION", "ROLE", "DESIGNATION"}
+    # Optional deterministic default time policy
+    if not rng and not asked_window and DEFAULT_TIME_DAYS > 0:
+        today = datetime.now().date()
+        start = datetime(today.year, today.month, today.day) - timedelta(days=DEFAULT_TIME_DAYS - 1)
+        end   = datetime(today.year, today.month, today.day)
+        rng2 = {"start": _to_oracle_date(start), "end": _to_oracle_date(end)}
+        candidate_table = table or (tables_in_plan[0] if tables_in_plan else None)
+        if candidate_table:
+            if date_col and _is_date(selected_db, candidate_table, date_col):
+                rng = {"column": date_col, "start": rng2["start"], "end": rng2["end"]}
+            else:
+                best = pick_best_date_column(candidate_table, rng2, selected_db)
+                if best:
+                    rng = {"column": best, "start": rng2["start"], "end": rng2["end"]}
 
+    # If we had explicit range but no column yet, choose now
+    if rng and "column" not in rng:
+        candidate_table = table or (tables_in_plan[0] if tables_in_plan else None)
+        if candidate_table:
+            if date_col and _is_date(selected_db, candidate_table, date_col):
+                rng = {"column": date_col, "start": rng["start"], "end": rng["end"]}
+            else:
+                best = pick_best_date_column(candidate_table, rng, selected_db)
+                if best:
+                    rng = {"column": best, "start": rng["start"], "end": rng["end"]}
+                else:
+                    rng = None
+
+    # If we added a month/date/year range, remove redundant predicates on the same date column
+    if rng:
+        _RE_TOCHAR_ANY = re.compile(
+            r"TO_CHAR\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*'([A-Za-z\-]+)'\s*\)",
+            re.IGNORECASE,
+        )
+        rng_col = (rng.get("column") or "").upper()
+
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "")).strip().upper()
+
+        cleaned = []
+        for w in where_parts:
+            wn = _norm(w)
+            drop = False
+
+            # 3a) Drop TO_CHAR(MON-YY|MON-YYYY) equality on the same date column
+            mm = _RE_TOCHAR_ANY.search(w)
+            if mm:
+                dcol = (mm.group(1) or "").upper()
+                if dcol == rng_col and re.search(r"=\s*UPPER\('[A-Za-z]{3}-\d{2,4}'\)", w, re.IGNORECASE):
+                    drop = True
+
+            # 3b) Drop direct single-day equality on the same date column
+            if not drop:
+                if wn.startswith(f"{rng_col} = DATE '") and re.search(r"DATE '\d{4}-\d{2}-\d{2}'$", wn):
+                    drop = True
+                elif wn.startswith(f"{rng_col} = TO_DATE("):
+                    drop = True
+                elif wn.startswith(f"{rng_col} = '"):
+                    drop = True
+
+            # 3c) NEW — when a window is applied, drop date predicates on *other* date columns
+            if not drop:
+                other_date_pred = re.search(
+                    r"(?is)\b([A-Za-z_][A-Za-z0-9_\.]*)\s*(=|<=|>=|<|>|LIKE)\s*"
+                    r"(?:DATE\s*'\d{4}-\d{2}-\d{2}'|TO_DATE\s*\(|UPPER\s*\(\s*TO_CHAR\s*\()",
+                    w,
+                )
+                if other_date_pred:
+                    other_col = other_date_pred.group(1).split(".")[-1].upper()
+                    if other_col != rng_col:
+                        drop = True
+
+            if not drop:
+                cleaned.append(w)
+
+        where_parts = cleaned
+
+    # Dims: strings or expr-as
+    dim_aliases = set()
+    for d in dims:
+        if isinstance(d, str):
+            select_parts.append(d); group_by_parts.append(d)
+        elif isinstance(d, dict) and "expr" in d:
+            parsed = _parse_tochar_expr(d["expr"])
+            if not parsed:
+                raise ValueError(f"Invalid TO_CHAR dimension: {d}")
+            col, fmt = parsed
+            candidate_table = table or (tables_in_plan[0] if tables_in_plan else None)
+            if not candidate_table:
+                raise ValueError("No table provided for TO_CHAR dimension")
+            if not _is_date(selected_db, candidate_table, col):
+                raise ValueError(f"TO_CHAR used on non-date column: {col}")
+            alias = d.get("as")
+            if alias:
+                select_parts.append(f"TO_CHAR({col}, '{fmt}') AS {alias}")
+                dim_aliases.add(alias)
+            else:
+                select_parts.append(f"TO_CHAR({col}, '{fmt}')")
+            group_by_parts.append(f"TO_CHAR({col}, '{fmt}')")
+        else:
+            raise ValueError("Unsupported dim type")
+
+    # Metrics
+    type_table = table or (tables_in_plan[0] if tables_in_plan else None)
+    if metrics:
+        for m in metrics:
+            if type_table and _is_numeric(selected_db, type_table, m):
+                select_parts.append(f"SUM({m}) AS {m}")
+            else:
+                select_parts.append(f"COUNT(*) AS ROWS")
+    else:
+        if not select_parts:
+            select_parts.append("*")
+
+    # Build base FROM (support optional 2-table join)
+    if tables_in_plan and joins:
+        tnames = [t for t in tables_in_plan if t][:2]
+        if len(tnames) < 2:
+            base_from = f"FROM {tnames[0]}" if tnames else f"FROM {table}"
+        else:
+            j = joins[0]
+            jtype = (j.get("type") or "INNER").upper()
+            left_key = j.get("left")
+            right_key = j.get("right")
+            if not (left_key and right_key):
+                base_from = f"FROM {tnames[0]}"
+            else:
+                base_from = f"FROM {tnames[0]} {jtype} JOIN {tnames[1]} ON {left_key} = {right_key}"
+    else:
+        base_from = f"FROM {table}"
+
+    sql = f"SELECT {', '.join(select_parts)} {base_from}"
+
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
+    if rng:
+        sql = apply_date_range_constraint(sql, rng)
+
+    # GROUP BY (only when both dims and metrics exist)
+    if metrics and group_by_parts:
+        sql += " GROUP BY " + ", ".join(group_by_parts)
+
+    # ORDER BY (only by selected metric/dim or alias)
+    if order_by:
+        safe_keys = set(metrics) | set([d for d in dims if isinstance(d, str)]) | dim_aliases
+        order_items = []
+        for ob in order_by:
+            key = ob.get("key"); direction = ob.get("dir", "DESC")
+            if key in safe_keys:
+                order_items.append(f"{key} {direction}")
+        if order_items:
+            sql += " ORDER BY " + ", ".join(order_items)
+
+    # LIMIT (FETCH FIRST N ROWS ONLY)
+    if limit is not None:
+        try:
+            n = int(limit)
+        except Exception:
+            n = 200
+        n = min(max(n, 1), 500)
+        sql += f" FETCH FIRST {n} ROWS ONLY"
+
+    return sql
+
+# ------------------------------------------------------------------------------
+# Type/predicate guards
+# ------------------------------------------------------------------------------
+_ALIAS_ITEM_RX = re.compile(r'(?is)\bfrom\b\s+(.*?)\s*(?:\bwhere\b|\bgroup\b|\border\b|\bfetch\b|$)')
+_SPLIT_ITEMS_RX = re.compile(r'(?is)\bjoin\b|,')
+_TABLE_ALIAS_RX = re.compile(r'(?is)^\s*(?:"([^"]+)"|([A-Za-z0-9_\.]+))\s*(?:AS\s+)?([A-Za-z0-9_]+)?')
+
+def _parse_tables_and_aliases(sql: str) -> Dict[str, str]:
+    out = {}
+    m = _ALIAS_ITEM_RX.search(sql or "")
+    if not m: return out
+    block = m.group(1)
+    for it in [s.strip() for s in _SPLIT_ITEMS_RX.split(block) if s.strip()]:
+        mm = _TABLE_ALIAS_RX.match(it)
+        if not mm: continue
+        table = mm.group(1) or mm.group(2)
+        alias = (mm.group(3) or table.split(".")[-1]).upper()
+        out[alias] = table
+    return out
+
+def enforce_predicate_type_compat(sql: str, selected_db: str) -> None:
+    alias2table = _parse_tables_and_aliases(sql)
+    def dtype(alias, col):
+        tbl = alias2table.get(alias.upper()) if alias else (next(iter(alias2table.values())) if len(alias2table)==1 else None)
+        if not tbl: return None
+        return _get_table_colmeta(selected_db, tbl).get(col.upper(), "")
+    # TRUNC(col)
+    for m in re.finditer(r'(?is)TRUNC\s*\(\s*(?:"([^"]+)"\.)?([A-Za-z0-9_]+)\s*\)', sql or ""):
+        dt = dtype(m.group(1), m.group(2)) or ""
+        if "DATE" not in dt and "TIMESTAMP" not in dt:
+            raise ValueError(f"TRUNC used on non-date column {m.group(2)}")
+    # col LIKE ...
+    for m in re.finditer(r'(?is)\b(?:"([^"]+)"\.)?([A-Za-z0-9_]+)\s+LIKE\s+', sql or ""):
+        dt = dtype(m.group(1), m.group(2)) or ""
+        if not any(k in dt for k in ("CHAR","VARCHAR","NCHAR","CLOB")):
+            raise ValueError(f"LIKE used on non-text column {m.group(2)}")
+    # col = TO_DATE(...)
+    for m in re.finditer(r'(?is)\b(?:"([^"]+)"\.)?([A-Za-z0-9_]+)\s*(=|<>|<=|>=|<|>|between)\s*TO_DATE\s*\(', sql or ""):
+        dt = dtype(m.group(1), m.group(2)) or ""
+        if "DATE" not in dt and "TIMESTAMP" not in dt:
+            raise ValueError(f"TO_DATE compared to non-date column {m.group(2)}")
+
+_ORPHAN_LITERAL_WHERE = re.compile(r"(?is)\bwhere\s*'[^']+'\s*(?:group|order|fetch|offset|limit|$)")
+def _has_orphan_literal_where(sql: str) -> bool:
+    return bool(_ORPHAN_LITERAL_WHERE.search(sql or ""))
+
+def is_valid_sql(sql: str, source_id: str) -> bool:
+    s = (sql or "").strip()
+    if not s.lower().startswith("select"): return False
+    if ";" in s: return False
+    if re.search(r":\w+", s, re.IGNORECASE): return False
+    if len(s) > 100000: return False
+    if _has_orphan_literal_where(s): return False
+    try:
+        with connect_to_source(source_id) as (conn, _):
+            cursor = conn.cursor()
+            cursor.prepare(s)  # early sanity check
+            return True
+    except Exception as e:
+        logger.warning(f"[Validation Fail] {e}")
+        return False
+
+# ------------------------------------------------------------------------------
+# Value-aware WHERE rewrite for human labels
+# ------------------------------------------------------------------------------
+from functools import lru_cache as _lru_cache_cols
+
+@_lru_cache_cols(maxsize=512)
+def _get_table_columns(selected_db: str, table: str) -> Set[str]:
+    cols: Set[str] = set()
+    owner = None
+    tbl = table
+    if "." in table:
+        owner, tbl = table.split(".", 1)
+    sql = (
+        "SELECT column_name FROM user_tab_columns WHERE table_name=:tbl"
+        if not owner else
+        "SELECT column_name FROM all_tab_columns WHERE owner=:own AND table_name=:tbl"
+    )
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        try:
+            if owner:
+                cur.execute(sql, own=owner.upper(), tbl=tbl.upper())
+            else:
+                cur.execute(sql, tbl=tbl.upper())
+            for (c,) in cur.fetchall():
+                cols.add(str(c).upper())
+        finally:
+            try: cur.close()
+            except: pass
+    return cols
+
+@_memo(maxsize=512)
+def _guess_text_column_for_literal(selected_db: str, table: str, literal: str) -> Optional[str]:
+    meta = _get_table_colmeta(selected_db, table)
+    text_cols = [c for c, dt in meta.items()
+                 if any(k in dt for k in ("CHAR", "VARCHAR", "NCHAR", "CLOB"))]
+    if not text_cols:
+        return None
+
+    esc_full = literal.upper().replace("'", "''")
+    tokens = [t for t in re.findall(r"[A-Za-z0-9]+", literal.upper()) if len(t) >= 2]
+    tokens = [t for t in tokens if t.lower() not in _STOPWORDS]
+    tokens = [t for t in tokens if not _GENERIC_TOKENS_RX.fullmatch(t)]
+
+    def _score(col: str, cur) -> int:
+        try:
+            cur.execute(f"SELECT 1 FROM {table} WHERE UPPER({col}) LIKE '%{esc_full}%' AND ROWNUM = 1")
+            if cur.fetchone(): return 2
+        except: pass
+        if 1 <= len(tokens) <= 4:
+            and_clause = " AND ".join([f"UPPER({col}) LIKE '%{t}%'" for t in tokens])
+            try:
+                cur.execute(f"SELECT 1 FROM {table} WHERE {and_clause} AND ROWNUM = 1")
+                if cur.fetchone(): return 1
+            except: pass
+        return 0
+
+#    best = None; best_score = -1
+    best = None; best_score = 0
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        for c in text_cols:
+            s = _score(c, cur)
+            if s > best_score:
+                best, best_score = c, s
+                # hard-prefer label-ish columns when matched
+                if s >= 1 and re.search(r'(FLOOR|LINE|PM_OR_APM|NAME|TITLE|DESC|DESCRIPTION|LABEL)$', c, re.I):
+                    break
+    # Only trust a column if we actually saw a hit in the DB
+    return best if best_score >= 1 else None
+
+def value_aware_text_filter(sql: str, selected_db: str) -> str:
+    """
+    Make human-entered labels robust to space/hyphen differences.
+    Rewrites the first simple text predicate into:
+      UPPER(col) LIKE '%VAL%' OR UPPER(REPLACE(REPLACE(col,'-',''),' ','')) LIKE '%NORM%'
+    If the matched predicate is already inside (...), we do NOT add another pair of ().
+    Also ensures the WHERE block has balanced parentheses before the next clause.
+    """
+    table = extract_main_table(sql or "")
+    if not table:
+        return sql
+
+    m = _WHERE_BLOCK_RX.search(sql or "")
+    if not m:
+        return sql
+
+    w_start, w_end = m.span(1)
+    where_part = m.group(1)
+
+    # Match a single column =/LIKE 'literal' (tolerate UPPER(...) on either side)
+    pred_rx = re.compile(
+        r"(?is)(?<!\w)(?:UPPER\(\s*)?([A-Za-z_][A-Za-z0-9_\.]*)\s*(?:\)\s*)?"
+        r"(=|LIKE)\s*(?:UPPER\(\s*)?'([^']+)'(?:\)\s*)?(?=\s*[)\s]|$)"
+    )
+    pm = pred_rx.search(where_part)
+    if not pm:
+        return sql
+
+    raw_val = pm.group(3)
+    esc = raw_val.replace("'", "''")
+    esc_like = esc if any(ch in esc for ch in ("%","_")) else f"%{esc}%"
+    norm = re.sub(r"[\s\-]", "", esc).upper()
+
+    best_col = _guess_text_column_for_literal(selected_db, table, raw_val)
+    if not best_col:
+        return sql
+
+    # Build predicate WITHOUT outer () — we’ll add them only if the match isn’t already wrapped
+    pred_core = (
+        f"UPPER({best_col}) LIKE UPPER('{esc_like}') "
+        f"OR UPPER(REPLACE(REPLACE({best_col},'-',''),' ','')) LIKE UPPER('%{norm}%')"
+    )
+
+    s, e = pm.span()
+    left = where_part[:s]
+    right = where_part[e:]
+
+    # Is the matched predicate already inside parentheses?
+    left_trim  = left.rstrip()
+    right_trim = right.lstrip()
+    already_wrapped = left_trim.endswith("(") and right_trim.startswith(")")
+
+    replacement = pred_core if already_wrapped else f"({pred_core})"
+    new_where = left + replacement + right
+
+    # Final safety: ensure WHERE block has balanced parentheses
+    opens = new_where.count("(")
+    closes = new_where.count(")")
+    if closes < opens:
+        new_where = new_where + (")" * (opens - closes))
+
+    # Keep a space before the next clause token (GROUP|ORDER|...)
+    if not new_where.endswith(" "):
+        new_where = new_where + " "
+
+    return sql[:w_start] + new_where + sql[w_end:]
+
+
+
+# ------------------------------------------------------------------------------
+# Entity-lookup helpers (needle → candidate columns → probe)
+# ------------------------------------------------------------------------------
+_BASE_NAMEISH: Set[str] = {
+    "NAME","FULL_NAME","FIRST_NAME","LAST_NAME","GIVEN_NAME","SURNAME",
+    "TITLE","JOB","POSITION","ROLE","DESIGNATION","DESC","DESCRIPTION","LABEL"
+}
+def _nameish_for_query(q: str) -> Set[str]:
+    tokens = set(_BASE_NAMEISH); uq = (q or "").lower()
+    if re.search(r'\b(product|sku|item|model|brand|category|upc|ean)\b', uq):
+        tokens.update({"PRODUCT","PRODUCT_NAME","ITEM","ITEM_NAME","SKU","MODEL","BRAND","CATEGORY","UPC","EAN"})
+    if re.search(r'\b(order|po|purchase\s*order|invoice|bill|so|sales\s*order)\b', uq):
+        tokens.update({"ORDER","ORDER_NO","ORDER_NUM","ORDER_NUMBER","PO","PO_NO","PO_NUMBER","INVOICE","INVOICE_NO","INVOICE_NUM"})
+    if re.search(r'\b(customer|client|buyer)\b', uq):
+        tokens.update({"CUSTOMER","CLIENT","BUYER","COMPANY","ACCOUNT_NAME"})
+    if re.search(r'\b(supplier|vendor|manufacturer)\b', uq):
+        tokens.update({"SUPPLIER","VENDOR","MANUFACTURER","COMPANY","ORG","ORGANIZATION"})
+    return tokens
+
+_GENERIC_SHORT_WORDS = {
+    "order","orders","summary","report","reports","status","table","tables","grid",
+    "list","display","show","overview","analysis","analytics","trend","trends",
+    "update","updates","kpi","kpis","metrics","revenue","sales","inventory",
+    "backlog","dashboard","data","info","information","help"
+}
 def _is_entity_lookup(q: str) -> bool:
     q = (q or "").strip()
-    return bool(re.search(r"^\s*(who|what)\s+is\b", q, re.I)) or len(q.split()) <= 3
+    if re.match(r"^\s*(who|what)\s+is\b", q, re.I): return True
+    toks = re.findall(r"[A-Za-z0-9]+", q)
+    if not toks or len(toks) > 3: return False
+    low = [t.lower() for t in toks]
+    if all(t in _GENERIC_SHORT_WORDS for t in low): return False
+    if any(any(ch.isdigit() for ch in t) for t in toks): return True
+    if len(toks) == 2 and all(t.isalpha() and len(t) >= 2 for t in toks) and all(t not in _GENERIC_SHORT_WORDS for t in low): return True
+    if len(toks) == 1 and low[0] not in _GENERIC_SHORT_WORDS and len(toks[0]) >= 4: return True
+    return False
 
 def _needle_from_question(q: str) -> str:
     m = re.search(r"(?:who|what)\s+is\s+(.+)", q, re.I)
-    if m:
-        return m.group(1).strip().strip("?")
+    if m: return m.group(1).strip().strip("?")
     return q.strip().strip("?")
 
-_NAME_ROLE_COLS = ("ENAME","NAME","FULL_NAME","TITLE","JOB","POSITION","ROLE","DESIGNATION")
-
-def _list_name_like_columns(selected_db: str, limit_tables: int = 400) -> List[Dict[str, str]]:
+def _list_name_like_columns(selected_db: str, limit_tables: int = 400, query_text: str = "") -> List[Dict[str, str]]:
+    dyn_tokens = sorted(_nameish_for_query(query_text))
+    like_clauses = " OR ".join([f"UPPER(column_name) LIKE '%{t}%'" for t in dyn_tokens])
     sql = f"""
     SELECT /*+ FIRST_ROWS(200) */
            table_name, column_name
       FROM user_tab_columns
      WHERE data_type IN ('VARCHAR2','CHAR','NVARCHAR2','NCHAR')
        AND (
-            { " OR ".join([f"UPPER(column_name) = '{c}'" for c in _NAME_ROLE_COLS]) }
-           OR UPPER(column_name) LIKE '%NAME%'
-           OR UPPER(column_name) LIKE '%TITLE%'
-           OR UPPER(column_name) LIKE '%ROLE%'
-           OR UPPER(column_name) LIKE '%POSITION%'
-           OR UPPER(column_name) LIKE '%DESIGNATION%'
+            { " OR ".join([f"UPPER(column_name) = '{c}'" for c in ("ENAME","NAME","FULL_NAME","TITLE","JOB","POSITION","ROLE","DESIGNATION")]) }
+            OR {like_clauses if like_clauses else "1=0"}
        )
      FETCH FIRST {limit_tables} ROWS ONLY
     """
@@ -777,6 +1686,7 @@ def _list_name_like_columns(selected_db: str, limit_tables: int = 400) -> List[D
         finally:
             try: cur.close()
             except: pass
+    out = [x for x in out if not _is_banned_table(x["table"])]
     seen = set(); dedup = []
     for x in out:
         k = (x["table"], x["column"])
@@ -785,15 +1695,13 @@ def _list_name_like_columns(selected_db: str, limit_tables: int = 400) -> List[D
     return dedup
 
 def _merge_candidates(primary: List[Dict[str, str]], fallback: List[Dict[str, str]], cap: int = 200) -> List[Dict[str, str]]:
-    seen = set()
-    merged = []
+    seen = set(); merged = []
     for lst in (primary, fallback):
         for x in lst:
             k = (x["table"], x["column"])
             if k not in seen:
                 merged.append(x); seen.add(k)
-            if len(merged) >= cap:
-                return merged
+            if len(merged) >= cap: return merged
     return merged
 
 def _candidate_columns(selected_db: str, query_text: str, top_k: int = 12) -> List[Dict[str, str]]:
@@ -803,14 +1711,14 @@ def _candidate_columns(selected_db: str, query_text: str, top_k: int = 12) -> Li
         meta = (h or {}).get("metadata", {})
         if meta.get("kind") == "column" and meta.get("source_table") and meta.get("column"):
             cols.append({"table": meta["source_table"], "column": meta["column"]})
-    seen = set()
-    dedup = []
+    seen = set(); dedup = []
     for c in cols:
         key = (c["table"], c["column"])
         if key not in seen:
-            dedup.append(c)
-            seen.add(key)
-    dedup.sort(key=lambda c: 0 if any(k in c["column"].upper() for k in _NAMEISH) else 1)
+            dedup.append(c); seen.add(key)
+    dedup = [c for c in dedup if not _is_banned_table(c["table"])]
+    nameish = _nameish_for_query(query_text)
+    dedup.sort(key=lambda c: 0 if any(k in (c["column"] or "").upper() for k in nameish) else 1)
     return dedup[:25]
 
 def _quick_value_probe(selected_db: str, needle: str, candidates: List[Dict[str, str]], limit_per_col: int = 5) -> List[Dict[str, Any]]:
@@ -819,10 +1727,11 @@ def _quick_value_probe(selected_db: str, needle: str, candidates: List[Dict[str,
     esc = needle.upper().replace("'", "''")
     results: List[Dict[str, Any]] = []
     with connect_to_source(selected_db) as (conn, _):
-        cur = conn.cursor()
-        _set_case_insensitive_session(cur)
+        cur = conn.cursor(); _set_case_insensitive_session(cur)
         for c in candidates:
             table = c["table"]; col = c["column"]
+            if _is_banned_table(table):
+                continue
             sql = f"SELECT {col} FROM {table} WHERE UPPER({col}) LIKE '%{esc}%' AND ROWNUM <= {limit_per_col}"
             try:
                 cur.execute(sql)
@@ -830,901 +1739,6 @@ def _quick_value_probe(selected_db: str, needle: str, candidates: List[Dict[str,
                     results.append({"table": table, "column": col, "value": to_jsonable(r[0])})
             except Exception:
                 continue
-        try:
-            cur.close()
-        except Exception:
-            pass
+        try: cur.close()
+        except Exception: pass
     return results[:50]
-
-# --- Date range parsing -------------------------------------------------
-# Handles:
-#   "<col> between 01/07/2025 and 31/07/2025"
-#   "<col> will be between 01/07/2025 and 31/07/2025"
-#   "<col> is between 01/07/2025 and 31/07/2025"
-DATE_RANGE_PATTERNS = [
-    re.compile(
-        r"\b(?P<col>[A-Za-z_][A-Za-z0-9_]*)\s*(?:is|was|are|were|will\s+be|shall\s+be|be)\s+between\s+"
-        r"(?P<d1>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(?:and|to)\s+(?P<d2>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?P<col>[A-Za-z_][A-Za-z0-9_]*)\s*(?:between|from)\s+"
-        r"(?P<d1>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(?:and|to)\s+(?P<d2>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        re.IGNORECASE,
-    ),
-]
-
-# Words that must NEVER be treated as a column name
-_DATE_RANGE_STOPWORDS = {"be", "is", "was", "are", "were", "will", "shall"}
-
-def _try_match_date_range(text: str):
-    for rx in DATE_RANGE_PATTERNS:
-        m = rx.search(text or "")
-        if not m:
-            continue
-        col = (m.group("col") or "").strip()
-        if col.lower() in _DATE_RANGE_STOPWORDS:
-            continue
-        d1 = _parse_day_first_date(m.group("d1"))
-        d2 = _parse_day_first_date(m.group("d2"))
-        if d1 and d2:
-            if d2 < d1:
-                d1, d2 = d2, d1
-            return col, d1, d2
-    return None
-
-def extract_explicit_date_range(user_query: str) -> Optional[Dict[str, str]]:
-    hit = _try_match_date_range(user_query)
-    if not hit:
-        return None
-    col, d1, d2 = hit
-    return {"column": col, "start": _to_oracle_date(d1), "end": _to_oracle_date(d2)}
-
-# --- Date-range hint for the prompt -----------------------------------------
-def _date_range_hint_for_prompt(user_query: str) -> str:
-    hit = _try_match_date_range(user_query)
-    if not hit:
-        return ""
-    col, d1, d2 = hit
-    return (
-        "USER-SPECIFIED DATE RANGE:\n"
-        f"- The user provided a range for column {col}.\n"
-        f"- Use: WHERE {col} BETWEEN {_to_oracle_date(d1)} AND {_to_oracle_date(d2)}\n"
-        "Do not invent other time filters."
-    )
-
-# ----------------------------------------------------------------------
-# Guardrail: remove unrequested time predicates
-# ----------------------------------------------------------------------
-_TIME_KEYWORDS_RX = re.compile(
-    r"\b(today|yesterday|this (?:week|month|quarter|year)|last (?:week|month|quarter|year)|"
-    r"last \d+\s+days?|past \d+\s+days?|last \d+\s+months?|from \d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+(?:to|and)\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
-    re.IGNORECASE,
-)
-
-def _user_requested_time_window(q: str) -> bool:
-    return bool(_TIME_KEYWORDS_RX.search(q or "")) or extract_explicit_date_range(q) is not None
-
-def strip_unprompted_time_filters(sql: str, user_query: str) -> str:
-    """
-    If the user didn't ask for a timeframe, remove obviously time-based WHERE clauses.
-    Keeps non-time filters intact. Heuristic; intentionally conservative.
-    """
-    if _user_requested_time_window(user_query):
-        return sql
-
-    parts = re.split(r"(?i)\bWHERE\b", sql, maxsplit=1)
-    if len(parts) != 2:
-        return sql
-
-    before, after = parts[0], parts[1]
-    m = re.search(r"(?i)\b(GROUP|ORDER|FETCH|OFFSET|LIMIT)\b", after)
-    cond = after if not m else after[:m.start()]
-    tail = "" if not m else after[m.start():]
-
-    # Tokenize on AND/OR while keeping connectors
-    tokens = re.split(r"(\band\b|\bor\b)", cond, flags=re.IGNORECASE)
-    keep: List[str] = []
-
-    def is_timey(s: str) -> bool:
-        s = s or ""
-        if re.search(r"(SYSDATE|SYSTIMESTAMP|CURRENT_DATE|TO_DATE\s*\(|TRUNC\s*\()", s, re.IGNORECASE):
-            return True
-        if re.search(r"(date|dt|time|hiredate|created|updated|txn|order_date|post_date|delivery)", s, re.IGNORECASE) and \
-           re.search(r"\bbetween\b|>=|<=|<|>", s, re.IGNORECASE):
-            return True
-        return False
-
-    pending = None
-    for t in tokens:
-        if re.fullmatch(r"\s*(and|or)\s*", t, flags=re.IGNORECASE):
-            pending = t.strip().upper()
-            continue
-        clause = (t or "").strip()
-        if not clause:
-            continue
-        if is_timey(clause):
-            pending = None
-            continue
-        if keep and pending:
-            keep.append(pending)
-        keep.append(clause)
-        pending = None
-
-    if not keep:
-        return (before + " " + tail).strip()
-
-    clean_where = " ".join(keep).strip()
-    return f"{before}WHERE {clean_where} {tail}".rstrip()
-
-_GROUP_BY_TAIL = re.compile(
-    r'(?is)\s+group\s+by\b.*?(?=(\border\b|\bfetch\b|\boffset\b|\blimit\b|$))'
-)
-
-def _strip_group_by_with_star(sql: str) -> str:
-    """If the statement is SELECT * ... GROUP BY ..., drop the GROUP BY clause."""
-    if re.match(r'(?is)^\s*select\s+\*\s+from\b', sql or '') and re.search(r'(?is)\bgroup\s+by\b', sql or ''):
-        return _GROUP_BY_TAIL.sub('', sql).strip()
-    return sql
-
-
-# ----------------------------------------------------------------------
-# Main (non-streaming)
-# ----------------------------------------------------------------------
-def process_question(user_query: str, selected_db: str) -> dict:
-    logger.info(f"[User Query] {user_query} (DB: {selected_db})")
-
-    results = hybrid_schema_value_search(user_query, selected_db=selected_db, top_k=10)
-    schema_chunks = [r["document"] for r in results] if results else []
-    if not schema_chunks:
-        return {"error": "No schema context found."}
-
-    # ---- Fast path for entity lookups ----
-    if _is_entity_lookup(user_query):
-        needle = _needle_from_question(user_query)
-        candidates = _candidate_columns(selected_db, user_query)
-        if len(candidates) < 5:
-            meta_cols = _list_name_like_columns(selected_db)
-            candidates = _merge_candidates(candidates, meta_cols, cap=200)
-
-        probe_hits = _quick_value_probe(selected_db, needle, candidates)
-        if probe_hits:
-            from collections import Counter
-            cc = Counter((h["table"], h["column"]) for h in probe_hits)
-            def score(k):
-                t, c = k
-                boost = 1 if any(n in c.upper() for n in _NAMEISH) else 0
-                return (cc[k], boost)
-            best_table, best_col = sorted(cc.keys(), key=score, reverse=True)[0]
-            esc = needle.upper().replace("'", "''")
-            sql = f"SELECT * FROM {best_table} WHERE UPPER({best_col}) LIKE '%{esc}%' FETCH FIRST 200 ROWS ONLY"
-            try:
-                rows = run_sql(sql, selected_db)
-                if not rows and extract_explicit_date_range(user_query):
-                    return {
-                        "status": "success",
-                        "summary": "No data found for the requested date range.",
-                        "sql": sql,
-                        "display_mode": determine_display_mode(user_query, []),  # or determine_display_mode(user_query, [])
-                        "results": {"columns": [], "rows": [], "row_count": 0},
-                        "schema_context": schema_chunks,
-                    }
-                if not rows:
-                    main_table = extract_main_table(sql or "")
-                    if main_table:
-                        try:
-                            sample_sql = f"SELECT * FROM {main_table} FETCH FIRST 200 ROWS ONLY"
-                            rows = run_sql(sample_sql, selected_db)
-                            if rows:
-                                sql = sample_sql
-                        except Exception as e:
-                            logger.warning(f"Sample fallback failed for {main_table}: {e}")
-            except Exception as e:
-                logger.error(f"[Probe SQL Error] {e}")
-                return {"error": f"Oracle query failed: {str(e)}", "sql": sql}
-
-            display_mode = determine_display_mode(user_query, rows)
-
-            rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode)
-            python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-
-            if display_mode in ["summary", "both"]:
-                cols_for_llm = list(rows_for_summary[0].keys()) if rows_for_summary else []
-                try:
-                    summary = summarize_with_mistral(
-                        user_query=user_query,
-                        columns=cols_for_llm,
-                        rows=rows_for_summary,
-                        backend_summary=python_summary,
-                        sql=sql,
-                    ) if SUMMARY_ENGINE == "llm" else python_summary
-                except Exception as e:
-                    logger.warning(f"LLM summary failed, falling back to python summary: {e}")
-                    summary = python_summary
-            else:
-                summary = ""
-
-            return {
-                "status": "success",
-                "summary": summary,
-                "sql": sql,
-                "display_mode": display_mode,
-                "results": {
-                    "columns": list(rows[0].keys()) if rows else [],
-                    "rows": [list(r.values()) for r in rows] if rows else [],
-                    "row_count": len(rows),
-                },
-                "schema_context": schema_chunks,
-            }
-        # fall through to LLM path if no probe hits
-
-    # ---- LLM path ----
-    prompt = generate_sql_prompt(schema_chunks, user_query)
-    sql = cached_call_ollama(prompt, model=OLLAMA_SQL_MODEL)
-    sql = sql.strip().removeprefix("sql").strip("`").strip().rstrip(";")
-    sql = handle_bind_variables(sql, user_query)
-    sql = normalize_dates(sql)
-    # enforce explicit date range & raw table asks
-    rng = extract_explicit_date_range(user_query)
-    sql = apply_date_range_constraint(sql, rng)
-    sql = enforce_raw_table_request(user_query, sql)
-    sql = strip_unprompted_time_filters(sql, user_query) # ← guardrail
-    sql = _strip_group_by_with_star(sql)  
-    logger.info(f"[Generated SQL] {sql}")
-
-    # --- Execute, with retry+fallback, and ensure `rows` is always defined ---
-    used_fallback = False
-
-    if not is_valid_sql(sql, selected_db):
-        logger.warning("[Retry] Initial SQL failed. Retrying.")
-        sql = retry_with_stricter_prompt(user_query, schema_chunks, "parse/validation error")
-        sql = sql.strip().removeprefix("sql").strip("`").strip().rstrip(";")
-        sql = handle_bind_variables(sql, user_query)
-        sql = normalize_dates(sql)
-        rng = extract_explicit_date_range(user_query)
-        sql = apply_date_range_constraint(sql, rng)
-        sql = enforce_raw_table_request(user_query, sql)
-        sql = strip_unprompted_time_filters(sql, user_query)
-        sql = _strip_group_by_with_star(sql)
-
-        if not is_valid_sql(sql, selected_db):
-            # Heuristic fallback to a safe table sample
-            tbl = extract_main_table(sql) or _guess_table_from_query(user_query, schema_chunks)
-            if tbl:
-                # IMPORTANT: if user gave an explicit date range, do NOT sample
-                if extract_explicit_date_range(user_query):
-                    return {"error": "Could not generate valid SQL for the specified date range.", "sql": sql}
-                fallback = f"SELECT * FROM {tbl} FETCH FIRST 200 ROWS ONLY"
-                if is_valid_sql(fallback, selected_db):
-                    logger.info(f"[Fallback] Using table sample from {tbl}")
-                    sql = fallback
-                    rows = run_sql(sql, selected_db, cache_ok=False)  # run once
-                    used_fallback = True
-                else:
-                    return {"error": "Retry failed to produce valid SQL.", "sql": sql}
-            else:
-                return {"error": "Retry failed to produce valid SQL.", "sql": sql}
-
-    # If we did NOT take the fallback path, execute the (validated) SQL now
-    if not used_fallback:
-        try:
-            rows = run_sql(sql, selected_db)
-            if not rows and extract_explicit_date_range(user_query):
-                return {
-                    "status": "success",
-                    "summary": "No data found for the requested date range.",
-                    "sql": sql,
-                    "display_mode": determine_display_mode(user_query, []),
-                    "results": {"columns": [], "rows": [], "row_count": 0},
-                    "schema_context": schema_chunks,
-                }
-        except Exception as e:
-            logger.error(f"[Oracle Error] {e}")
-            return {"error": f"Oracle query failed: {str(e)}", "sql": sql}
-
-    display_mode = determine_display_mode(user_query, rows)
-
-    rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode)
-    python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-
-    if display_mode in ["summary", "both"]:
-        cols_for_llm = list(rows_for_summary[0].keys()) if rows_for_summary else []
-        try:
-            summary = summarize_with_mistral(
-                user_query=user_query,
-                columns=cols_for_llm,
-                rows=rows_for_summary,
-                backend_summary=python_summary,
-                sql=sql,
-            ) if SUMMARY_ENGINE == "llm" else python_summary
-        except Exception as e:
-            logger.warning(f"LLM summary failed, falling back to python summary: {e}")
-            summary = python_summary
-    else:
-        summary = ""
-
-    return {
-        "status": "success",
-        "summary": summary,
-        "sql": sql,
-        "display_mode": display_mode,
-        "results": {
-            "columns": list(rows[0].keys()) if rows else [],
-            "rows": [list(r.values()) for r in rows] if rows else [],
-            "row_count": len(rows),
-        },
-        "schema_context": schema_chunks,
-    }
-
-# If the user asked for a table/show/list, make sure we return a wide sample
-_TABLE_LIKE_RE = re.compile(r"\b(show|list|display|table|grid|all columns)\b", re.I)
-
-def enforce_raw_table_request(user_query: str, sql: str) -> str:
-    if not _TABLE_LIKE_RE.search(user_query or ""):
-        return sql
-
-    rng = extract_explicit_date_range(user_query)
-    has_where = bool(re.search(r"\bWHERE\b", sql or "", re.I))
-    has_join = bool(re.search(r"\bJOIN\b|\bNATURAL\b", sql or "", re.I))
-    m = _TABLE_FROM_RE.search(sql or "")  # keep your existing regex if you still use it
-    main_tbl = extract_main_table(sql or "")
-
-    def ensure_fetch(s: str) -> str:
-        return s if re.search(r"fetch\s+first\s+\d+\s+rows\s+only", s, re.I) else s.rstrip() + " FETCH FIRST 200 ROWS ONLY"
-
-    # Force SELECT * but keep everything after FROM
-    sql_star = re.sub(r"(?is)^select\s+.*?\bfrom\b", "SELECT * FROM ", sql or "", count=1)
-
-    if rng:
-        sql_star = apply_date_range_constraint(sql_star, rng)
-        return ensure_fetch(sql_star)
-
-    if has_where:
-        # respect existing filters
-        return ensure_fetch(sql_star)
-
-    # NEW: user wants a grid, no filters, and the SQL has JOINs → just show a single-table sample
-    if has_join and main_tbl:
-        return f"SELECT * FROM {main_tbl} FETCH FIRST 200 ROWS ONLY"
-
-    # Otherwise: raw sample of the first table we can find
-    if main_tbl:
-        return f"SELECT * FROM {main_tbl} FETCH FIRST 200 ROWS ONLY"
-
-    # Fallback to previous behavior if we couldn't determine the table safely
-    if m:
-        table = m.group(1)
-        return f"SELECT * FROM {table} FETCH FIRST 200 ROWS ONLY"
-
-    return sql
-
-def _repair_sql_on_runtime_error(sql: str, selected_db: str, err_msg: str) -> Optional[str]:
-    em = (err_msg or "").upper()
-
-    # ORA-00979: invalid GROUP BY expression
-    if "ORA-00979" in em:
-        fixed = _strip_group_by_with_star(sql)
-        if fixed != sql:
-            return fixed
-        tbl = extract_main_table(sql)
-        if tbl:
-            return f"SELECT * FROM {tbl} FETCH FIRST 200 ROWS ONLY"
-
-    # ORA-00904/00942: invalid identifier or table/view does not exist
-    if "ORA-00904" in em or "ORA-00942" in em:
-        tbl = extract_main_table(sql)
-        if tbl:
-            return f"SELECT * FROM {tbl} FETCH FIRST 200 ROWS ONLY"
-
-    return None
-
-
-# ----------------------------------------------------------------------
-# Streaming
-# ----------------------------------------------------------------------
-async def process_question_streaming(
-    user_query: str, selected_db: str
-) -> AsyncGenerator[dict, None]:
-    sql = ""
-    logger.info(f"[User Query - Streaming] {user_query} (DB: {selected_db})")
-
-    try:
-        # Phase 1: retrieval
-        yield {"phase": "Searching schema context...", "stage": "retrieval"}
-        await asyncio.sleep(0)
-        results = hybrid_schema_value_search(user_query, selected_db=selected_db, top_k=10)
-        schema_chunks = [r["document"] for r in results] if results else []
-        user_has_explicit_range = extract_explicit_date_range(user_query) is not None
-        if not schema_chunks:
-            yield {"error": {"error": "NO_SCHEMA_CONTEXT", "message": "No relevant schema information found"}}
-            await asyncio.sleep(0)
-            return
-
-        # Phase 1.5: entity probe
-        if _is_entity_lookup(user_query):
-            needle = _needle_from_question(user_query)
-            yield {"phase": f"Looking up '{needle}' in likely columns...", "stage": "entity_probe"}
-            await asyncio.sleep(0)
-            candidates = _candidate_columns(selected_db, user_query)
-            if len(candidates) < 5:
-                meta_cols = _list_name_like_columns(selected_db)
-                candidates = _merge_candidates(candidates, meta_cols, cap=200)
-
-            probe_hits = _quick_value_probe(selected_db, needle, candidates)
-            if probe_hits:
-                from collections import Counter
-                cc = Counter((h["table"], h["column"]) for h in probe_hits)
-                def score(k):
-                    t, c = k
-                    boost = 1 if any(n in c.upper() for n in _NAMEISH) else 0
-                    return (cc[k], boost)
-                best_table, best_col = sorted(cc.keys(), key=score, reverse=True)[0]
-                esc = needle.upper().replace("'", "''")
-                sql = f"SELECT * FROM {best_table} WHERE UPPER({best_col}) LIKE '%{esc}%' FETCH FIRST 200 ROWS ONLY"
-                yield {"phase": "Executing query...", "stage": "execute", "sql": sql}
-                await asyncio.sleep(0)
-
-                # cache check
-                hit = _cache_get_result(selected_db, sql)
-                if hit:
-                    display_mode = determine_display_mode(user_query, hit["rows"])
-                    rows_for_summary = widen_results_if_needed(hit["rows"], sql, selected_db, display_mode)
-                    python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-                    if display_mode in ["summary", "both"]:
-                        cols_for_llm = list(rows_for_summary[0].keys()) if rows_for_summary else []
-                        summary = summarize_with_mistral(
-                            user_query=user_query,
-                            columns=cols_for_llm,
-                            rows=rows_for_summary,
-                            backend_summary=python_summary,
-                            sql=sql,
-                        ) if SUMMARY_ENGINE == "llm" else python_summary
-                    else:
-                        summary = ""
-
-                    if display_mode not in ["summary", "both"]:
-                        yield {"phase": "Done", "stage": "done"}
-                        await asyncio.sleep(0)
-
-                    response: Dict[str, Any] = {
-                        "status": "success",
-                        "sql": sql,
-                        "display_mode": display_mode,
-                        "results": {
-                            "columns": hit["columns"],
-                            "rows": [list(r.values()) for r in hit["rows"]] if display_mode in ["table", "both"] else [],
-                            "row_count": hit["row_count"],
-                        },
-                        "schema_context": schema_chunks,
-                        "summary": summary,
-                    }
-                    yield response
-                    return
-
-                try:
-                    rows = run_sql(sql, selected_db)
-                except Exception as e:
-                    yield {"error": {"error": "ORACLE_ERROR", "message": str(e), "sql": sql}}
-                    await asyncio.sleep(0)
-                    return
-
-                display_mode = determine_display_mode(user_query, rows)
-
-                rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode)
-                python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-                if display_mode in ["summary", "both"]:
-                    cols_for_llm = list(rows_for_summary[0].keys()) if rows_for_summary else []
-                    summary = summarize_with_mistral(
-                        user_query=user_query,
-                        columns=cols_for_llm,
-                        rows=rows_for_summary,
-                        backend_summary=python_summary,
-                        sql=sql,
-                    ) if SUMMARY_ENGINE == "llm" else python_summary
-                else:
-                    summary = ""
-
-                response: Dict[str, Any] = {
-                    "status": "success",
-                    "sql": sql,
-                    "display_mode": display_mode,
-                    "results": {
-                        "columns": list(rows[0].keys()) if rows else [],
-                        "rows": [list(r.values()) for r in rows] if display_mode in ["table", "both"] else [],
-                        "row_count": len(rows),
-                    },
-                    "schema_context": schema_chunks,
-                    "summary": summary,
-                }
-
-                if display_mode not in ["summary", "both"]:
-                    yield {"phase": "Done", "stage": "done"}
-                    await asyncio.sleep(0)
-
-                yield response
-                return
-            else:
-                yield {"phase": "No direct hits; switching to LLM...", "stage": "switch_llm"}
-                await asyncio.sleep(0)
-
-        # Phase 2: SQL generation
-        yield {"phase": "Generating SQL...", "stage": "sql_gen"}
-        await asyncio.sleep(0)
-        prompt = generate_sql_prompt(schema_chunks, user_query)
-        sql = cached_call_ollama(prompt, model=OLLAMA_SQL_MODEL)
-        sql = sql.strip().removeprefix("sql").strip("`").strip().rstrip(";")
-        sql = handle_bind_variables(sql, user_query)
-        sql = normalize_dates(sql)
-        rng = extract_explicit_date_range(user_query)
-        sql = apply_date_range_constraint(sql, rng)
-        sql = enforce_raw_table_request(user_query, sql)
-        # NEW: remove unrequested time filters
-        new_sql = strip_unprompted_time_filters(sql, user_query)
-        if new_sql != sql:
-            sql = new_sql
-            yield {"phase": "Removed unrequested time filter", "stage": "rewrite", "sql": sql}
-            await asyncio.sleep(0)
-            yield {"phase": "Tip: add a timeframe for a focused report (e.g., 'last month' or '01/07/2025 to 31/07/2025').", "stage": "hint"}
-            await asyncio.sleep(0)
-
-        # ✅ Always sanitize after the time-filter step (regardless of change)
-        sql = _strip_group_by_with_star(sql)
-
-        yield {"phase": "SQL ready", "stage": "sql_ready", "sql": sql}
-
-        await asyncio.sleep(0)
-        logger.info(f"[Generated SQL] {sql}")
-
-        # Phase 3: light validation
-        yield {"phase": "Validating SQL...", "stage": "validate"}
-        await asyncio.sleep(0)
-        if not is_valid_sql(sql, selected_db):
-            sql = retry_with_stricter_prompt(user_query, schema_chunks, "initial invalid")
-            sql = sql.strip().removeprefix("sql").strip("`").strip().rstrip(";")
-            sql = handle_bind_variables(sql, user_query)
-            sql = normalize_dates(sql)
-            rng = extract_explicit_date_range(user_query)
-            sql = apply_date_range_constraint(sql, rng)
-            sql = enforce_raw_table_request(user_query, sql)
-            # NEW: sanitize on retry too
-            new_sql = strip_unprompted_time_filters(sql, user_query)
-            if new_sql != sql:
-                sql = new_sql
-                yield {"phase": "Removed unrequested time filter", "stage": "rewrite", "sql": sql}
-                await asyncio.sleep(0)
-
-            # ✅ Also sanitize here
-            sql = _strip_group_by_with_star(sql)
-
-            yield {"phase": "SQL ready", "stage": "sql_ready", "sql": sql}
-
-            await asyncio.sleep(0)
-            if not is_valid_sql(sql, selected_db):
-                # NEW: heuristic fallback to a safe table sample
-                tbl = extract_main_table(sql) or _guess_table_from_query(user_query, schema_chunks)
-                if tbl:
-                    fallback = f"SELECT * FROM {tbl} FETCH FIRST 200 ROWS ONLY"
-                    if is_valid_sql(fallback, selected_db):
-                        sql = fallback
-                        yield {"phase": "Validation passed", "stage": "validate_ok"}
-                        await asyncio.sleep(0)
-                    else:
-                        yield {"error": {"error":"INVALID_SQL", "message":"Could not generate valid SQL", "sql": sql}}
-                        await asyncio.sleep(0)
-                        return
-                else:
-                    yield {"error": {"error":"INVALID_SQL", "message":"Could not generate valid SQL", "sql": sql}}
-                    await asyncio.sleep(0)
-                    return
-
-            # retry succeeded:
-            yield {"phase": "Validation passed", "stage": "validate_ok"}
-            await asyncio.sleep(0)
-        else:
-            # first attempt was valid:
-            yield {"phase": "Validation passed", "stage": "validate_ok"}
-            await asyncio.sleep(0)
-        # cache hit path before executing
-        hit = _cache_get_result(selected_db, sql)
-        if hit:
-            display_mode = determine_display_mode(user_query, hit["rows"])
-
-            # Stream summary if needed
-            if display_mode in ["summary", "both"]:
-                yield {"phase": "Generating summary/report...", "stage": "summary_start", "display_mode": display_mode}
-                await asyncio.sleep(0)
-
-                snapshot = _pipe_snapshot(
-                    hit["columns"],
-                    hit["rows"],
-                    max_rows=SUMMARY_MAX_ROWS,
-                    char_budget=SUMMARY_CHAR_BUDGET
-                )
-
-                for piece in stream_summary(user_query, data_snippet=snapshot):
-                    try:
-                        obj = json.loads(piece)
-                    except Exception:
-                        obj = {"summary": piece}
-
-                    if "phase" in obj:
-                        obj["stage"] = "summary_stream"
-                        yield obj
-                    elif "summary" in obj:
-                        yield {"summary": obj["summary"], "stage": "summary_chunk"}
-                        await asyncio.sleep(0)
-
-                yield {"phase": "Summary complete", "stage": "done"}
-                await asyncio.sleep(0)
-            if display_mode not in ["summary", "both"]:
-                yield {"phase": "Done", "stage": "done"}
-                await asyncio.sleep(0)
-
-            # Final payload (table rows only if requested)
-            response: Dict[str, Any] = {
-                "status": "success",
-                "sql": sql,
-                "display_mode": display_mode,
-                "results": {
-                    "columns": hit["columns"],
-                    "rows": [list(r.values()) for r in hit["rows"]] if display_mode in ["table", "both"] else [],
-                    "row_count": hit["row_count"],
-                },
-                "schema_context": schema_chunks,
-                # don't include full summary text here because it was streamed
-                "summary": "" if display_mode in ["summary", "both"] else "",
-            }
-
-
-            yield response
-            return
-
-
-        # Phase 4: execution + stream rows (batched)
-        yield {"phase": "Executing query...", "stage": "execute", "sql": sql}
-        await asyncio.sleep(0)
-        with connect_to_source(selected_db) as (conn, _):
-            cursor = conn.cursor()
-            _set_case_insensitive_session(cursor)
-            try:
-                cursor.execute(sql)
-            except Exception as e:
-                repaired = _repair_sql_on_runtime_error(sql, selected_db, str(e))
-                if repaired and is_valid_sql(repaired, selected_db):
-                    sql = repaired
-                    yield {"phase": "Fixing SQL and retrying…", "stage": "rewrite", "sql": sql}
-                    await asyncio.sleep(0)
-                    cursor = conn.cursor()
-                    _set_case_insensitive_session(cursor)
-                    cursor.execute(sql)
-                else:
-                    yield {"error": {"error": "ORACLE_ERROR", "message": str(e), "sql": sql}}
-                    await asyncio.sleep(0)
-                    return
-
-            col_names = [desc[0] for desc in cursor.description]
-            yield {"phase": "Parsing rows...", "stage": "parsing", "columns": col_names, "row_count": 0}
-            await asyncio.sleep(0)
-
-            batch_size = 10
-            batch: List[Dict[str, Any]] = []
-            all_rows: List[Dict[str, Any]] = []
-            row_count = 0
-
-            for row in cursor:
-                row_dict = {col_names[i]: to_jsonable(row[i]) for i in range(len(col_names))}
-                batch.append(row_dict)
-                all_rows.append(row_dict)
-                row_count += 1
-
-                if len(batch) >= batch_size:
-                    yield {
-                        "phase": "Parsing rows...",
-                        "stage": "parsing",
-                        "partial_results": {
-                            "rows": [list(r.values()) for r in batch],
-                            "row_count": row_count,
-                        },
-                    }
-                    await asyncio.sleep(0)
-                    batch = []
-
-            if batch:
-                yield {
-                    "phase": "Parsing rows...",
-                    "stage": "parsing",
-                    "partial_results": {
-                        "rows": [list(r.values()) for r in batch],
-                        "row_count": row_count,
-                    },
-                }
-                await asyncio.sleep(0)
-            # --- First empty-results check
-            if row_count == 0:
-                if user_has_explicit_range:
-                    # Return a clean, truthful payload; no sampling
-                    yield {
-                        "status": "success",
-                        "sql": sql,
-                        "display_mode": determine_display_mode(user_query, []),
-                        "results": {"columns": col_names, "rows": [], "row_count": 0},
-                        "schema_context": schema_chunks,
-                        "summary": "No data found for the requested date range.",
-                    }
-                    await asyncio.sleep(0)
-                    return
-
-                ci_sql = _case_insensitive_rewrite(sql)
-                if ci_sql != sql and is_valid_sql(ci_sql, selected_db):
-                    yield {"phase": "No rows; retrying with case-insensitive match..."}
-                    await asyncio.sleep(0)
-                    cursor2 = conn.cursor()
-                    _set_case_insensitive_session(cursor2)
-                    cursor2.execute(ci_sql)
-
-                    col_names = [desc[0] for desc in cursor2.description]
-                    yield {"phase": "Parsing rows...", "stage": "parsing", "columns": col_names, "row_count": 0}
-                    await asyncio.sleep(0)
-
-                    batch, all_rows, row_count = [], [], 0
-                    for row in cursor2:
-                        row_dict = {col_names[i]: to_jsonable(row[i]) for i in range(len(col_names))}
-                        batch.append(row_dict)
-                        all_rows.append(row_dict)
-                        row_count += 1
-                        if len(batch) >= batch_size:
-                            yield {
-                                "phase": "Parsing rows...",
-                                "stage": "parsing",
-                                "partial_results": {"rows": [list(r.values()) for r in batch], "row_count": row_count},
-                            }
-                            await asyncio.sleep(0)
-                            batch = []
-                    if batch:
-                        yield {
-                            "phase": "Parsing rows...",
-                            "stage": "parsing",
-                            "partial_results": {"rows": [list(r.values()) for r in batch], "row_count": row_count},
-                        }
-                        await asyncio.sleep(0)
-
-                    sql = ci_sql
-
-                    # If still zero and the user gave an explicit range, stop (no sampling)
-                    if row_count == 0 and user_has_explicit_range:
-                        yield {
-                            "status": "success",
-                            "sql": sql,
-                            "display_mode": determine_display_mode(user_query, []),
-                            "results": {"columns": col_names, "rows": [], "row_count": 0},
-                            "schema_context": schema_chunks,
-                            "summary": "No data found for the requested date range.",
-                        }
-                        await asyncio.sleep(0)
-                        return
-
-                # 🔧 FINAL FALLBACK NOW RUNS OUTSIDE THE CI BRANCH
-                if row_count == 0 and not user_has_explicit_range:
-                    main_table = extract_main_table(sql or "")
-                    if main_table:
-                        try:
-                            yield {"phase": f"No rows; showing sample from {main_table}..."}
-                            await asyncio.sleep(0)
-                            sample_sql = f"SELECT * FROM {main_table} FETCH FIRST 200 ROWS ONLY"
-                            cursor3 = conn.cursor()
-                            _set_case_insensitive_session(cursor3)
-                            cursor3.execute(sample_sql)
-                            col_names = [d[0] for d in cursor3.description]
-                            all_rows, row_count = [], 0
-                            for r in cursor3:
-                                all_rows.append({col_names[i]: to_jsonable(r[i]) for i in range(len(col_names))})
-                                row_count += 1
-
-                            if row_count > 0:
-                                sql = sample_sql
-                                display_mode = determine_display_mode(user_query, all_rows)
-                                rows_for_summary = widen_results_if_needed(all_rows, sql, selected_db, display_mode)
-                                python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary","both"] else ""
-                                if display_mode in ["summary", "both"]:
-                                    cols_for_llm = list(rows_for_summary[0].keys()) if rows_for_summary else []
-                                    summary = summarize_with_mistral(
-                                        user_query=user_query,
-                                        columns=cols_for_llm,
-                                        rows=rows_for_summary,
-                                        backend_summary=python_summary,
-                                        sql=sql,
-                                    ) if SUMMARY_ENGINE == "llm" else python_summary
-                                else:
-                                    summary = ""
-
-                                response = {
-                                    "status": "success",
-                                    "sql": sql,
-                                    "display_mode": display_mode,
-                                    "results": {"columns": col_names, "rows": [list(r.values()) for r in all_rows], "row_count": row_count},
-                                    "summary": summary,
-                                    "schema_context": schema_chunks,
-                                }
-                                _cache_set_result(selected_db, sql, col_names, all_rows)
-                                if display_mode not in ["summary", "both"]:
-                                    yield {"phase": "Done", "stage": "done"}
-                                    await asyncio.sleep(0)
-
-                                yield response
-                                return
-
-                        except Exception as e:
-                            logger.warning(f"Sample fallback failed for {main_table}: {e}")
-
-                # Still nothing after all fallbacks
-                if row_count == 0:
-                    yield {"error": {"error": "NO_RESULTS", "message": "No results found"}}
-                    await asyncio.sleep(0)
-                    return
-
-            # store in cache
-            _cache_set_result(selected_db, sql, col_names, all_rows)
-
-            display_mode = determine_display_mode(user_query, all_rows)
-
-            # Stream summary if needed
-            if display_mode in ["summary", "both"]:
-                yield {"phase": "Generating summary/report...", "stage": "summary_start", "display_mode": display_mode}
-                await asyncio.sleep(0)
-                snapshot = _pipe_snapshot(
-                    col_names,
-                    all_rows,
-                    max_rows=SUMMARY_MAX_ROWS,
-                    char_budget=SUMMARY_CHAR_BUDGET
-                )
-
-                for piece in stream_summary(user_query, data_snippet=snapshot):
-                    try:
-                        obj = json.loads(piece)
-                    except Exception:
-                        obj = {"summary": piece}
-
-                    if "phase" in obj:
-                        obj["stage"] = "summary_stream"
-                        yield obj
-                    elif "summary" in obj:
-                        yield {"summary": obj["summary"], "stage": "summary_chunk"}
-                        await asyncio.sleep(0)
-
-                yield {"phase": "Summary complete", "stage": "done"}
-                await asyncio.sleep(0)
-            else:
-                # Table-only → finish the status pipeline cleanly
-                yield {"phase": "Done", "stage": "done"}
-                await asyncio.sleep(0)
-
-            response: Dict[str, Any] = {
-                "status": "success",
-                "sql": sql,
-                "display_mode": display_mode,
-                "results": {
-                    "columns": col_names,
-                    "row_count": row_count,
-                },
-                "schema_context": schema_chunks,
-            }
-
-            # summary was streamed; keep the field empty in the final envelope
-            response["summary"] = ""
-
-
-            if display_mode in ["table", "both"]:
-                response["results"]["rows"] = [list(r.values()) for r in all_rows]
-
-            yield response
-
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}\n{traceback.format_exc()}")
-        yield {
-            "error": {
-                "error": "INTERNAL_ERROR",
-                "message": "An unexpected error occurred",
-                "detail": str(e),
-            }
-        }
-        await asyncio.sleep(0)

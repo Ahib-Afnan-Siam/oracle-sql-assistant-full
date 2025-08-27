@@ -60,7 +60,7 @@ export default function Sidebar() {
                 : "bg-white/60 text-gray-800 border-white/40 hover:bg-white/80"
             )}
           >
-            🏢 Logic
+            🏢 Test DB
           </button>
         </div>
       </div>

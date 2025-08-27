@@ -1,14 +1,34 @@
 # db_connector.py
 import cx_Oracle
 import json
-import os
+import time, os
 import logging
 import itertools
 import re
 from contextlib import contextmanager
 from typing import List, Dict, Any, Tuple
 from app.config import FEEDBACK_DB_ID
+from threading import Lock
 
+_SCHEMA_TTL_SEC = int(os.getenv("SCHEMA_TTL_SEC", "600"))  # 10 min default
+_SCHEMA_LAST_REFRESH: Dict[str, float] = {}                # per-DB last refresh
+_SCHEMA_LOCK = Lock()
+
+def _maybe_refresh_schema_cache(db_key: str, validator: "SchemaValidator") -> None:
+    """
+    Refresh the validator's schema cache at most once per TTL *per source DB*.
+    """
+    now = time.time()
+    with _SCHEMA_LOCK:
+        last = _SCHEMA_LAST_REFRESH.get(db_key, 0.0)
+        # if the validator is "cold", force refresh regardless of TTL
+        if (now - last) < _SCHEMA_TTL_SEC:
+            logging.getLogger(__name__).debug(
+                f"[SchemaCache] skip refresh for {db_key}; age={now-last:.1f}s < TTL"
+            )
+            return
+        validator.refresh_cache()
+        _SCHEMA_LAST_REFRESH[db_key] = now
 
 # --- Lightweight SQL helpers (no hardcoding) ---------------------------------
 def _normalize_ident(tok: str) -> str:
@@ -163,113 +183,6 @@ class SchemaValidator:
                 logger.error(f"Failed to refresh schema cache: {e}")
                 raise
 
-def validate_sql(self, sql: str) -> Dict[str, Any]:
-    """
-    Per-SELECT-arm validation that stays friendly:
-    - Split on top-level UNION/UNION ALL
-    - For each arm, resolve tables/aliases and check:
-        * qualified t.col exists in resolved table
-        * unqualified col exists in ANY table in that arm
-    - Falls back softly (never blocks execution) — DB parse remains the hard guard.
-    """
-    try:
-        SQL_KEYWORDS = {
-            'SELECT','FROM','WHERE','GROUP','ORDER','BY','HAVING','JOIN','INNER','OUTER','LEFT','RIGHT','FULL',
-            'CROSS','ON','AND','OR','NOT','IN','LIKE','BETWEEN','IS','NULL','TRUE','FALSE','EXISTS','DISTINCT',
-            'AS','WITH','UNION','INTERSECT','EXCEPT','CASE','WHEN','THEN','ELSE','END','LIMIT','OFFSET','FETCH',
-            'NEXT','ONLY','NVL','DECODE','TO_DATE','TO_CHAR','TO_NUMBER','DUAL','ROWNUM','ROWID','LEVEL',
-            'CONNECT','PRIOR','START','COUNT','SUM','AVG','MIN','MAX','COALESCE'
-        }
-
-        # dynamic keyword candidates from the SQL text (keeps it robust)
-        keyword_candidates = {
-            w.upper()
-            for w in re.findall(r'\b[a-z_]+\b', sql or "", re.IGNORECASE)
-            if len(w) > 2
-        }
-        all_keywords = SQL_KEYWORDS | keyword_candidates
-
-        arms = _split_top_level_unions(sql or "")
-        overall_missing_tables = set()
-        overall_valid_cols = set()
-        overall_invalid_cols = set()
-
-        for arm in arms:
-            tables_in_arm, alias_map = _extract_tables_and_aliases(arm)
-
-            # mark missing tables vs cache
-            present_tables = set()
-            for t in tables_in_arm:
-                if t in self._table_cache:
-                    present_tables.add(t)
-                else:
-                    overall_missing_tables.add(t)
-
-            # union of columns/types across present tables in this arm
-            arm_union_cols = set()
-            for t in present_tables:
-                info = self._column_cache.get(t)
-                if not info:
-                    continue
-                arm_union_cols |= (info.get('columns') or set())
-
-            # collect columns (qualified & raw tokens)
-            qual_pairs, raw_tokens = _collect_columns(arm)
-
-            # drop obvious non-columns from raw_tokens: keywords, table names, aliases
-            to_remove = all_keywords | tables_in_arm | set(alias_map.keys())
-            candidates = {c for c in raw_tokens if c not in to_remove}
-
-            # validate qualified: alias must resolve; col must be in that table
-            for a, c in qual_pairs:
-                t = alias_map.get(a)
-                if not t or t not in self._column_cache:
-                    overall_invalid_cols.add(f"{a}.{c}")
-                    continue
-                t_cols = self._column_cache[t]['columns']
-                if c not in t_cols:
-                    overall_invalid_cols.add(f"{a}.{c}")
-                else:
-                    overall_valid_cols.add(c)
-
-            # validate unqualified: ok if present in ANY table used in this arm
-            for c in candidates:
-                if c in arm_union_cols:
-                    overall_valid_cols.add(c)
-                else:
-                    overall_invalid_cols.add(c)
-
-        # Oracle-specific date literal hint (kept)
-        oracle_date_pattern = re.compile(
-            r"TO_DATE\s*\(\s*'[^']+'\s*,\s*'[^']+'\s*\)",
-            re.IGNORECASE
-        )
-        if (not oracle_date_pattern.search(sql or "")) and re.search(r'\bDATE\b', sql or "", re.IGNORECASE):
-            # don't add duplicates
-            for c in list(overall_invalid_cols):
-                if c.upper().endswith('DATE'):
-                    overall_invalid_cols.add(c)
-
-        return {
-            'valid': (len(overall_missing_tables) == 0 and len(overall_invalid_cols) == 0),
-            'missing_tables': sorted(overall_missing_tables),
-            'invalid_columns': sorted(overall_invalid_cols),
-            'valid_columns': sorted(overall_valid_cols),
-            'column_types': {},   # (optional) can be filled if you want
-            'error': None
-        }
-
-    except Exception as e:
-        logger.error(f"SQL validation error: {e}", exc_info=True)
-        return {
-            'valid': False,
-            'missing_tables': [],
-            'invalid_columns': [],
-            'valid_columns': [],
-            'column_types': {},
-            'error': str(e)
-        }
-
 # Store all live Oracle connections for selected DBs
 DB_CONNECTIONS: Dict[str, cx_Oracle.Connection] = {}
 DB_VALIDATORS: Dict[str, SchemaValidator] = {}
@@ -325,11 +238,11 @@ def connect_to_source(db_key: str) -> Tuple[cx_Oracle.Connection, SchemaValidato
         
         # Create validator for this temporary connection
         validator = SchemaValidator(conn)
-        validator.refresh_cache()
+        _maybe_refresh_schema_cache(db_key, validator)
         
         yield conn, validator
     except cx_Oracle.Error as e:
-        logger.error(f"Database connection error: {e}")
+        logger.error("Database error during operation: %s", e)
         raise
     finally:
         if conn:

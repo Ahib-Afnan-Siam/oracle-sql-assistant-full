@@ -1,3 +1,4 @@
+#app/ollama_llm.py
 import requests
 import logging
 from typing import Optional, Dict, Any
@@ -15,7 +16,7 @@ from app.config import (
     OLLAMA_ANALYTICAL_URL,
     OLLAMA_ANALYTICAL_MODEL,
     OLLAMA_ANALYTICAL_TIMEOUT,
-    # ↓ add these imports
+    # SQL tunables
     OLLAMA_SQL_TEMP,
     OLLAMA_SQL_TOP_P,
     OLLAMA_SQL_TOP_K,
@@ -33,62 +34,62 @@ OLLAMA_RETRY_CONFIG = {
     "reraise": True
 }
 
-# ✅ Generic Ollama caller
+# ---------------------------
+# Generic Ollama caller
+# ---------------------------
 def _ask_ollama_generic(
     url: str,
     model: str,
     timeout: int,
     prompt: str,
-    options: Optional[Dict[str, Any]] = None,  # ← NEW
+    options: Optional[Dict[str, Any]] = None,
+    format_mode: Optional[str] = None,  # ← set to "json" for strict JSON responses
 ) -> str:
     if not prompt or not isinstance(prompt, str):
         raise ValueError("Prompt must be a non-empty string")
 
+    truncated = prompt[:10000] if len(prompt) > 10000 else prompt
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "prompt": truncated,
+        "stream": False,
+    }
+    if options:
+        payload["options"] = options
+    if format_mode:
+        payload["format"] = format_mode  # Ollama supports strict JSON via this field
+
     try:
-        truncated_prompt = prompt[:10000] if len(prompt) > 10000 else prompt
-
-        payload = {
-            "model": model,
-            "prompt": truncated_prompt,
-            "stream": False,
-        }
-        # Only include options if provided (keeps other callers unchanged)
-        if options:
-            payload["options"] = options
-
-        response = requests.post(url, json=payload, timeout=timeout)
-        response.raise_for_status()
-        response_json = response.json()
-
-        if "response" not in response_json:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if "response" not in data:
             raise ValueError("Invalid response format from Ollama API")
 
-        result = response_json["response"].strip()
+        out = (data["response"] or "").strip()
 
-        # Clean up code blocks
-        if result.startswith("```") and "```" in result[3:]:
-            result = result.split("```", 1)[1].strip()
+        # In case some models still wrap JSON in fences
+        if out.startswith("```") and "```" in out[3:]:
+            out = out.split("```", 1)[1].strip()
 
-        if not result:
+        if not out:
             raise ValueError("Empty response from Ollama")
 
-        logger.info(f"[LLM] Response from {model}: {result[:200]}...")
-        return result
-
+        logger.debug("[LLM] Response from %s: %s", model, (out or "")[:300].replace("\n", " "))
+        return out
     except requests.exceptions.RequestException as e:
-        logger.error(f"Ollama API request failed: {str(e)}", exc_info=True)
-        raise
-    except ValueError as e:
-        logger.error(f"Ollama response validation failed: {str(e)}")
+        logger.error(f"Ollama API request failed: {e}", exc_info=True)
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in Ollama query: {str(e)}", exc_info=True)
+        logger.error(f"Unexpected error in Ollama query: {e}", exc_info=True)
         raise
 
-# ✅ Retry wrappers
+# ---------------------------
+# Retry wrappers
+# ---------------------------
 @retry(**OLLAMA_RETRY_CONFIG)
 def ask_sql_model(prompt: str) -> str:
-    # Lower creativity + determinism for SQL only
     sql_options = {
         "temperature": OLLAMA_SQL_TEMP,
         "top_p": OLLAMA_SQL_TOP_P,
@@ -97,10 +98,32 @@ def ask_sql_model(prompt: str) -> str:
         "num_predict": OLLAMA_SQL_NUM_PREDICT,
         "num_ctx": OLLAMA_SQL_NUM_CTX,
         "seed": OLLAMA_SQL_SEED,
-        # (Optional) Stops to reduce multi-statement outputs; keep commented unless needed:
-        # "stop": ["```"]
     }
     return _ask_ollama_generic(OLLAMA_SQL_URL, OLLAMA_SQL_MODEL, OLLAMA_SQL_TIMEOUT, prompt, sql_options)
+
+# NEW: strict-JSON wrapper for the planner
+@retry(**OLLAMA_RETRY_CONFIG)
+def ask_sql_planner(prompt: str) -> str:
+    sql_options = {
+        "temperature": OLLAMA_SQL_TEMP,
+        "top_p": OLLAMA_SQL_TOP_P,
+        "top_k": OLLAMA_SQL_TOP_K,
+        "repeat_penalty": OLLAMA_SQL_REPEAT_PENALTY,
+        "num_predict": OLLAMA_SQL_NUM_PREDICT,
+        "num_ctx": OLLAMA_SQL_NUM_CTX,
+        "seed": OLLAMA_SQL_SEED,
+    }
+    resp_text = _ask_ollama_generic(
+        OLLAMA_SQL_URL,
+        OLLAMA_SQL_MODEL,
+        OLLAMA_SQL_TIMEOUT,
+        prompt,
+        options=sql_options,
+        format_mode="json",   # ← forces valid JSON tokens from Ollama
+    )
+    # Quiet, but still available when DEBUG is enabled
+    logger.debug("[LLM] Planner raw: %s", (resp_text or "")[:300].replace("\n", " "))
+    return resp_text
 
 @retry(**OLLAMA_RETRY_CONFIG)
 def ask_summary_model(prompt: str) -> str:
@@ -108,34 +131,28 @@ def ask_summary_model(prompt: str) -> str:
 
 @retry(**OLLAMA_RETRY_CONFIG)
 def ask_analytical_model(prompt: str) -> str:
-    return _ask_ollama_generic(
-        OLLAMA_ANALYTICAL_URL,
-        OLLAMA_ANALYTICAL_MODEL,
-        OLLAMA_ANALYTICAL_TIMEOUT,
-        prompt
-    )
+    return _ask_ollama_generic(OLLAMA_ANALYTICAL_URL, OLLAMA_ANALYTICAL_MODEL, OLLAMA_ANALYTICAL_TIMEOUT, prompt)
 
 def call_ollama(prompt: str, model: str) -> str:
     if model == OLLAMA_SQL_MODEL:
         return ask_sql_model(prompt)
-    elif model == OLLAMA_SUMMARY_MODEL:
+    if model == OLLAMA_SUMMARY_MODEL:
         return _ask_ollama_generic(OLLAMA_SUMMARY_URL, model, OLLAMA_SUMMARY_TIMEOUT, prompt)
-    elif model == OLLAMA_ANALYTICAL_MODEL:
+    if model == OLLAMA_ANALYTICAL_MODEL:
         return ask_analytical_model(prompt)
-    elif model == OLLAMA_R1_MODEL:
+    if model == OLLAMA_R1_MODEL:
         return ask_deepseek_r1(prompt)
-    else:
-        raise ValueError(f"Unsupported model: {model}")
+    raise ValueError(f"Unsupported model: {model}")
 
 def ask_deepseek_r1(prompt: str) -> str:
     try:
-        response = requests.post(
+        resp = requests.post(
             OLLAMA_R1_URL,
             json={"model": OLLAMA_R1_MODEL, "prompt": prompt, "stream": False},
-            timeout=OLLAMA_R1_TIMEOUT
+            timeout=OLLAMA_R1_TIMEOUT,
         )
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
+        resp.raise_for_status()
+        return (resp.json().get("response") or "").strip()
     except Exception as e:
         logger.error(f"[R1] DeepSeek-R1 failed: {e}")
         return "⚠️ Failed to generate response with DeepSeek-R1."

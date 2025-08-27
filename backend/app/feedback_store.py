@@ -116,7 +116,7 @@ def insert_turn(
 def insert_sql_sample(
     turn_id: int,
     model_name: Optional[str],
-    prompt: str,
+    prompt_text: str,
     sql_text: str,
     display_mode: Optional[str] = None,
 ) -> int:
@@ -134,7 +134,7 @@ def insert_sql_sample(
               (:tid, :m, :p, :s, :dm)
             RETURNING ID INTO :new_id
             """,
-            {"tid": turn_id, "m": model_name, "p": prompt, "s": sql_text, "dm": display_mode},
+            {"tid": turn_id, "m": model_name, "p": prompt_text, "s": sql_text, "dm": display_mode},
         )
         conn.commit()
         return new_id
@@ -162,7 +162,7 @@ def update_sql_sample(sample_id: int, **kv):
 def insert_summary_sample(
     turn_id: int,
     model_name: Optional[str],
-    prompt: str,
+    prompt_text: str,
     data_snapshot: str,
     sql_used: Optional[str] = None,
     display_mode: Optional[str] = None,
@@ -184,7 +184,7 @@ def insert_summary_sample(
             {
                 "tid": turn_id,
                 "m": model_name,
-                "p": prompt,
+                "p": prompt_text,
                 "ds": data_snapshot,
                 "sqlu": sql_used,
                 "dm": display_mode,

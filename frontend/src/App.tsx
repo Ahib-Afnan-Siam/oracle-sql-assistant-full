@@ -1,9 +1,9 @@
 import Sidebar from "./components/Sidebar";
 import ChatPanel from "./components/ChatPanel";
-import ChatInput from "./components/ChatInput";
 import HomePrompts from "./components/HomePrompts";
 import { useChat } from "./components/ChatContext";
 import { AnimatePresence, motion } from "framer-motion";
+import ChatInput from "./components/ChatInput";
 
 function App() {
   const { messages } = useChat();
@@ -41,6 +41,7 @@ function App() {
             </AnimatePresence>
           </div>
 
+          {/* Single input for both Home + Chat views */}
           <ChatInput />
         </div>
       </div>
