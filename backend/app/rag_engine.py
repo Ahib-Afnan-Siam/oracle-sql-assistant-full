@@ -196,30 +196,6 @@ def _parse_day_token(s: str) -> Optional[_dt]:
         return _dt(y, _MON_ABBR.get(mon3, 1), d)
     return None
 
-def _asked_range(uq: str) -> tuple[Optional[_dt], Optional[_dt]]:
-    """
-    Extract date range from user query.
-    Returns (start_date, end_date) or (None, None) if no dates found.
-    """
-    # Try to find date tokens in the query
-    day_tokens = re.findall(
-        r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}|\d{1,2}-[A-Za-z]{3}-\d{2,4})\b",
-        uq or "", re.IGNORECASE
-    )
-    
-    parsed_days = []
-    for token in day_tokens:
-        dt = _parse_day_token(token)
-        if dt:
-            parsed_days.append(dt)
-    
-    if len(parsed_days) == 1:
-        return (parsed_days[0], parsed_days[0])
-    elif len(parsed_days) >= 2:
-        return (min(parsed_days), max(parsed_days))
-    
-    return (None, None)
-
 # -------------------------
 # Enhanced Entity Recognition (Integrated from enhanced_entity_recognizer.py)
 # -------------------------
@@ -315,31 +291,79 @@ def extract_enhanced_metrics(query: str) -> List[str]:
 def classify_enhanced_query_intent(query: str) -> str:
     """Enhanced query intent classification based on user patterns."""
     query_lower = query.lower()
-    
-    # Enhanced intent patterns
+
     intent_patterns = {
-        'floor_production_summary': [r'floor.*wise.*production.*summary', r'show.*floor.*production'],
-        'defect_analysis': [r'defect.*qty.*floor', r'max.*defect.*qty', r'total.*defect.*qty'],
-        'employee_lookup': [r'who\s+is\s+\w+', r'salary.*president'],
+        'floor_production_summary': [
+            r'floor.*wise.*production.*summary',
+            r'show.*floor.*production'
+        ],
+        'defect_analysis': [
+            r'defect.*qty.*floor',
+            r'max.*defect.*qty',
+            r'total.*defect.*qty'
+        ],
+        'employee_lookup': [
+            r'who\s+is\s+\w+',
+            r'salary.*president',
+            r'give\s+me\s+email.*of\s+\w+',
+            r'email.*address.*of\s+\w+',
+            r'find\s+email.*\w+',
+            r'contact.*info.*of\s+\w+',
+            r'\w+.*email.*address',
+            r'email.*\w+',
+            r'get.*email.*of\s+\w+'
+        ],
+        # NEW: TNA / task queries (includes PP Approval)
+        'tna_task_query': [
+            r'\bpp\s+approval\b',
+            r'task.*status',
+            r'\btna\b.*status',
+            r'\bjob.*no\b',
+            r'\bpo.*number\b',
+            r'style.*ref',
+            r'buyer.*name',
+            r'shipment.*date',
+            r'task.*finish',
+            r'task.*update',
+            r'approval.*update',
+            r'fabric.*receive',
+            r'cutting.*production',
+            r'sewing.*production',
+            r'garment.*inspection',
+            r'ex.*factory',
+            r'\bknit.*fabric\b',
+            # CTL job number patterns / phrasing
+            r'\bCTL-\d{2}-\d{5,6}\b',
+            r'\bctl-\d{2}-\d{5,6}\b',
+            r'job.*number.*CTL',
+            r'\bCTL.*information\b'
+        ],
         'ranking_query': [
-            r'top.*\d+.*defect', r'max.*defect.*floor', r'biggest.*production',
-            r'which.*floor.*produced.*most', r'which.*floor.*most.*production',
-            r'most.*production.*floor', r'floor.*produced.*most',
-            r'maximum.*production', r'highest.*production'
+            r'top.*\d+.*defect',
+            r'max.*defect.*floor',
+            r'biggest.*production',
+            r'which.*floor.*produced.*most',
+            r'which.*floor.*most.*production',
+            r'most.*production.*floor',
+            r'floor.*produced.*most',
+            r'maximum.*production',
+            r'highest.*production'
         ]
     }
-    
+
     for intent, patterns in intent_patterns.items():
-        if any(re.search(pattern, query_lower) for pattern in patterns):
+        if any(re.search(p, query_lower) for p in patterns):
             return intent
-    
-    if any(word in query_lower for word in ['production', 'defect', 'floor']):
+
+    if any(w in query_lower for w in ['production', 'defect', 'floor']):
         return 'production_data'
-    elif any(word in query_lower for word in ['employee', 'salary', 'president']):
+    elif any(w in query_lower for w in ['employee', 'salary', 'president', 'email', 'contact']):
         return 'employee_data'
-    elif any(word in query_lower for word in ['stock', 'inventory', 'item', 'product']):
+    elif any(w in query_lower for w in ['task', 'tna', 'job', 'po', 'buyer', 'style', 'shipment', 'approval']):
+        return 'tna_task_data'
+    elif any(w in query_lower for w in ['stock', 'inventory', 'item', 'product']):
         return 'inventory_data'
-    
+
     return 'general'
 
 def analyze_enhanced_query(query: str) -> Dict:
@@ -482,6 +506,242 @@ def _discover_dailyish_tables(selected_db: str, limit: int = 6,
         cur.execute(sql, lim=limit)
         out = [r[0] for r in cur.fetchall()]
     return out
+
+# -------------------------
+# Critical Table Schema Definitions (Dynamic, not hardcoded)
+# -------------------------
+def get_critical_table_schemas(selected_db: str) -> Dict[str, Dict]:
+    """
+    Dynamically fetch schema information for critical tables.
+    """
+    critical_tables = ['T_PROD', 'T_PROD_DAILY', 'T_TNA_STATUS']
+    schemas: Dict[str, Dict] = {}
+
+    try:
+        with connect_to_source(selected_db) as (conn, _):
+            cur = conn.cursor()
+
+            for table in critical_tables:
+                cur.execute("""
+                    SELECT COLUMN_NAME, DATA_TYPE, NULLABLE, DATA_DEFAULT, COLUMN_ID
+                    FROM USER_TAB_COLUMNS
+                    WHERE TABLE_NAME = :table_name
+                    ORDER BY COLUMN_ID
+                """, {"table_name": table.upper()})
+
+                columns = cur.fetchall()
+                if not columns:
+                    continue
+
+                schemas[table] = {
+                    'columns': {},
+                    'date_columns': [],
+                    'numeric_columns': [],
+                    'text_columns': [],
+                    'key_columns': {}
+                }
+
+                for col_name, data_type, nullable, default, col_id in columns:
+                    dt = str(data_type or "").upper()
+                    schemas[table]['columns'][col_name] = {
+                        'type': dt,
+                        'nullable': (nullable == 'Y'),
+                        'default': default,
+                        'position': col_id
+                    }
+                    if 'DATE' in dt or 'TIMESTAMP' in dt:
+                        schemas[table]['date_columns'].append(col_name)
+                    elif any(k in dt for k in ('NUMBER','FLOAT','INTEGER','BINARY')):
+                        schemas[table]['numeric_columns'].append(col_name)
+                    else:
+                        schemas[table]['text_columns'].append(col_name)
+
+                schemas[table]['key_columns'] = _get_key_columns_for_table(table)
+
+        logger.info(f"[RAG] Loaded schemas for {len(schemas)} critical tables")
+        return schemas
+    except Exception as e:
+        logger.error(f"[RAG] Failed to load critical table schemas: {e}")
+        return {}
+
+def _get_key_columns_for_table(table: str) -> Dict[str, List[str]]:
+    key_mappings: Dict[str, Dict[str, List[str]]] = {
+        'T_PROD': {
+            'date_filters': ['PROD_DATE'],
+            'grouping_columns': ['FLOOR_NAME', 'PM_OR_APM_NAME'],
+            'metric_columns': ['PRODUCTION_QTY', 'DEFECT_QTY', 'DHU', 'FLOOR_EF'],
+            'defect_details': ['UNCUT_THREAD', 'DIRTY_STAIN', 'BROKEN_STITCH', 'SKIP_STITCH', 'OPEN_SEAM'],
+            'efficiency_columns': ['FLOOR_EF', 'DHU', 'DEFECT_PERS']
+        },
+        'T_PROD_DAILY': {
+            'date_filters': ['PROD_DATE'],
+            'grouping_columns': ['FLOOR_NAME', 'PM_OR_APM_NAME'],
+            'metric_columns': ['PRODUCTION_QTY', 'DEFECT_QTY', 'DHU', 'FLOOR_EF'],
+            'defect_details': ['UNCUT_THREAD', 'DIRTY_STAIN', 'BROKEN_STITCH', 'SKIP_STITCH', 'OPEN_SEAM'],
+            'efficiency_columns': ['FLOOR_EF', 'DHU', 'DEFECT_PERS'],
+            'time_columns': ['AC_PRODUCTION_HOUR', 'AC_WORKING_HOUR']
+        },
+        'T_TNA_STATUS': {
+            'date_filters': ['TASK_FINISH_DATE', 'ACTUAL_FINISH_DATE', 'PO_RECEIVED_DATE', 'SHIPMENT_DATE'],
+            'grouping_columns': ['BUYER_NAME', 'TEAM_LEADER_NAME', 'TEAM_MEMBER_NAME'],
+            'identifier_columns': ['JOB_NO', 'PO_NUMBER', 'STYLE_REF_NO'],
+            'task_columns': ['TASK_NUMBER', 'TASK_SHORT_NAME'],
+            'style_columns': ['STYLE_REF_NO', 'STYLE_DESCRIPTION']
+        }
+    }
+    return key_mappings.get(table, {})
+
+def enhance_query_with_critical_table_knowledge(user_query: str, plan: Dict, options: Dict, selected_db: str) -> Dict:
+    """
+    If the planner picks one of the critical tables, auto-augment dims/metrics based on the question.
+    """
+    if not isinstance(plan, dict):
+        return plan
+
+    table = plan.get('table')
+    if not table or table.upper() not in {'T_PROD','T_PROD_DAILY','T_TNA_STATUS'}:
+        return plan
+    table = table.upper()
+
+    critical = get_critical_table_schemas(selected_db)
+    if table not in critical:
+        return plan
+
+    key_cols = critical[table].get('key_columns', {})
+    q = (user_query or "").lower()
+    out = dict(plan)
+
+    # metrics
+    if any(w in q for w in ['production','qty','quantity','piece','pieces']):
+        out.setdefault('metrics', [])
+        if 'PRODUCTION_QTY' not in out['metrics']:
+            out['metrics'].append('PRODUCTION_QTY')
+
+    if any(w in q for w in ['defect','rejection','dhu']):
+        out.setdefault('metrics', [])
+        for m in ['DEFECT_QTY', 'DHU']:
+            if m not in out['metrics']:
+                out['metrics'].append(m)
+
+    if any(w in q for w in ['efficiency','eff','rate','percent','pct']):
+        out.setdefault('metrics', [])
+        if 'FLOOR_EF' not in out['metrics']:
+            out['metrics'].append('FLOOR_EF')
+
+    # defect detail columns
+    if any(w in q for w in ['broken','skip','stitch','seam','thread','stain','dirty']):
+        out.setdefault('metrics', [])
+        for m in key_cols.get('defect_details', []):
+            if m not in out['metrics']:
+                out['metrics'].append(m)
+
+    # dims
+    if any(w in q for w in ['floor','wise','by floor','each floor']):
+        out.setdefault('dims', [])
+        if 'FLOOR_NAME' not in out['dims']:
+            out['dims'].append('FLOOR_NAME')
+
+    if any(w in q for w in ['manager','pm','apm']):
+        out.setdefault('dims', [])
+        if 'PM_OR_APM_NAME' not in out['dims']:
+            out['dims'].append('PM_OR_APM_NAME')
+
+    if table == 'T_TNA_STATUS':
+        if any(w in q for w in ['buyer','customer']):
+            out.setdefault('dims', [])
+            if 'BUYER_NAME' not in out['dims']:
+                out['dims'].append('BUYER_NAME')
+        if any(w in q for w in ['style','design']):
+            out.setdefault('dims', [])
+            for c in ['STYLE_REF_NO','STYLE_DESCRIPTION']:
+                if c not in out['dims']:
+                    out['dims'].append(c)
+
+    if table == 'T_PROD_DAILY' and any(w in q for w in ['hour','working','production hour']):
+        out.setdefault('metrics', [])
+        for c in ['AC_PRODUCTION_HOUR','AC_WORKING_HOUR']:
+            if c not in out['metrics']:
+                out['metrics'].append(c)
+
+    # dedupe/limit
+    if 'metrics' in out:
+        out['metrics'] = list(dict.fromkeys(out['metrics']))[:10]
+    if 'dims' in out:
+        out['dims'] = list(dict.fromkeys(out['dims']))[:5]
+
+    return out
+
+def _intelligent_table_selection(user_query: str, candidate_tables: List[str], selected_db: str) -> List[str]:
+    q = (user_query or "").lower()
+    crit = {'T_PROD','T_PROD_DAILY','T_TNA_STATUS'}
+    scores: Dict[str,int] = {}
+
+    for t in candidate_tables:
+        T = t.upper()
+        s = 0
+        if T in crit: s += 10
+
+        if any(w in q for w in ['production','defect','floor','dhu','efficiency']):
+            if T in {'T_PROD','T_PROD_DAILY'}:
+                s += 20
+                if T == 'T_PROD_DAILY' and _DAILY_HINT_RX.search(user_query or ''):
+                    s += 5
+
+        if any(w in q for w in ['task','tna','job','po','buyer','style','shipment','approval','ctl']):
+            if T == 'T_TNA_STATUS':
+                s += 20
+
+        if T in {'T_PROD','T_PROD_DAILY'}:
+            start_dt, end_dt = _asked_range(user_query or "")
+            if start_dt and end_dt:
+                if end_dt < _CUTOFF_DT and T == 'T_PROD':
+                    s += 10
+                elif start_dt >= _CUTOFF_DT and T == 'T_PROD_DAILY':
+                    s += 10
+
+        scores[T] = s
+
+    return sorted(candidate_tables, key=lambda x: (-scores.get(x.upper(), 0), x.upper()))
+
+def get_smart_column_suggestions(table: str, user_query: str, selected_db: str) -> List[str]:
+    T = (table or "").upper()
+    if T not in {'T_PROD','T_PROD_DAILY','T_TNA_STATUS'}:
+        return []
+
+    q = (user_query or "").lower()
+    schemas = get_critical_table_schemas(selected_db)
+    if T not in schemas:
+        return []
+
+    sug: List[str] = []
+    if T in {'T_PROD','T_PROD_DAILY'}:
+        sug += ['PROD_DATE','FLOOR_NAME']
+    elif T == 'T_TNA_STATUS':
+        sug += ['JOB_NO','STYLE_REF_NO']
+
+    intent_map = {
+        'production': ['PRODUCTION_QTY'],
+        'defect': ['DEFECT_QTY','DHU'],
+        'efficiency': ['FLOOR_EF','DHU'],
+        'floor': ['FLOOR_NAME'],
+        'manager': ['PM_OR_APM_NAME'],
+        'buyer': ['BUYER_NAME'],
+        'style': ['STYLE_REF_NO','STYLE_DESCRIPTION'],
+        'task': ['TASK_SHORT_NAME','TASK_NUMBER'],
+        'date': ['PROD_DATE','TASK_FINISH_DATE','SHIPMENT_DATE']
+    }
+    for k, cols in intent_map.items():
+        if k in q:
+            sug += cols
+
+    # keep only real columns, dedupe, cap
+    cols_set = set(schemas[T]['columns'].keys())
+    out: List[str] = []
+    seen = set()
+    for c in sug:
+        if c in cols_set and c not in seen:
+            out.append(c); seen.add(c)
+    return out[:8]
 
 # ---------------------------
 # Retrieval
@@ -957,6 +1217,221 @@ def _enhanced_employee_lookup(user_query: str, selected_db: str, enhanced_analys
         logger.error(f"[RAG] Enhanced employee lookup failed: {e}")
         # Fall back to generic entity lookup
         return _entity_lookup_path(user_query, selected_db, [], [])
+    
+def _enhanced_tna_task_lookup(user_query: str, selected_db: str, enhanced_analysis: Dict) -> Dict[str, Any]:
+    """Enhanced TNA task lookup using intent analysis."""
+    try:
+        ql = (user_query or "").lower()
+        # Highest priority: exact CTL job number (CTL-NN-NNNNN or CTL-NN-NNNNNN)
+        ctl_match = re.search(r'\bCTL-\d{2}-\d{5,6}\b', user_query, re.IGNORECASE)
+        if ctl_match:
+            full_ctl = ctl_match.group(0).upper()
+            
+            # Check for task number filter
+            task_filter = ""
+            task_match = re.search(r'\btask\s+(?:number\s+)?(\d+)\b', user_query, re.IGNORECASE)
+            if task_match:
+                task_number = task_match.group(1)
+                task_filter = f" AND TASK_NUMBER = {task_number}"
+                logger.info(f"[RAG] Adding task number filter: {task_number}")
+            
+            # Comprehensive date detection for any format
+            date_filter = ""
+            try:
+                # Enhanced date pattern matching (covers ALL common formats)
+                date_patterns = [
+                    # DD/MM/YYYY and DD-MM-YYYY
+                    (r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', 'dmy'),
+                    # MM/DD/YYYY and MM-DD-YYYY
+                    (r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', 'mdy'),
+                    # DD-MON-YY and DD-MON-YYYY (Oracle style)
+                    (r'\b(\d{1,2})-([A-Z]{3})-(\d{2,4})\b', 'dd_mon_yy'),
+                    # DD MMM YYYY (space separated)
+                    (r'\b(\d{1,2})\s+([A-Z]{3,9})\s+(\d{4})\b', 'dd_mmm_yyyy'),
+                    # YYYY-MM-DD (ISO format)
+                    (r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', 'iso'),
+                    # MON-YY and Month YYYY
+                    (r'\b([A-Z]{3,9})[-\s](\d{2,4})\b', 'mon_yy')
+                ]
+                
+                date_obj = None
+                for pattern, format_type in date_patterns:
+                    match = re.search(pattern, user_query.upper())
+                    if match:
+                        try:
+                            if format_type == 'dmy':
+                                day, month, year = match.groups()
+                                date_obj = _dt(int(year), int(month), int(day))
+                            elif format_type == 'mdy':
+                                month, day, year = match.groups()
+                                date_obj = _dt(int(year), int(month), int(day))
+                            elif format_type == 'dd_mon_yy':
+                                day, month_str, year = match.groups()
+                                month_abbr = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+                                            'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
+                                month = month_abbr.get(month_str.upper())
+                                if month:
+                                    year_int = int(year)
+                                    if year_int < 100:
+                                        year_int += 2000
+                                    date_obj = _dt(year_int, month, int(day))
+                            elif format_type == 'dd_mmm_yyyy':
+                                day, month_str, year = match.groups()
+                                month_abbr = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+                                            'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12,
+                                            'JANUARY':1,'FEBRUARY':2,'MARCH':3,'APRIL':4,'MAY':5,'JUNE':6,
+                                            'JULY':7,'AUGUST':8,'SEPTEMBER':9,'OCTOBER':10,'NOVEMBER':11,'DECEMBER':12}
+                                month = month_abbr.get(month_str.upper())
+                                if month:
+                                    date_obj = _dt(int(year), month, int(day))
+                            elif format_type == 'iso':
+                                year, month, day = match.groups()
+                                date_obj = _dt(int(year), int(month), int(day))
+                            elif format_type == 'mon_yy':
+                                month_str, year = match.groups()
+                                month_abbr = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+                                            'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
+                                month = month_abbr.get(month_str.upper())
+                                if month:
+                                    year_int = int(year)
+                                    if year_int < 100:
+                                        year_int += 2000
+                                    date_obj = _dt(year_int, month, 1)
+                            
+                            if date_obj:
+                                oracle_date = f"TO_DATE('{date_obj.day:02d}-{['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][date_obj.month-1]}-{date_obj.year}','DD-MON-YYYY')"
+                                date_filter = f" AND TASK_FINISH_DATE = {oracle_date}"
+                                logger.info(f"[RAG] Adding date filter: {match.group(0)} -> {oracle_date}")
+                                break
+                        except (ValueError, IndexError) as e:
+                            logger.warning(f"[RAG] Failed to parse date {match.group(0)}: {e}")
+                            continue
+                
+            except Exception as e:
+                logger.warning(f"[RAG] Date extraction failed in CTL lookup: {e}")
+            
+            sql = f"""
+            SELECT JOB_NO, PO_NUMBER, TASK_SHORT_NAME, TASK_FINISH_DATE,
+                   ACTUAL_FINISH_DATE, BUYER_NAME, STYLE_REF_NO, STYLE_DESCRIPTION
+            FROM T_TNA_STATUS
+            WHERE UPPER(JOB_NO) = '{full_ctl}'{task_filter}{date_filter}
+            ORDER BY TASK_NUMBER DESC
+            FETCH FIRST 50 ROWS ONLY
+            """
+            logger.info(f"[RAG] CTL pattern detected → exact JOB_NO match: {full_ctl}{' with task filter' if task_filter else ''}{' with date filter' if date_filter else ''}")
+            rows = run_sql(sql, selected_db)
+            display_mode = determine_display_mode(user_query, rows)
+            rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
+            python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary","both"] else ""
+            summary = (
+                summarize_with_mistral(
+                    user_query=user_query,
+                    columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
+                    rows=rows_for_summary,
+                    backend_summary=python_summary,
+                    sql=sql,
+                ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary","both"] else python_summary
+            )
+            return {
+                "status": "success",
+                "summary": summary if display_mode in ["summary","both"] else "",
+                "sql": sql,
+                "display_mode": display_mode,
+                "results": {
+                    "columns": (list(rows[0].keys()) if rows else []),
+                    "rows": [list(r.values()) for r in rows] if rows else [],
+                    "row_count": len(rows) if rows else 0,
+                },
+                "schema_context": [],
+                "schema_context_ids": [],
+            }
+        
+        # ----------------------------------------------
+        # Recognize key task phrases (PP Approval first)
+        # ----------------------------------------------
+        if 'pp approval' in ql:
+            sql = """
+            SELECT JOB_NO, PO_NUMBER, TASK_SHORT_NAME, TASK_FINISH_DATE,
+                   ACTUAL_FINISH_DATE, BUYER_NAME, STYLE_REF_NO
+            FROM T_TNA_STATUS
+            WHERE UPPER(TASK_SHORT_NAME) LIKE '%PP APPROVAL%'
+            ORDER BY TASK_FINISH_DATE DESC
+            FETCH FIRST 20 ROWS ONLY
+            """
+        else:
+            task_patterns = [
+                r'pp\s+approval',
+                r'fabric.*receive',
+                r'cutting.*production',
+                r'sewing.*production',
+                r'garment.*inspection',
+                r'ex.*factory',
+                r'knit.*fabric'
+            ]
+            sql = None
+            for pat in task_patterns:
+                m = re.search(pat, ql, re.IGNORECASE)
+                if m:
+                    task_term = re.sub(r'\s+', '%', m.group(0))  # space→% for LIKE
+                    esc = task_term.replace("'", "''")
+                    sql = f"""
+                    SELECT JOB_NO, PO_NUMBER, TASK_SHORT_NAME, TASK_FINISH_DATE,
+                           ACTUAL_FINISH_DATE, BUYER_NAME, STYLE_REF_NO
+                    FROM T_TNA_STATUS
+                    WHERE UPPER(TASK_SHORT_NAME) LIKE UPPER('%{esc}%')
+                    ORDER BY TASK_FINISH_DATE DESC
+                    FETCH FIRST 20 ROWS ONLY
+                    """
+                    break
+
+            if sql is None:
+                # generic recent tasks
+                sql = """
+                SELECT JOB_NO, PO_NUMBER, TASK_SHORT_NAME, TASK_FINISH_DATE,
+                       ACTUAL_FINISH_DATE, BUYER_NAME, STYLE_REF_NO
+                FROM T_TNA_STATUS
+                ORDER BY TASK_FINISH_DATE DESC
+                FETCH FIRST 20 ROWS ONLY
+                """
+
+        logger.info(f"[RAG] Enhanced TNA task lookup SQL: {sql.strip()}")
+
+        rows = run_sql(sql, selected_db)
+        display_mode = determine_display_mode(user_query, rows)
+        rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
+
+        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+        summary = (
+            summarize_with_mistral(
+                user_query=user_query,
+                columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
+                rows=rows_for_summary,
+                backend_summary=python_summary,
+                sql=sql,
+            )
+            if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"]
+            else python_summary
+        )
+
+        return {
+            "status": "success",
+            "summary": summary if display_mode in ["summary", "both"] else "",
+            "sql": sql,
+            "display_mode": display_mode,
+            "results": {
+                "columns": (list(rows[0].keys()) if rows else []),
+                "rows": [list(r.values()) for r in rows] if rows else [],
+                "row_count": len(rows) if rows else 0,
+            },
+            "schema_context": [],
+            "schema_context_ids": [],
+        }
+
+    except Exception as e:
+        logger.error(f"[RAG] Enhanced TNA task lookup failed: {e}")
+        return _entity_lookup_path(user_query, selected_db, [], [])
+
+
 # ---------------------------
 # Fallback: entity lookup
 # ---------------------------
@@ -1206,6 +1681,11 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
     if enhanced_analysis['intent'] == 'employee_lookup':
         logger.info("[RAG] Routing to employee lookup based on enhanced analysis")
         return _enhanced_employee_lookup(uq, selected_db, enhanced_analysis)
+    # NEW: TNA/task routing
+    if enhanced_analysis['intent'] in ('tna_task_query', 'tna_task_data'):
+        logger.info("[RAG] Routing to TNA task query based on enhanced analysis")
+        return _enhanced_tna_task_lookup(uq, selected_db, enhanced_analysis)
+
     # 0) Fast paths -------------------------------------------------------------
     # 0.a) Raw SELECT passthrough (validated)
     if re.match(r'(?is)^\s*select\b', uq):
@@ -1266,6 +1746,8 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
     schema_context_ids = _extract_context_ids(results)
     candidate_tables = _tables_from_results(results)
     candidate_tables = _filter_banned_tables(candidate_tables)
+    # NEW: prioritize critical tables based on query content
+    candidate_tables = _intelligent_table_selection(user_query, candidate_tables, selected_db)
     candidate_tables = _bias_tables_for_day(candidate_tables, uq)
     # NEW: if it’s a single-day/“day” query, make sure daily tables are present
     if _DAILY_HINT_RX.search(uq):
@@ -1302,6 +1784,9 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
             return _entity_lookup_path(user_query, selected_db, schema_chunks, schema_context_ids)
         # NEW: graceful table-browse fallback
         return _generic_browse_fallback(user_query, selected_db, options, schema_chunks, schema_context_ids)
+
+    # NEW: add business-aware dims/metrics for critical tables
+    plan = enhance_query_with_critical_table_knowledge(user_query, plan, options, selected_db)
 
     plan = _augment_plan_with_metrics(uq, plan, options)
     ok, why = _validate_plan(plan or {}, options)

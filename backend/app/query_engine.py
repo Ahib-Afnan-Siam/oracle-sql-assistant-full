@@ -827,10 +827,21 @@ def extract_year_only_range(user_query: str) -> Optional[Dict[str, str]]:
 # ------------------------------------------------------------------------------
 # Display decisions & wideners
 # ------------------------------------------------------------------------------
+
 def determine_display_mode(user_query: str, rows: list) -> str:
     uq = (user_query or "").strip().lower()
     want_table = bool(re.search(r'\b(show|list|display|table|tabular|rows|grid)\b', uq))
     want_summary = bool(re.search(r'\b(summary|summarise|summarize|overview|report|insights?|analysis|analyze|describe|explain|update|status)\b', uq))
+    
+    # Check for specific data requests (should show table even if they start with what/when/where/who)
+    specific_data_request = bool(re.search(r'\b(finish date|start date|task number|job.?no|po.?number|style.?ref|buyer.?name|actual.?finish|task.?finish|shipment.?date|user.?id|username|full.?name|email|phone|address|salary|employee|person|user|staff)\b', uq))
+    
+    # Check for "who is" queries - these should show person details, not just summary
+    who_is_query = bool(re.match(r'^\s*who\s+is\b', uq))
+    
+    # Check for "what is" queries asking for specific values
+    what_is_specific = bool(re.match(r'^\s*what\s+is\s+(the\s+)?(finish|start|actual|task|shipment|po|job)', uq))
+    
     if not rows:
         return "summary"
     if want_summary and want_table:
@@ -839,8 +850,21 @@ def determine_display_mode(user_query: str, rows: list) -> str:
         return "table"
     if want_summary:
         return "summary"
+    
+    # For questions starting with what/who/when/where/why/how
     if re.match(r'^\s*(who|what|which|when|where|why|how)\b', uq):
+        # Show table for "who is" queries (employee lookups)
+        if who_is_query:
+            return "table"
+        # Show table for specific "what is" queries
+        if what_is_specific:
+            return "table"
+        # Show table if asking for specific data fields
+        if specific_data_request:
+            return "table"
+        # Otherwise, show summary
         return "summary"
+    
     return "table"
 
 # --- generic-ness detector used by wide projection & widener ------------------

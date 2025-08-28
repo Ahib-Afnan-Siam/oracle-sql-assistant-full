@@ -122,8 +122,118 @@ def generate_table_description(table_name: str) -> str:
     else:
         return f"Table '{table_name}' contains unspecified data."
 
+# -------------------------
+# Enhanced Critical Table Definitions
+# -------------------------
+
+CRITICAL_TABLE_ENHANCED_INFO = {
+    "T_PROD": {
+        "description": "Production data table containing daily floor-wise production metrics, defect quantities, efficiency rates, and quality analysis. This is the primary table for production analysis and floor performance tracking.",
+        "business_context": "Used for production summaries, floor efficiency analysis, defect tracking, DHU calculations, and quality control reporting.",
+        "key_metrics": ["PRODUCTION_QTY", "DEFECT_QTY", "DHU", "FLOOR_EF"],
+        "common_queries": ["floor-wise production", "defect analysis", "efficiency tracking", "daily production summary"]
+    },
+    "T_PROD_DAILY": {
+        "description": "Daily production data with detailed time tracking including AC production hours and working hours. Enhanced version of T_PROD with additional time-based metrics for comprehensive production analysis.",
+        "business_context": "Used for detailed daily production analysis, time efficiency calculations, hourly productivity tracking, and operational hour reporting.",
+        "key_metrics": ["PRODUCTION_QTY", "DEFECT_QTY", "DHU", "FLOOR_EF", "AC_PRODUCTION_HOUR", "AC_WORKING_HOUR"],
+        "common_queries": ["daily production analysis", "hourly efficiency", "time-based productivity", "working hour analysis"]
+    },
+    "T_TNA_STATUS": {
+        "description": "Time and Action (TNA) status tracking table containing task management, buyer information, style details, and shipment schedules. Critical for order fulfillment and timeline management.",
+        "business_context": "Used for task tracking, buyer order management, style reference lookups, shipment planning, and TNA timeline analysis.",
+        "key_metrics": ["TASK_NUMBER", "PO_NUMBER_ID"],
+        "common_queries": ["task status", "buyer orders", "style information", "shipment tracking", "TNA analysis"]
+    }
+}
+
+CRITICAL_COLUMN_ENHANCED_HINTS = {
+    # Production Tables
+    "PROD_DATE": "Production date - key for daily/periodic production analysis",
+    "FLOOR_NAME": "Production floor identifier - essential for floor-wise analysis and comparisons",
+    "PM_OR_APM_NAME": "Production Manager or Assistant Production Manager name",
+    "FLOOR_EF": "Floor efficiency percentage - key performance indicator",
+    "DHU": "Defects per Hundred Units - critical quality metric",
+    "DEFECT_QTY": "Total defect quantity - primary quality measurement",
+    "PRODUCTION_QTY": "Total production quantity - primary output measurement",
+    "DEFECT_PERS": "Defect percentage relative to production",
+    "UNCUT_THREAD": "Specific defect type: uncut threads",
+    "DIRTY_STAIN": "Specific defect type: dirty stains or spots",
+    "BROKEN_STITCH": "Specific defect type: broken stitching",
+    "SKIP_STITCH": "Specific defect type: skipped stitches",
+    "OPEN_SEAM": "Specific defect type: open seams",
+    "AC_PRODUCTION_HOUR": "Actual production hours worked",
+    "AC_WORKING_HOUR": "Actual total working hours",
+
+    # TNA Status Table
+    "JOB_NO": "Job number - unique identifier for production jobs",
+    "PO_NUMBER_ID": "Purchase order number ID - links to buyer orders",
+    "TASK_NUMBER": "Task sequence number in TNA timeline",
+    "TASK_FINISH_DATE": "Planned task completion date",
+    "ACTUAL_FINISH_DATE": "Actual task completion date - for timeline analysis",
+    "TASK_SHORT_NAME": "Abbreviated task name for quick reference",
+    "PO_NUMBER": "Purchase order number - buyer reference",
+    "PO_RECEIVED_DATE": "Date when purchase order was received",
+    "PUB_SHIPMENT_DATE": "Published/planned shipment date",
+    "SHIPMENT_DATE": "Actual shipment date",
+    "STYLE_REF_NO": "Style reference number - unique garment style identifier",
+    "STYLE_DESCRIPTION": "Detailed description of the garment style",
+    "BUYER_NAME": "Customer/buyer name - for buyer-wise analysis",
+    "TEAM_MEMBER_NAME": "Team member responsible for the task",
+    "TEAM_LEADER_NAME": "Team leader overseeing the task"
+}
+
+def generate_enhanced_table_description(table_name: str) -> str:
+    """Generate enhanced descriptions for critical tables with business context."""
+    table_upper = table_name.upper()
+    if table_upper in CRITICAL_TABLE_ENHANCED_INFO:
+        info = CRITICAL_TABLE_ENHANCED_INFO[table_upper]
+        description = info["description"]
+        business_context = info["business_context"]
+        key_metrics = ", ".join(info["key_metrics"])
+        common_queries = ", ".join(info["common_queries"])
+        return f"{description} {business_context} Key metrics: {key_metrics}. Common use cases: {common_queries}."
+
+    # Fallback to original lightweight heuristics
+    t = table_name.lower()
+    if "emp" in t or "employee" in t:
+        return "Table containing employee data such as personal details, salaries, and job roles."
+    elif "dept" in t or "department" in t:
+        return "Table containing department details including department name and location."
+    elif "task" in t or "tna" in t:
+        return "Table containing task details related to Time and Action management."
+    elif "order" in t:
+        return "Table containing order details including order information, quantities, and statuses."
+    elif "transaction" in t:
+        return "Table storing transaction details related to various processes."
+    elif "details" in t:
+        return "Table containing detailed information related to specific records."
+    elif "mst" in t:
+        return "Master table containing key reference data for a specific entity."
+    elif "inventory" in t or "inv" in t:
+        return "Table containing inventory-related data, including stock and transactions."
+    elif "comment" in t:
+        return "Table containing comments or notes related to specific records or transactions."
+    elif "consume" in t:
+        return "Table storing data about consumption of resources, such as materials or goods."
+    elif "charge" in t:
+        return "Table containing information about charges, fees, or costs associated with records."
+    elif "contract" in t:
+        return "Table storing contract details including contract amendments and related information."
+    elif "tc" in t:
+        return "Table containing transaction or receipt details related to specific processes."
+    else:
+        return f"Table '{table_name}' contains unspecified data."
+
 def create_table_descriptions(tables):
-    return {table: generate_table_description(table) for table in tables}
+    return {table: generate_enhanced_table_description(table) for table in tables}
+
+def get_enhanced_column_hint(column_name: str, table_name: str = None) -> str:
+    """Get enhanced column hints with table context awareness."""
+    col_upper = (column_name or "").upper()
+    if col_upper in CRITICAL_COLUMN_ENHANCED_HINTS:
+        return CRITICAL_COLUMN_ENHANCED_HINTS[col_upper]
+    return COLUMN_HINTS.get(col_upper, "No description available")
 
 def _safe_id_fragment(s: str) -> str:
     s = (s or "")[:128]
@@ -253,11 +363,31 @@ def load_schema_to_chroma():
                 table_docs, table_ids, table_metas = [], [], []
                 for table in tables:
                     table_desc = table_descriptions.get(table.upper(), "No description available for this table")
-                    content = f"Table '{table}' from {source_id.upper()} database. Description: {table_desc}"
+
+                    if table.upper() in CRITICAL_TABLE_ENHANCED_INFO:
+                        info = CRITICAL_TABLE_ENHANCED_INFO[table.upper()]
+                        content = (
+                            f"Table '{table}' from {source_id.upper()} database. {table_desc} "
+                            f"Business use cases: {', '.join(info['common_queries'])}. "
+                            f"This table is frequently used for queries about: "
+                            f"production analysis, floor performance, defect tracking, efficiency metrics."
+                        )
+                        enhanced_meta = {
+                            "source_table": table,
+                            "source_id": source_id,
+                            "kind": "table",
+                            "is_critical": True,
+                            "business_priority": "high",
+                        }
+                    else:
+                        content = f"Table '{table}' from {source_id.upper()} database. Description: {table_desc}"
+                        enhanced_meta = {"source_table": table, "source_id": source_id, "kind": "table"}
+
                     doc_id = f"{source_id}.{table}"
                     table_docs.append(content)
                     table_ids.append(doc_id)
-                    table_metas.append({"source_table": table, "source_id": source_id, "kind": "table"})
+                    table_metas.append(enhanced_meta)
+
                 table_embs = encode_texts_batch(table_docs, batch_size=EMB_BATCH_SIZE)
 
                 # Add tables in large batches
@@ -289,6 +419,53 @@ def load_schema_to_chroma():
                             )
                             alias_table_docs += len(alias_ids[i:i+CHROMA_ADD_BATCH_SIZE])
 
+                # ---------- ENHANCED BUSINESS CONTEXT DOCS (for critical tables) ----------
+                business_docs, business_ids, business_metas = [], [], []
+
+                for table in tables:
+                    if table.upper() in CRITICAL_TABLE_ENHANCED_INFO:
+                        info = CRITICAL_TABLE_ENHANCED_INFO[table.upper()]
+                        context_mappings = [
+                            ("production queries", "production quantity defect floor efficiency manufacturing output"),
+                            ("defect analysis", "quality control defects DHU broken stitch skip stitch open seam"),
+                            ("floor performance", "floor wise analysis efficiency comparison production rates"),
+                            ("daily tracking", "daily production tracking date wise analysis trends"),
+                            ("task management", "TNA timeline task status buyer orders shipment dates"),
+                            ("style information", "garment style description buyer requirements specifications"),
+                        ]
+                        for context_type, keywords in context_mappings:
+                            if any(
+                                kw in (info["business_context"] or "").lower()
+                                or kw in " ".join(info.get("common_queries", [])).lower()
+                                for kw in keywords.split()
+                            ):
+                                business_doc = (
+                                    f"Business context: {context_type} using table '{table}'. "
+                                    f"Keywords: {keywords}. Table contains: {info['description'][:200]}..."
+                                )
+                                business_id = f"{source_id}.{table}::CONTEXT::{context_type.replace(' ', '_')}"
+                                business_meta = {
+                                    "source_table": table,
+                                    "source_id": source_id,
+                                    "kind": "business_context",
+                                    "context_type": context_type,
+                                    "is_critical": True,
+                                }
+                                business_docs.append(business_doc)
+                                business_ids.append(business_id)
+                                business_metas.append(business_meta)
+
+                if business_docs:
+                    business_embs = encode_texts_batch(business_docs, batch_size=EMB_BATCH_SIZE)
+                    for i in range(0, len(business_docs), CHROMA_ADD_BATCH_SIZE):
+                        collection.add(
+                            documents=business_docs[i:i+CHROMA_ADD_BATCH_SIZE],
+                            embeddings=business_embs[i:i+CHROMA_ADD_BATCH_SIZE],
+                            ids=business_ids[i:i+CHROMA_ADD_BATCH_SIZE],
+                            metadatas=business_metas[i:i+CHROMA_ADD_BATCH_SIZE],
+                        )
+                    logger.info(f"[{source_id}] Added {len(business_docs)} business context documents")
+
                 # ---------- COLUMNS + OPTIONAL VALUE/RANGE (stream batched) ----------
                 for table in tqdm(tables, desc=f"{source_id} Tables"):
                     cursor.execute("""
@@ -305,21 +482,33 @@ def load_schema_to_chroma():
                     # build column docs first
                     col_docs, col_ids, col_metas = [], [], []
                     for col_name, col_type in cols:
-                        desc = COLUMN_HINTS.get(col_name.upper(), "No description available")
+                        # Use enhanced column hints with table context
+                        desc = get_enhanced_column_hint(col_name, table)
                         col_doc = (
                             f"Column '{col_name}' in table '{table}' from {source_id.upper()} database. "
                             f"Type: {col_type}. Purpose: {desc}"
                         )
-                        col_id = f"{source_id}.{table}.{col_name}"
-                        col_docs.append(col_doc)
-                        col_ids.append(col_id)
-                        col_metas.append({
+
+                        enhanced_meta = {
                             "source_table": table,
                             "source_id": source_id,
                             "column": col_name,
                             "type": col_type,
-                            "kind": "column"
-                        })
+                            "kind": "column",
+                        }
+
+                        # Add critical flags / key metric markers
+                        if table.upper() in CRITICAL_TABLE_ENHANCED_INFO:
+                            enhanced_meta["is_critical"] = True
+                            info = CRITICAL_TABLE_ENHANCED_INFO[table.upper()]
+                            if col_name.upper() in (info.get("key_metrics") or []):
+                                enhanced_meta["is_key_metric"] = True
+                                col_doc += f" This is a key business metric for {table}."
+
+                        col_id = f"{source_id}.{table}.{col_name}"
+                        col_docs.append(col_doc)
+                        col_ids.append(col_id)
+                        col_metas.append(enhanced_meta)
 
                     # embed columns in batch
                     if col_docs:
@@ -400,14 +589,18 @@ def load_schema_to_chroma():
                                 range_docs += 1
 
                 # ✅ No explicit persist() needed with PersistentClient
+                business_context_count = len([t for t in tables if t.upper() in CRITICAL_TABLE_ENHANCED_INFO])
+
                 logger.info(
                     f"✅ {source_id}: {total_tables} table docs, {total_columns} column docs"
                     + (f", {alias_table_docs} table-alias docs" if INCLUDE_ALIASES else "")
                     + (f", {alias_column_docs} column-alias docs" if INCLUDE_ALIASES else "")
                     + (f", {value_docs} value docs" if INCLUDE_VALUE_SAMPLES else "")
                     + (f", {range_docs} range docs" if INCLUDE_NUMERIC_RANGES else "")
+                    + (f", enhanced business context for {business_context_count} critical tables" if business_context_count > 0 else "")
                     + " indexed."
                 )
+
 
         except Exception as e:
             logger.error(f"❌ Failed to load {source_id}: {e}", exc_info=True)
