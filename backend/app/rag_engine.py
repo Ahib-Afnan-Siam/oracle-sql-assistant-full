@@ -868,6 +868,95 @@ def _validate_plan(plan: Dict[str, Any], options: Dict[str, Any]) -> Tuple[bool,
     # order_by/limit are optional; keys are checked later by the SQL builder
     return True, None
 
+def _enhanced_employee_lookup(user_query: str, selected_db: str, enhanced_analysis: Dict) -> Dict[str, Any]:
+    """Enhanced employee lookup using intent analysis."""
+    try:
+        # Extract person name or role from query
+        query_lower = user_query.lower()
+        
+        # Extract the person's name from the query
+        name_patterns = [
+            r'email.*(?:address\s+)?of\s+(\w+)',
+            r'give\s+me\s+email.*of\s+(\w+)',
+            r'(\w+).*email',
+            r'who\s+is\s+(?:employee\s+)?(\w+)'
+        ]
+        
+        person_name = None
+        for pattern in name_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                person_name = match.group(1).upper()
+                break
+        
+        # Determine what information is being requested
+        wants_email = any(word in query_lower for word in ['email', 'contact', 'address'])
+        wants_salary = any(word in query_lower for word in ['salary', 'pay', 'wage'])
+        
+        # For T_USERS table (since the query went there), select appropriate columns
+        if wants_email:
+            columns_str = "USER_ID, USERNAME, FULL_NAME, EMAIL_ADDRESS, PHONE_NUMBER"
+        elif wants_salary:
+            columns_str = "USER_ID, USERNAME, FULL_NAME"  # T_USERS doesn't have salary
+        else:
+            columns_str = "USER_ID, USERNAME, FULL_NAME, EMAIL_ADDRESS"
+        
+        # Build the SQL for T_USERS table
+        if person_name:
+            sql = f"""
+            SELECT {columns_str}
+            FROM T_USERS 
+            WHERE (UPPER(USERNAME) LIKE '%{person_name}%' 
+                   OR UPPER(FULL_NAME) LIKE '%{person_name}%')
+            ORDER BY USER_ID
+            FETCH FIRST 5 ROWS ONLY
+            """
+        else:
+            # Generic user search
+            sql = f"""
+            SELECT {columns_str}
+            FROM T_USERS 
+            ORDER BY USER_ID
+            FETCH FIRST 10 ROWS ONLY
+            """
+        
+        logger.info(f"[RAG] Enhanced employee lookup SQL: {sql}")
+        
+        # Execute query
+        rows = run_sql(sql, selected_db)
+        
+        # Format results
+        display_mode = determine_display_mode(user_query, rows)
+        rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
+        
+        # Use enhanced summarizer for employee lookup
+        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+        summary = (summarize_with_mistral(
+            user_query=user_query,
+            columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
+            rows=rows_for_summary,
+            backend_summary=python_summary,
+            sql=sql,
+        ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"] else python_summary)
+        
+        return {
+            "status": "success",
+            "summary": summary if display_mode in ["summary","both"] else "",
+            "sql": sql,
+            "display_mode": display_mode,
+            "results": {
+                "columns": list(rows[0].keys()) if rows else [],
+                "rows": [list(r.values()) for r in rows] if rows else [],
+                "row_count": len(rows) if rows else 0,
+            },
+            "schema_context": [],
+            "schema_context_ids": [],
+        }
+        
+    except Exception as e:
+        logger.error(f"[RAG] Enhanced employee lookup failed: {e}")
+        # Fall back to generic entity lookup
+        return _entity_lookup_path(user_query, selected_db, [], [])
 # ---------------------------
 # Fallback: entity lookup
 # ---------------------------
@@ -1113,7 +1202,10 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
             logger.info(f"[RAG] Enhanced date range detected: {enhanced_date_range['type']}")
     except Exception as e:
         logger.warning(f"[RAG] Enhanced date extraction failed: {e}")
-
+    # Enhanced intent-based routing - use enhanced analysis before vector search
+    if enhanced_analysis['intent'] == 'employee_lookup':
+        logger.info("[RAG] Routing to employee lookup based on enhanced analysis")
+        return _enhanced_employee_lookup(uq, selected_db, enhanced_analysis)
     # 0) Fast paths -------------------------------------------------------------
     # 0.a) Raw SELECT passthrough (validated)
     if re.match(r'(?is)^\s*select\b', uq):
