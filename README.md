@@ -231,9 +231,9 @@ OPENROUTER_API_KEY=your_openrouter_api_key
 Start the FastAPI server:
 ```bash
 cd backend
-uvicorn app.main:app --port 8090 --reload
+uvicorn app.main:app --port **** --reload
 ```
-The backend will be available at **http://localhost:8090**
+The backend will be available at **Your localhot and port**
 
 ### Frontend
 Start the React development server:
@@ -241,13 +241,13 @@ Start the React development server:
 cd frontend
 npm run dev
 ```
-The frontend will be available at **http://localhost:5173**
+The frontend will be available at **Your localhot and port**
 
 ---
 
 ## 🚀 Usage
 
-1. Open the web interface at **http://localhost:5173**  
+1. Open the web interface at **Your localhot and port** 
 2. Type your natural-language query in the chat input  
 3. View the **generated SQL** and **execution results**  
 4. Provide **feedback** on the response quality  
