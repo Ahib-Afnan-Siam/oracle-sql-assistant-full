@@ -752,17 +752,26 @@ def _month_token_to_range(tok: str) -> Optional[Tuple[datetime, datetime]]:
 def _extract_relative_date_range(uq: str) -> Optional[Tuple[datetime, datetime]]:
     uq = uq.lower()
     today = datetime.now().date()
-    # last 7 days (inclusive)
-    if "last 7 days" in uq:
+    
+    # last 7 days (inclusive) - handle multiple variations
+    if "last 7 days" in uq or "last seven days" in uq:
         start = datetime.combine(today - timedelta(days=6), datetime.min.time())
         end = datetime.combine(today, datetime.max.time())
         return start, end
+        
+    # last 30 days
+    if "last 30 days" in uq or "last thirty days" in uq:
+        start = datetime.combine(today - timedelta(days=29), datetime.min.time())
+        end = datetime.combine(today, datetime.max.time())
+        return start, end
+        
     # last month
     if "last month" in uq:
         y, m = (today.year, today.month-1) if today.month > 1 else (today.year-1, 12)
         start = datetime(y, m, 1)
         end = datetime(y, m, monthrange(y, m)[1])
         return start, end
+        
     # last quarter
     if "last quarter" in uq:
         q = (today.month-1)//3 + 1
@@ -772,12 +781,14 @@ def _extract_relative_date_range(uq: str) -> Optional[Tuple[datetime, datetime]]
         start = datetime(y, m0, 1)
         end = datetime(y, m0+2, monthrange(y, m0+2)[1])
         return start, end
+        
     # last year
     if "last year" in uq:
         y = today.year - 1
         start = datetime(y, 1, 1)
         end = datetime(y, 12, 31)
         return start, end
+        
     return None
 
 def extract_month_token_range(user_query: str) -> Optional[Dict[str, str]]:
@@ -1004,6 +1015,7 @@ def summarize_results(rows: list, user_query: str) -> str:
         k, v = next(iter(rows[0].items()))
         def _fmt(x): 
             from decimal import Decimal
+            if x is None: return "—"
             if isinstance(x, Decimal): x = float(x)
             s = f"{x:,.2f}"; return s.rstrip("0").rstrip(".")
         return f"{k.replace('_',' ').title()}: {_fmt(v)}"
@@ -1779,11 +1791,28 @@ def value_aware_text_filter(sql: str, selected_db: str) -> str:
     if not best_col:
         return sql
 
+    # Enhanced pattern matching for company names in floor names
+    # If the value contains company identifiers, create additional flexible patterns
+    additional_patterns = []
+    company_identifiers = ['CAL', 'WINNER', 'BIP']
+    
+    # Check if this is a company-related filter
+    if any(company in raw_val.upper() for company in company_identifiers):
+        # Add a more flexible pattern to match company identifiers anywhere in the value
+        for company in company_identifiers:
+            if company in raw_val.upper():
+                additional_patterns.append(f"UPPER({best_col}) LIKE UPPER('%{company}%')")
+                break  # Only add one company pattern to avoid over-complication
+
     # Build predicate WITHOUT outer () — we’ll add them only if the match isn’t already wrapped
     pred_core = (
         f"UPPER({best_col}) LIKE UPPER('{esc_like}') "
         f"OR UPPER(REPLACE(REPLACE({best_col},'-',''),' ','')) LIKE UPPER('%{norm}%')"
     )
+    
+    # Add additional company patterns if applicable
+    if additional_patterns:
+        pred_core = " OR ".join([pred_core] + additional_patterns)
 
     s, e = pm.span()
     left = where_part[:s]
@@ -1808,8 +1837,6 @@ def value_aware_text_filter(sql: str, selected_db: str) -> str:
         new_where = new_where + " "
 
     return sql[:w_start] + new_where + sql[w_end:]
-
-
 
 # ------------------------------------------------------------------------------
 # Entity-lookup helpers (needle → candidate columns → probe)

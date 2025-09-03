@@ -6,17 +6,23 @@ from typing import List, Dict
 
 import chromadb
 from chromadb.config import Settings
-from chromadb.telemetry.posthog import Posthog
+
+# ---- Telemetry handling with version compatibility ----
+try:
+    from chromadb.telemetry.posthog import Posthog
+    # For older versions of ChromaDB
+    def safe_capture(self, *args, **kwargs):
+        # Newer Chroma calls capture with variable args; just swallow.
+        return None
+    Posthog.capture = safe_capture
+except ImportError:
+    # For newer versions of ChromaDB where this import doesn't exist
+    pass
+
+# Disable telemetry
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
 from app.embeddings import get_embedding
-
-# ---- Telemetry off / monkey patch ----
-def safe_capture(self, *args, **kwargs):
-    # Newer Chroma calls capture with variable args; just swallow.
-    return None
-
-Posthog.capture = safe_capture
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,7 +40,6 @@ def get_chroma_client(selected_db: str) -> chromadb.Client:
         path=f"chroma_storage/{selected_db}",
         settings=Settings(anonymized_telemetry=False)
     )
-
 # =========================
 # Optional synonyms used ONLY at query-time (no indexing cost)
 # =========================

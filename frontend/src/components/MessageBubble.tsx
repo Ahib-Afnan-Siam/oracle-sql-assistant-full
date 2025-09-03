@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import { Bot, User, Copy, RotateCcw, Check } from "lucide-react";
 import DataTable from "./DataTable";
 import { useChat } from "./ChatContext";
+import HybridMetadataDisplay from "./HybridMetadataDisplay";
 
 type OracleError = {
   error: string;
@@ -17,11 +18,24 @@ type OracleError = {
   suggestions?: string[];
 };
 
+// Phase 4.2: Enhanced message type with hybrid metadata
+type HybridMetadata = {
+  processing_mode?: string;
+  model_used?: string;
+  selection_reasoning?: string;
+  processing_time?: number;
+  local_confidence?: number;
+  api_confidence?: number;
+};
+
 type Message = {
   sender: "user" | "bot";
   content: string | (string | number | null)[][] | OracleError;
   id: string;
   type: "user" | "status" | "summary" | "table" | "error";
+  // Phase 4.2: Add hybrid metadata and response time to message type
+  hybrid_metadata?: HybridMetadata;
+  response_time?: number;
 };
 
 interface Props {
@@ -107,7 +121,7 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
   // typing effect for summary only
   const [displayed, setDisplayed] = useState("");
   const [idx, setIdx] = useState(0);
-  
+
   // Copy functionality
   const [copied, setCopied] = useState(false);
 
@@ -131,18 +145,18 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
   const handleCopy = async () => {
     try {
       let textToCopy = "";
-      
+
       if (typeof content === "string") {
         textToCopy = content;
       } else if (Array.isArray(content)) {
         // For table data, create a formatted text representation
         const [headers, ...rows] = content;
-        textToCopy = `${headers.join('\t')}\n${rows.map(row => row.join('\t')).join('\n')}`;
+        textToCopy = `${headers.join("\t")}\n${rows.map((row) => row.join("\t")).join("\n")}`;
       } else if (typeof content === "object" && content && ("error" in content || "message" in content)) {
         const errorData = content as OracleError;
         textToCopy = errorData.message || errorData.error || "Error occurred";
       }
-      
+
       await navigator.clipboard.writeText(textToCopy);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -154,9 +168,9 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
   // Retry function - finds the last user message and resends it
   const handleRetry = () => {
     // Find the user message that triggered this bot response
-    const currentIndex = messages.findIndex(m => m.id === id);
+    const currentIndex = messages.findIndex((m) => m.id === id);
     let userMessage = "";
-    
+
     // Look backwards from current message to find the last user message
     for (let i = currentIndex - 1; i >= 0; i--) {
       if (messages[i].sender === "user" && typeof messages[i].content === "string") {
@@ -164,19 +178,21 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
         break;
       }
     }
-    
+
     if (userMessage) {
       processMessage(userMessage, selectedDB);
     }
   };
 
   // Don't show action buttons for user messages, status messages, or during typing
-  const showActionButtons = sender === "bot" && 
-                           type !== "status" && 
-                           !(type === "summary" && typeof content === "string" && idx < content.length);
+  const showActionButtons =
+    sender === "bot" &&
+    type !== "status" &&
+    !(type === "summary" && typeof content === "string" && idx < content.length);
 
+  // user bubbles now inline-block so they only take necessary width
   const bubbleStyle: Record<Message["type"], string> = {
-    user: "bg-purple-600 text-white",
+    user: "bg-purple-600 text-white inline-block",
     bot: "bg-white text-gray-900 border border-gray-300 shadow-sm",
     status: "bg-yellow-50 text-gray-600 italic status-blink",
     table: "bg-white text-gray-900 border border-gray-200 shadow",
@@ -232,12 +248,18 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
     return null;
   };
 
-  // widen table bubbles
-  const widthClass = type === "table" ? "max-w-[95%]" : "max-w-[78%] md:max-w-[70%]";
+  // widen table bubbles; make user bubbles a bit wider than bot bubbles
+  const widthClass =
+    type === "table"
+      ? "max-w-[95%]"
+      : sender === "user"
+      ? "max-w-[85%] md:max-w-[75%]"
+      : "max-w-[78%] md:max-w-[70%]";
 
   return (
     <div className={`w-full flex ${sender === "user" ? "justify-end" : "justify-start"}`}>
-      <div className={`group flex items-start gap-2 ${sender === "user" ? "flex-row-reverse" : ""} max-w-[90%]`}>
+      {/* gap reduced further to gap-0.5 and container widened to 95% */}
+      <div className={`group flex items-start gap-0.5 ${sender === "user" ? "flex-row-reverse" : ""} max-w-[95%]`}>
         {/* avatar */}
         <div className="pt-1 flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 shadow-sm shrink-0">
           {sender === "user" ? (
@@ -249,22 +271,48 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
 
         {/* For messages without action buttons, use simple bubble structure */}
         {!showActionButtons ? (
-          <div className={`rounded-2xl px-4 py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
-            {renderContent()}
-            {type === "summary" && typeof content === "string" && idx < content.length && (
-              <span className="animate-pulse">|</span>
-            )}
-          </div>
-        ) : (
-          /* For messages with action buttons, use flex column structure */
-          <div className="flex flex-col gap-1">
-            <div className={`rounded-2xl px-4 py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
+          <div className="flex flex-col gap-1 w-full">
+            {/* Adjusted padding: slightly more for user, compact for bot */}
+            <div className={`rounded-2xl ${sender === "user" ? "px-4" : "px-3"} py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
               {renderContent()}
               {type === "summary" && typeof content === "string" && idx < content.length && (
                 <span className="animate-pulse">|</span>
               )}
             </div>
-            
+
+            {/* Phase 4.2: Show hybrid metadata for bot messages (compact version) */}
+            {sender === "bot" && message.hybrid_metadata && type !== "status" && (
+              <div className={`${widthClass}`}>
+                <HybridMetadataDisplay
+                  metadata={message.hybrid_metadata}
+                  responseTime={message.response_time}
+                  compact={true}
+                />
+              </div>
+            )}
+          </div>
+        ) : (
+          /* For messages with action buttons, use flex column structure */
+          <div className="flex flex-col gap-1 w-full">
+            {/* Adjusted padding: slightly more for user, compact for bot */}
+            <div className={`rounded-2xl ${sender === "user" ? "px-4" : "px-3"} py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
+              {renderContent()}
+              {type === "summary" && typeof content === "string" && idx < content.length && (
+                <span className="animate-pulse">|</span>
+              )}
+            </div>
+
+            {/* Phase 4.2: Show hybrid metadata for bot messages (full version) */}
+            {message.hybrid_metadata && (
+              <div className={`${widthClass} ml-2`}>
+                <HybridMetadataDisplay
+                  metadata={message.hybrid_metadata}
+                  responseTime={message.response_time}
+                  compact={false}
+                />
+              </div>
+            )}
+
             {/* Action buttons for bot messages */}
             <div className="flex items-center gap-1 ml-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
               {/* Copy button */}
@@ -279,7 +327,7 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
                   <Copy size={14} className="text-gray-500 hover:text-gray-700" />
                 )}
               </button>
-              
+
               {/* Retry button */}
               <button
                 onClick={handleRetry}

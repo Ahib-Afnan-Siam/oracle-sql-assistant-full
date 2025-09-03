@@ -1,4 +1,3 @@
-# app/schema_loader_chroma.py
 import logging
 import os
 from tqdm import tqdm
@@ -13,10 +12,16 @@ from app.config import SOURCES
 import os
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
-from chromadb.telemetry.posthog import Posthog
-def _no_capture(*args, **kwargs):
-    return None
-Posthog.capture = _no_capture
+# ---- Telemetry handling with version compatibility ----
+try:
+    from chromadb.telemetry.posthog import Posthog
+    # For older versions of ChromaDB
+    def safe_capture(self, *args, **kwargs):
+        return None
+    Posthog.capture = safe_capture
+except ImportError:
+    # For newer versions of ChromaDB where this import doesn't exist
+    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -125,7 +130,7 @@ def generate_table_description(table_name: str) -> str:
 # -------------------------
 # Enhanced Critical Table Definitions
 # -------------------------
-
+# Enhanced Critical Table Definitions with your full schema
 CRITICAL_TABLE_ENHANCED_INFO = {
     "T_PROD": {
         "description": "Production data table containing daily floor-wise production metrics, defect quantities, efficiency rates, and quality analysis. This is the primary table for production analysis and floor performance tracking.",
@@ -144,13 +149,61 @@ CRITICAL_TABLE_ENHANCED_INFO = {
         "business_context": "Used for task tracking, buyer order management, style reference lookups, shipment planning, and TNA timeline analysis.",
         "key_metrics": ["TASK_NUMBER", "PO_NUMBER_ID"],
         "common_queries": ["task status", "buyer orders", "style information", "shipment tracking", "TNA analysis"]
+    },
+    "T_USERS": {
+        "description": "User management table containing employee personal details, contact information, access control, and login tracking.",
+        "business_context": "Used for HR queries, employee lookups, contact information, user authentication, and staff management.",
+        "key_metrics": ["USER_ID", "FULL_NAME", "EMAIL_ADDRESS"],
+        "common_queries": ["employee information", "staff lookup", "contact details", "user management"]
+    },
+    "EMP": {
+        "description": "Employee data table containing personal details, job roles, salary information, and organizational hierarchy.",
+        "business_context": "Used for HR analysis, salary queries, organizational structure, employee management, and payroll reporting.",
+        "key_metrics": ["EMPNO", "ENAME", "SAL", "JOB"],
+        "common_queries": ["employee details", "salary information", "job roles", "manager hierarchy"]
+    },
+    "DEPT": {
+        "description": "Department master table containing department information, names, and locations within the organization.",
+        "business_context": "Used for organizational structure queries, department-wise analysis, and location-based reporting.",
+        "key_metrics": ["DEPTNO", "DNAME", "LOC"],
+        "common_queries": ["department information", "organizational structure", "department locations"]
+    },
+    "T_ORDC": {
+        "description": "Order details and production tracking table containing buyer information, style details, quantities, and production metrics.",
+        "business_context": "Used for order management, production planning, buyer analysis, and shipment tracking.",
+        "key_metrics": ["POQTY", "CUTQTY", "SOUTPUT", "SHIPQTY"],
+        "common_queries": ["order details", "production tracking", "buyer orders", "shipment status"]
+    },
+    "COMPANIES": {
+        "description": "Company master table containing company information, addresses, and contact details.",
+        "business_context": "Used for company management, contact information, and business relationship tracking.",
+        "key_metrics": ["COMPANY_ID", "COMPANY_NAME"],
+        "common_queries": ["company information", "business contacts", "company details"]
+    },
+    "CONTAINER_MASTER": {
+        "description": "Container specifications table containing container types, dimensions, and capacity information.",
+        "business_context": "Used for shipping calculations, container planning, and logistics management.",
+        "key_metrics": ["CONTAINER_ID", "MAX_CBM", "MAX_WEIGHT_KG"],
+        "common_queries": ["container specifications", "shipping capacity", "logistics planning"]
+    },
+    "ITEM_MASTER": {
+        "description": "Item master table containing product specifications, dimensions, and physical properties.",
+        "business_context": "Used for product management, inventory planning, and shipping calculations.",
+        "key_metrics": ["ITEM_ID", "CBM", "LENGTH_CM", "WIDTH_CM", "HEIGHT_CM"],
+        "common_queries": ["item specifications", "product details", "inventory management"]
+    },
+    "V_TNA_STATUS": {
+        "description": "TNA status view providing comprehensive task tracking with enhanced reporting capabilities.",
+        "business_context": "Used for TNA reporting, task analysis, buyer tracking, and timeline management.",
+        "key_metrics": ["JOB_NO", "PO_NUMBER", "BUYER_NAME"],
+        "common_queries": ["TNA reports", "task analysis", "buyer tracking", "timeline reports"]
     }
 }
 
 CRITICAL_COLUMN_ENHANCED_HINTS = {
     # Production Tables
     "PROD_DATE": "Production date - key for daily/periodic production analysis",
-    "FLOOR_NAME": "Production floor identifier - essential for floor-wise analysis and comparisons",
+    "FLOOR_NAME": "Production floor identifier - essential for floor-wise analysis and comparisons. Use patterns like 'Sewing CAL%', 'Winner%', 'BIP%' for company filtering",
     "PM_OR_APM_NAME": "Production Manager or Assistant Production Manager name",
     "FLOOR_EF": "Floor efficiency percentage - key performance indicator",
     "DHU": "Defects per Hundred Units - critical quality metric",
@@ -180,7 +233,124 @@ CRITICAL_COLUMN_ENHANCED_HINTS = {
     "STYLE_DESCRIPTION": "Detailed description of the garment style",
     "BUYER_NAME": "Customer/buyer name - for buyer-wise analysis",
     "TEAM_MEMBER_NAME": "Team member responsible for the task",
-    "TEAM_LEADER_NAME": "Team leader overseeing the task"
+    "TEAM_LEADER_NAME": "Team leader overseeing the task",
+
+    # Employee Tables (EMP and T_USERS)
+    "EMPNO": "Employee number - unique employee identifier",
+    "ENAME": "Employee name",
+    "JOB": "Job title or role",
+    "MGR": "Manager employee number",
+    "HIREDATE": "Employee hire date",
+    "SAL": "Employee salary",
+    "COMM": "Commission amount",
+    "DEPTNO": "Department number",
+    "USER_ID": "User identifier in system",
+    "USERNAME": "System username",
+    "FULL_NAME": "Employee full name",
+    "PHONE_NUMBER": "Contact phone number",
+    "EMAIL_ADDRESS": "Employee email address",
+    "IS_ACTIVE": "User active status flag",
+    "LAST_LOGIN": "Last login timestamp",
+
+    # Department Table
+    "DNAME": "Department name",
+    "LOC": "Department location",
+
+    # Order and Production Tables
+    "BUYER_NAME": "Customer/buyer company name",
+    "STYLEPO": "Style purchase order reference",
+    "STYLE": "Garment style code",
+    "JOB": "Job reference number",
+    "ITEM_NAME": "Product item name",
+    "FACTORY": "Manufacturing factory",
+    "POQTY": "Purchase order quantity",
+    "CUTQTY": "Cutting quantity completed",
+    "SINPUT": "Sewing input quantity",
+    "SOUTPUT": "Sewing output quantity",
+    "SHIPQTY": "Shipped quantity",
+    "LEFTQTY": "Remaining quantity",
+    "FOBP": "FOB price",
+    "SMV": "Standard minute value",
+    "CM": "Cost of manufacturing",
+    "CEFFI": "Cutting efficiency",
+    "AEFFI": "Actual efficiency",
+    "CMER": "CM earned",
+    "ACM": "Actual CM",
+    "EXMAT": "Excess material",
+    "SHIPDATE": "Shipment date",
+
+    # Company Tables
+    "COMPANY_ID": "Company unique identifier",
+    "COMPANY_NAME": "Company name",
+    "COMPANY_ADDRESS": "Company address",
+    "COMPANY_CNCL": "Company cancellation status",
+
+    # Container and Item Tables
+    "CONTAINER_ID": "Container unique identifier",
+    "CONTAINER_TYPE": "Container type specification",
+    "INNER_LENGTH_CM": "Container inner length in centimeters",
+    "INNER_WIDTH_CM": "Container inner width in centimeters",
+    "INNER_HEIGHT_CM": "Container inner height in centimeters",
+    "MAX_CBM": "Maximum cubic meters capacity",
+    "MAX_WEIGHT_KG": "Maximum weight capacity in kilograms",
+    "ITEM_ID": "Item unique identifier",
+    "ITEM_CODE": "Item code reference",
+    "DESCRIPTION": "Item description",
+    "LENGTH_CM": "Item length in centimeters",
+    "WIDTH_CM": "Item width in centimeters",
+    "HEIGHT_CM": "Item height in centimeters",
+    "CBM": "Cubic meters volume",
+
+    # Task and Library Tables
+    "ID": "Generic identifier (context-dependent)",
+    "TASK_NAME": "Full task name",
+    "TASK_SHORT_NAME": "Abbreviated task name",
+    "TASK_TYPE": "Task category or type",
+    "STATUS_ACTIVE": "Active status indicator",
+    "TASK_GROUP": "Task grouping category",
+    "TASK_OWNER": "Task owner or responsible party",
+
+    # Date and Time Fields
+    "A_DATE": "Activity or record date",
+    "LAST_UPDATE": "Last update timestamp",
+    "ADDED_DATE": "Record creation date",
+    "UPDATE_DATE": "Record modification date",
+
+    # Location and Organizational Fields
+    "LOCATION_NAME": "Location description",
+    "BU_NAME": "Business unit name",
+    "SECTION_NAME": "Section within business unit",
+    "LINE_NAME": "Production line or zone name",
+    "SUBUNIT_NAME": "Sub-unit or team name",
+
+    # Overtime and Time Tracking
+    "TOTAL_PRESENTS": "Total attendance count",
+    "OT_HOUR": "Overtime hours worked",
+    "OT_AMOUNT": "Overtime payment amount",
+    "OT_EMPLOYEE_COUNT": "Number of employees with overtime",
+    "OT_HOUR_COUNT": "Total overtime hours",
+
+    # Training and Reporting Views
+    "SQL_SAMPLE_ID": "SQL sample identifier",
+    "TURN_ID": "Conversation turn identifier",
+    "USER_QUESTION": "User query text",
+    "SOURCE_DB_ID": "Source database identifier",
+    "MODEL_NAME": "AI model name used",
+    "PROMPT_TEXT": "System prompt used",
+    "SQL_TEXT": "Generated SQL query",
+    "SQL_TEXT_FINAL": "Final SQL after processing",
+    "NORMALIZED_SQL": "Normalized SQL query",
+    "VALIDATION_OK": "SQL validation status",
+    "EXECUTION_OK": "SQL execution status",
+    "ERROR_CODE": "Error code if any",
+    "ROW_COUNT": "Result row count",
+    "RESULT_TABLE_JSON": "Result data in JSON format",
+    "LABEL": "Training label or category",
+    "IMPROVEMENT_COMMENT": "Improvement suggestions",
+    "SUMMARY_SAMPLE_ID": "Summary sample identifier",
+    "DATA_SNAPSHOT": "Data snapshot for training",
+    "SQL_USED": "SQL query used for results",
+    "SUMMARY_TEXT": "Generated summary text"
 }
 
 def generate_enhanced_table_description(table_name: str) -> str:

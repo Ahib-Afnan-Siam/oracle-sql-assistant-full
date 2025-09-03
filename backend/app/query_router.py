@@ -27,7 +27,8 @@ POLICY_KEYWORDS = [
 EMP_DEPT_KEYWORDS = [
     "employee", "employees", "emp", "ename", "salary", "sal",
     "dept", "department", "deptno", "manager", "hiredate",
-    "commission", "comm", "loc", "full_name", "user", "users"
+    "commission", "comm", "loc", "full_name", "user", "users",
+    "sohan", "who is", "person", "staff", "personnel", "member"
 ]
 
 PRODUCTION_KEYWORDS = [

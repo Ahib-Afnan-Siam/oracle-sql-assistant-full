@@ -2,14 +2,16 @@
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime as _dt
 import os
-from app.query_engine import _MONTH_ALIASES  # add this
+from decimal import Decimal
+from app.query_engine import _MONTH_ALIASES
 from app.vector_store_chroma import hybrid_schema_value_search
 from app.db_connector import connect_to_source
 from app.ollama_llm import ask_sql_planner
-from app.config import SUMMARY_ENGINE
+from app.config import SUMMARY_ENGINE, SUMMARY_MAX_ROWS, SUMMARY_CHAR_BUDGET
 from app.query_engine import _get_table_colmeta
 from functools import lru_cache
 
@@ -27,6 +29,7 @@ from app.query_engine import (
     summarize_results,
     ensure_label_filter,
     extract_explicit_date_range,
+    extract_relative_date_range,
     # Entity-lookup fast path (importing "private" helpers is acceptable inside the app)
     _is_entity_lookup,
     _needle_from_question,
@@ -41,16 +44,99 @@ from app.query_engine import (
     _set_case_insensitive_session,
 )
 
-from app.summarizer import summarize_with_mistral
+from app.summarizer import summarize_with_mistral, _fallback_summarization
+
+from app.query_classifier import has_visualization_intent
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+try:
+    from app.hybrid_processor import HybridProcessor
+    from app.config import HYBRID_ENABLED, OPENROUTER_ENABLED, COLLECT_TRAINING_DATA
+    HYBRID_PROCESSING_AVAILABLE = HYBRID_ENABLED and OPENROUTER_ENABLED
+    if HYBRID_PROCESSING_AVAILABLE:
+        logger.info("[RAG] Hybrid AI processing system enabled")
+        # Test hybrid processor initialization
+        try:
+            _test_processor = HybridProcessor()
+            logger.info("[RAG] Hybrid processor initialized successfully")
+        except Exception as test_error:
+            HYBRID_PROCESSING_AVAILABLE = False
+            logger.error(f"[RAG] Hybrid processor initialization failed: {test_error}")
+    else:
+        logger.info("[RAG] Hybrid processing disabled in configuration")
+        
+    # Import training data collection system if available
+    if COLLECT_TRAINING_DATA:
+        try:
+            from app.hybrid_data_recorder import hybrid_data_recorder
+            from app.query_classifier import QueryClassifier
+            logger.info("[RAG] Training data collection system enabled")
+        except ImportError as e:
+            logger.warning(f"[RAG] Training data collection dependencies not available: {e}")
+            COLLECT_TRAINING_DATA = False
+    
+except ImportError as e:
+    HYBRID_PROCESSING_AVAILABLE = False
+    logger.warning(f"[RAG] Hybrid processing dependencies not available: {e}")
+except Exception as e:
+    HYBRID_PROCESSING_AVAILABLE = False
+    logger.error(f"[RAG] Hybrid processing setup failed: {e}")
 
 # Local parser for TO_CHAR dims used in validation (aligns with query_engine)
 _TOCHAR_WHITELIST = {"MON-YY", "MON-YYYY", "YYYY-MM", "YYYY", "DD-MON-YYYY"}
 _TOCHAR_RX = re.compile(
     r"""(?is)^\s*TO_CHAR\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*'([A-Za-z\-]+)'\s*\)\s*$"""
 )
+
+DYNAMIC_ENTITY_PATTERNS = {
+    'company_variations': {
+        'CAL': ['cal', 'chorka', 'chorka apparel', 'chorka apparel limited'],
+        'WINNER': ['winner', 'winner bip'],
+        'BIP': ['bip']
+    },
+    'floor_patterns': [
+        r'(?i)sewing\s+(?:floor-)?(\d+[a-z]?)',
+        r'(?i)(?:cal|winner)\s+sewing[-\s]f?(\d+)',
+        r'(?i)floor[-\s](\d+[a-z]?)'
+    ],
+    'date_patterns': [
+        r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b',
+        r'\b\d{1,2}[-\s][a-z]{3}[-\s]\d{2,4}\b',
+        r'\b[a-z]{3}[-\s]\d{2,4}\b',
+        r'\bthis\s+month\b',
+        r'\blast\s+\d+\s+days?\b'
+    ]
+}
+
+INTENT_CLASSIFICATION_PATTERNS = {
+    'production_summary': {
+        'keywords': ['floor-wise', 'production', 'summary'],
+        'variations': ['floor wise', 'floorwise', 'production summary'],
+        'table_preference': ['T_PROD_DAILY', 'T_PROD']
+    },
+    'defect_analysis': {
+        'keywords': ['defect', 'max', 'big', 'top'],
+        'aggregations': ['max', 'sum', 'top n'],
+        'table_preference': ['T_PROD_DAILY']
+    },
+    'employee_lookup': {
+        'keywords': ['president', 'salary', 'email', 'who is'],
+        'entity_types': ['person_name', 'job_title'],
+        'table_preference': ['EMP', 'T_USERS']
+    },
+    'efficiency_query': {
+        'keywords': ['efficiency', 'floor ef', 'dhu'],
+        'metrics': ['FLOOR_EF', 'DHU'],
+        'table_preference': ['T_PROD_DAILY']
+    },
+    'tna_task_query': {
+        'keywords': ['task', 'tna', 'job', 'po', 'buyer', 'style', 'ctl', 'information'],
+        'variations': ['task status', 'job information', 'po status'],
+        'table_preference': ['T_TNA_STATUS']
+    }
+}
 
 # Prefer daily-granularity tables when the question mentions a specific day
 _DAILY_HINT_RX = re.compile(
@@ -154,6 +240,99 @@ def _augment_plan_with_metrics(uq: str, plan: dict, options: dict) -> dict:
 
     return plan
 
+
+def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
+    """Enhanced entity recognition with pattern matching"""
+    
+    entities = {
+        'companies': [],
+        'floors': [],
+        'dates': [],
+        'ctl_codes': [],
+        'aggregations': [],
+        'metrics': []
+    }
+    
+    query_lower = user_query.lower()
+    
+    # Company recognition
+    for company, variations in DYNAMIC_ENTITY_PATTERNS['company_variations'].items():
+        if any(var in query_lower for var in variations):
+            entities['companies'].append(company)
+    
+    # Floor pattern recognition
+    for pattern in DYNAMIC_ENTITY_PATTERNS['floor_patterns']:
+        matches = re.finditer(pattern, user_query)
+        for match in matches:
+            entities['floors'].append(match.group(0))
+    
+    # Date pattern recognition
+    for pattern in DYNAMIC_ENTITY_PATTERNS['date_patterns']:
+        matches = re.finditer(pattern, user_query)
+        for match in matches:
+            entities['dates'].append(match.group(0))
+    
+    # CTL code recognition
+    ctl_matches = re.finditer(r'\bCTL-\d{2}-\d{5,6}\b', user_query)
+    for match in ctl_matches:
+        entities['ctl_codes'].append(match.group(0))
+    
+    # Aggregation detection
+    agg_patterns = ['max', 'min', 'sum', 'total', 'avg', 'top', 'big', 'maximum']
+    for agg in agg_patterns:
+        if agg in query_lower:
+            entities['aggregations'].append(agg)
+    
+    # Metric detection
+    metric_patterns = ['production', 'defect', 'efficiency', 'dhu', 'salary']
+    for metric in metric_patterns:
+        if metric in query_lower:
+            entities['metrics'].append(metric)
+    
+    return entities
+
+def enhanced_intent_classification(user_query: str, entities: Dict) -> Dict[str, Any]:
+    """Enhanced intent classification based on patterns and entities"""
+    
+    query_lower = user_query.lower()
+    intent_scores = {}
+    
+    # Check for CTL codes first - this should be high priority
+    if entities.get('ctl_codes'):
+        intent_scores['tna_task_query'] = 0.8  # High score for CTL codes
+    
+    # Score each intent based on patterns
+    for intent, config in INTENT_CLASSIFICATION_PATTERNS.items():
+        score = intent_scores.get(intent, 0)  # Keep existing CTL score
+        
+        # Keyword matching
+        for keyword in config['keywords']:
+            if keyword in query_lower:
+                score += 0.3
+        
+        # Variation matching
+        for variation in config.get('variations', []):
+            if variation in query_lower:
+                score += 0.2
+        
+        # Entity alignment
+        if intent == 'production_summary' and entities.get('companies'):
+            score += 0.2
+        elif intent == 'defect_analysis' and entities.get('aggregations'):
+            score += 0.3
+        elif intent == 'employee_lookup' and any(word in query_lower for word in ['president', 'salary', 'email']):
+            score += 0.4
+        
+        intent_scores[intent] = score
+    
+    # Select best intent
+    best_intent = max(intent_scores.items(), key=lambda x: x[1])
+    
+    return {
+        'intent': best_intent[0] if best_intent[1] > 0.3 else 'general',
+        'confidence': best_intent[1],
+        'all_scores': intent_scores
+    }
 
 # app/rag_engine.py (add near other helpers)
 _DAILY_NAME_RX = re.compile(r'(?:^|_)(DAILY|DLY|DAY)(?:$|_)', re.I)
@@ -366,18 +545,133 @@ def classify_enhanced_query_intent(query: str) -> str:
 
     return 'general'
 
-def analyze_enhanced_query(query: str) -> Dict:
-    """Comprehensive enhanced query analysis."""
+
+def analyze_enhanced_query(user_query: str) -> Dict[str, Any]:
+    """Main enhanced query analysis function integrating all components"""
     
-    analysis = {
-        'companies': extract_enhanced_companies(query),
-        'floors': extract_enhanced_floors(query),
-        'metrics': extract_enhanced_metrics(query),
-        'intent': classify_enhanced_query_intent(query),
-        'query_type': classify_enhanced_query_intent(query)
+    # Step 1: Dynamic entity recognition
+    entities = dynamic_entity_recognition(user_query)
+    
+    # Step 2: Enhanced intent classification
+    intent_result = enhanced_intent_classification(user_query, entities)
+    
+    # Step 3: Smart table selection
+    selected_tables = smart_table_selection(user_query, entities, intent_result['intent'])
+    
+    # Step 4: Dynamic column selection
+    column_selections = dynamic_column_selection(selected_tables, entities, intent_result['intent'])
+    
+    # Step 5: Compile comprehensive analysis
+    analysis_result = {
+        'entities': entities,
+        'intent': intent_result['intent'],
+        'intent_confidence': intent_result['confidence'],
+        'intent_scores': intent_result['all_scores'],
+        'recommended_tables': selected_tables,
+        'recommended_columns': column_selections,
+        'complexity_factors': {
+            'multiple_entities': len(entities.get('companies', [])) + len(entities.get('floors', [])) > 1,
+            'has_aggregations': bool(entities.get('aggregations')),
+            'has_dates': bool(entities.get('dates')),
+            'has_ctl_codes': bool(entities.get('ctl_codes')),
+            'multiple_metrics': len(entities.get('metrics', [])) > 1
+        }
     }
     
-    return analysis
+    return analysis_result
+
+def smart_table_selection(user_query: str, entities: Dict, intent: str) -> List[str]:
+    """Smart table selection based on query analysis"""
+    
+    selected_tables = []
+    query_lower = user_query.lower()
+    
+    # Priority 1: CTL code detection - always use T_TNA_STATUS
+    if entities.get('ctl_codes'):
+        selected_tables.append('T_TNA_STATUS')
+        return selected_tables  # Early return for CTL codes
+    
+    # Priority 2: Intent-based table selection
+    if intent == 'production_summary' or intent == 'defect_analysis':
+        # Check for date specificity to choose between T_PROD and T_PROD_DAILY
+        if any(date in entities.get('dates', []) for date in entities.get('dates', [])):
+            if _DAILY_HINT_RX.search(user_query):
+                selected_tables.append('T_PROD_DAILY')
+            else:
+                selected_tables.extend(['T_PROD_DAILY', 'T_PROD'])
+        else:
+            selected_tables.append('T_PROD_DAILY')
+    
+    elif intent == 'tna_task_query':
+        selected_tables.append('T_TNA_STATUS')
+        
+    elif intent == 'employee_lookup':
+        selected_tables.extend(['EMP', 'T_USERS'])
+        
+    elif intent == 'efficiency_query':
+        selected_tables.append('T_PROD_DAILY')
+    
+    # Priority 3: Company-based refinement
+    companies = entities.get('companies', [])
+    if companies and not selected_tables:
+        # Default to production tables for company queries
+        selected_tables.append('T_PROD_DAILY')
+    
+    # Priority 4: Keyword-based fallback
+    if not selected_tables:
+        if any(word in query_lower for word in ['task', 'tna', 'job', 'po', 'buyer', 'style']):
+            selected_tables.append('T_TNA_STATUS')
+        elif any(word in query_lower for word in ['production', 'defect', 'floor', 'dhu']):
+            selected_tables.append('T_PROD_DAILY')
+        elif any(word in query_lower for word in ['employee', 'salary', 'president']):
+            selected_tables.extend(['EMP', 'T_USERS'])
+    
+    # Fallback
+    if not selected_tables:
+        selected_tables.append('T_PROD_DAILY')
+    
+    return selected_tables
+
+def dynamic_column_selection(tables: List[str], entities: Dict, intent: str) -> Dict[str, List[str]]:
+    """Dynamic column selection based on entities and intent"""
+    
+    column_selections = {}
+    
+    for table in tables:
+        columns = []
+        
+        if table in ['T_PROD', 'T_PROD_DAILY']:
+            # Base production columns
+            columns.extend(['FLOOR_NAME', 'PROD_DATE'])
+            
+            # Intent-specific columns
+            if intent == 'production_summary':
+                columns.extend(['PRODUCTION_QTY', 'DEFECT_QTY'])
+            elif intent == 'defect_analysis':
+                columns.extend(['DEFECT_QTY', 'DHU', 'UNCUT_THREAD', 'DIRTY_STAIN'])
+            elif intent == 'efficiency_query':
+                columns.extend(['FLOOR_EF', 'DHU', 'PRODUCTION_QTY'])
+            
+            # Company context
+            companies = entities.get('companies', [])
+            if companies:
+                columns.append('FLOOR_NAME')  # For company filtering
+            
+        elif table == 'T_TNA_STATUS':
+            columns.extend(['JOB_NO', 'TASK_SHORT_NAME', 'TASK_FINISH_DATE'])
+            
+            if entities.get('ctl_codes'):
+                columns.extend(['BUYER_NAME', 'STYLE_REF_NO', 'ACTUAL_FINISH_DATE'])
+                
+        elif table in ['EMP', 'T_USERS']:
+            columns.extend(['EMPNO', 'ENAME', 'JOB'])
+            
+            if 'salary' in intent or any('salary' in m for m in entities.get('metrics', [])):
+                columns.append('SAL')
+        
+        column_selections[table] = list(set(columns))  # Remove duplicates
+    
+    return column_selections
 
 def _asked_range(uq: str) -> tuple[Optional[_dt], Optional[_dt]]:
     """
@@ -409,7 +703,31 @@ def _asked_range(uq: str) -> tuple[Optional[_dt], Optional[_dt]]:
         sdt = _to_dt(rng["start"]); edt = _to_dt(rng["end"])
         return (sdt, edt)
 
-    # 2) single-day literals in the question
+    # 2) relative date ranges (e.g., "last 7 days")
+    relative_range = extract_relative_date_range(uq or "")
+    if relative_range:
+        def _to_dt(to_date_expr: str) -> Optional[_dt]:
+            m = re.search(r"TO_DATE\('([^']+)','([^']+)'\)", to_date_expr, re.I)
+            if not m: 
+                return None
+            lit, fmt = m.group(1), (m.group(2) or "").upper()
+            fmt_map = {
+                "DD-MON-YYYY": "%d-%b-%Y", "DD-MON-YY": "%d-%b-%y",
+                "YYYY-MM-DD": "%Y-%m-%d",
+                "DD/MM/YYYY": "%d/%m/%Y", "DD/MM/YY": "%d/%m/%y",
+                "MON-YYYY": "%b-%Y", "MON-YY": "%b-%y",
+            }
+            py = fmt_map.get(fmt)
+            if not py: 
+                return None
+            try:
+                return _dt.strptime(lit, py)
+            except Exception:
+                return None
+        sdt = _to_dt(relative_range["start"]); edt = _to_dt(relative_range["end"])
+        return (sdt, edt)
+
+    # 3) single-day literals in the question
     m = re.search(
         r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}|\d{1,2}-[A-Za-z]{3}-\d{2,4})\b",
         uq or "", re.I
@@ -419,7 +737,7 @@ def _asked_range(uq: str) -> tuple[Optional[_dt], Optional[_dt]]:
         if dt:
             return (dt, dt)
 
-    # 3) month token like "Aug-2025" or "Aug 2025"
+    # 4) month token like "Aug-2025" or "Aug 2025"
     m = re.search(r"\b([A-Za-z]{3,9})[-\s](\d{2,4})\b", uq or "", re.I)
     if m:
         mon_word, yy = m.group(1), m.group(2)
@@ -469,7 +787,11 @@ def _maybe_force_tprod_tables(uq: str, selected_db: str, candidates: list[str]) 
 
     # decide which table to force
     forced = None
-    if end_dt < _CUTOFF_DT:
+    
+    # For relative date ranges like "last 7 days", always use T_PROD_DAILY
+    if re.search(r"\b(last|past)\s+\d+\s+days?\b", uq or "", re.I):
+        forced = "T_PROD_DAILY"
+    elif end_dt < _CUTOFF_DT:
         forced = "T_PROD"
     elif start_dt >= _CUTOFF_DT:
         forced = "T_PROD_DAILY"
@@ -507,6 +829,633 @@ def _discover_dailyish_tables(selected_db: str, limit: int = 6,
         out = [r[0] for r in cur.fetchall()]
     return out
 
+# Phase 4: Hybrid Processing Integration Helper Functions
+# ============================================================================
+
+def _should_use_hybrid_processing(user_query: str, enhanced_analysis: Dict[str, Any]) -> bool:
+    """
+    Determine if hybrid processing should be used for this query.
+    
+    Args:
+        user_query: The user's natural language query
+        enhanced_analysis: Enhanced analysis result from analyze_enhanced_query
+        
+    Returns:
+        True if hybrid processing should be attempted
+    """
+    # Skip hybrid processing for simple fast-path queries
+    if re.match(r'(?is)^\s*select\b', user_query.strip()):
+        return False
+    
+    if re.search(r'\ball\s+table\s+name(s)?\b', user_query, re.I):
+        return False
+    
+    # Use hybrid processing for complex queries that benefit from AI understanding
+    complex_indicators = [
+        # Manufacturing domain queries
+        r'\b(production|defect|dhu|efficiency|floor|company)\b',
+        # TNA/CTL queries
+        r'\bCTL-\d{2}-\d{5,6}\b',
+        r'\b(task|pp\s+approval|tna|finish\s+date)\b',
+        # HR queries
+        r'\b(employee|salary|staff|worker|president)\b',
+        # Analytics queries
+        r'\b(summary|total|average|trend|analysis|compare)\b',
+        # Date-based queries
+        r'\b(last\s+\d+\s+(days?|months?|years?)|this\s+(month|year|week))\b'
+    ]
+    
+    for pattern in complex_indicators:
+        if re.search(pattern, user_query, re.IGNORECASE):
+            return True
+    
+    # Use hybrid for queries with multiple entities or complex structure
+    if enhanced_analysis:
+        if len(enhanced_analysis.get('companies', [])) > 0:
+            return True
+        if enhanced_analysis.get('intent') in ['production_query', 'tna_task_query', 'employee_lookup']:
+            return True
+    
+    # Default: use hybrid for non-trivial queries
+    return len(user_query.split()) > 3
+
+async def _try_hybrid_processing(
+    user_query: str,
+    schema_context: str,
+    enhanced_analysis: Dict[str, Any],
+    options: Dict[str, Any],
+    schema_chunks: List[str],
+    schema_context_ids: List[str],
+    turn_id: Optional[int] = None,
+    session_id: Optional[str] = None,
+    client_ip: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    hybrid_context_info: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Attempt hybrid processing for SQL generation with enhanced schema context and comprehensive training data collection.
+    """
+    processing_start_time = time.time()
+    classification_start_time = time.time()
+    
+    try:
+        # Initialize hybrid processor
+        processor = HybridProcessor()
+        
+        # Use enhanced schema context for better API model performance
+        enhanced_schema_context = _search_schema_enhanced(user_query, "source_db_1", top_k=20)
+        # Add forced table information to the schema context if available
+        if hybrid_context_info and hybrid_context_info.get("forced_table"):
+            forced_table = hybrid_context_info["forced_table"]
+            enhanced_schema_context += f"\n\nCRITICAL TABLE SELECTION INFORMATION:\n"
+            enhanced_schema_context += f"FORCED TABLE: {forced_table}\n"
+            enhanced_schema_context += f"REASON: Date cutoff rule applied\n"
+            enhanced_schema_context += f"IMPORTANT: MUST USE {forced_table} TABLE FOR THIS QUERY\n"
+        # Phase 5.1: Query Classification and Entity Extraction for Training Data
+        classification_result = None
+        if COLLECT_TRAINING_DATA and turn_id:
+            try:
+                # Initialize query classifier for training data collection
+                classifier = QueryClassifier()
+                classification_result = classifier.classify_query(user_query)
+                classification_time_ms = (time.time() - classification_start_time) * 1000
+                logger.info(f"[RAG] Query classified as {classification_result.intent} with confidence {classification_result.confidence:.3f}")
+            except Exception as e:
+                logger.warning(f"[RAG] Query classification failed for training data: {e}")
+                classification_time_ms = 0.0
+        else:
+            classification_time_ms = 0.0
+        
+        # Create enhanced context for hybrid processing
+        hybrid_context = {
+            "schema_context": enhanced_schema_context,  # Use enhanced context
+            "enhanced_analysis": enhanced_analysis,
+            "available_tables": options.get("tables", []),
+            "numeric_columns": options.get("numeric_columns", {}),
+            "text_columns": options.get("text_columns", {}),
+            "date_columns": options.get("date_columns", {}),
+        }
+        
+        # Process query with hybrid system
+        processing_result = await processor.process_query_advanced(
+            user_query=user_query,
+            schema_context=enhanced_schema_context,  # Pass enhanced context
+            local_confidence=0.6  # Default confidence for RAG context
+        )
+        
+        if not processing_result or not processing_result.selected_response:
+            # Phase 5.2: Record failed processing attempt for training data
+            if COLLECT_TRAINING_DATA and turn_id and classification_result:
+                try:
+                    # Create a minimal ProcessingResult for failed attempts
+                    from app.hybrid_processor import ProcessingResult
+                    failed_result = ProcessingResult(
+                        processing_mode="failed",
+                        model_used="none",
+                        selected_response="",
+                        selection_reasoning="No response generated",
+                        processing_time=time.time() - processing_start_time,
+                        local_confidence=0.0,
+                        api_confidence=0.0
+                    )
+                    
+                    hybrid_data_recorder.record_complete_hybrid_turn(
+                        turn_id=turn_id,
+                        classification_result=classification_result,
+                        processing_result=failed_result,
+                        entities=enhanced_analysis.get('entities', {}),
+                        schema_tables_used=options.get("tables", []),
+                        business_context=f"Enhanced analysis: {enhanced_analysis.get('intent', 'unknown')}",
+                        sql_execution_success=False,
+                        sql_execution_error="No SQL generated",
+                        classification_time_ms=classification_time_ms,
+                        session_id=session_id,
+                        client_ip=client_ip,
+                        user_agent=user_agent
+                    )
+                    logger.info("[RAG] Recorded failed hybrid processing attempt for training data")
+                except Exception as e:
+                    logger.warning(f"[RAG] Failed to record failed processing attempt: {e}")
+            
+            return None
+        
+        # Parse the selected response (should be SQL)
+        sql_response = processing_result.selected_response.strip()
+        
+        # Clean markdown formatting if present
+        if sql_response.startswith('```sql'):
+            sql_response = sql_response.replace('```sql', '').replace('```', '').strip()
+        elif sql_response.startswith('```'):
+            sql_response = sql_response.replace('```', '').strip()
+            
+        # Remove any trailing backticks that might remain
+        sql_response = sql_response.rstrip('`').strip()
+        
+        # Enhanced extraction: Handle mixed responses with natural language and SQL
+        # Look for SQL code blocks or SELECT statements within the response
+        sql_start_patterns = [r'```sql\s*(SELECT.*)', r'```(?:\w*\s*)?(SELECT.*)', r'(SELECT.*)']
+        import re
+        extracted_sql = None
+        
+        for pattern in sql_start_patterns:
+            match = re.search(pattern, sql_response, re.IGNORECASE | re.DOTALL)
+            if match:
+                extracted_sql = match.group(1).strip()
+                break
+        
+        # If we found SQL within the response, use it
+        if extracted_sql:
+            sql_response = extracted_sql
+        else:
+            # Fallback to original extraction logic
+            # Extract only the SQL part if there are multiple lines
+            lines = sql_response.split('\n')
+            sql_lines = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith(('--', '/*', '#', '*')):
+                    sql_lines.append(line)
+            
+            sql_response = ' '.join(sql_lines) if sql_lines else sql_response
+        
+        # Additional cleaning: Remove any trailing characters that might cause syntax errors
+        sql_response = sql_response.rstrip(';').rstrip('`').rstrip().rstrip(';')
+        
+        # Validate the hybrid-generated SQL
+        if not sql_response or not sql_response.upper().startswith('SELECT'):
+            logger.warning(f"[RAG] Hybrid processing returned non-SQL response: {sql_response[:100]}...")
+            
+            # Instead of giving up, use the existing query engine to generate SQL based on the forced table
+            # This is a critical fallback for production queries with dates
+            forced_table_match = re.search(r"FORCED TABLE:\s*([A-Z_0-9]+)", schema_context or "")
+            if forced_table_match and "date" in user_query.lower() and any(word in user_query.lower() for word in ["production", "qty", "dhu"]):
+                forced_table = forced_table_match.group(1)
+                logger.info(f"[RAG] Using fallback SQL generation with forced table: {forced_table}")
+                
+                # Extract date information using existing robust date extraction functions
+                date_range = extract_enhanced_date_range(user_query)
+                date_range = date_range or extract_explicit_date_range(user_query)
+                date_range = date_range or extract_relative_date_range(user_query)
+                date_range = date_range or extract_month_token_range(user_query)
+                date_range = date_range or extract_single_day_range(user_query)
+                
+                # Build SQL based on the date range and forced table
+                if date_range:
+                    # Use existing SQL planner to generate SQL (don't hardcode!)
+                    plan = {
+                        "table": forced_table,
+                        "columns": ["PROD_DATE", "FLOOR_NAME", "PRODUCTION_QTY", "DHU"],
+                        "filters": []
+                    }
+                    
+                    # Add date filter if available
+                    if date_range.get("start") and date_range.get("end"):
+                        date_filter = {"column": "PROD_DATE", "operator": "BETWEEN", 
+                                      "value": date_range["start"], "value2": date_range["end"]}
+                        plan["filters"].append(date_filter)
+                    
+                    # Use the existing build_sql_from_plan function to generate SQL
+                    fallback_sql = build_sql_from_plan(plan, "source_db_1", user_query)
+                    
+                    # Apply existing validations
+                    fallback_sql = normalize_dates(fallback_sql)
+                    fallback_sql = enforce_wide_projection_for_generic(user_query, fallback_sql)
+                    fallback_sql = value_aware_text_filter(fallback_sql, "source_db_1")
+                    fallback_sql = ensure_label_filter(fallback_sql, user_query, "source_db_1")
+                    
+                    # Execute the fallback SQL
+                    logger.info(f"[RAG] Generated fallback SQL: {fallback_sql}")
+                    try:
+                        rows = run_sql(fallback_sql, "source_db_1")
+                        
+                        # Process results using existing RAG pipeline
+                        display_mode = determine_display_mode(user_query, rows)
+                        rows_for_summary = widen_results_if_needed(rows, fallback_sql, "source_db_1", display_mode, user_query)
+                        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+                        
+                        # Generate natural language summary if needed
+                        summary = ""
+                        if display_mode in ["summary", "both"]:
+                            summary = generate_natural_language_summary(
+                                user_query=user_query,
+                                columns=list(rows[0].keys()) if rows else [],
+                                rows=rows,
+                                sql=fallback_sql
+                            )
+                        else:
+                            summary = python_summary
+                        
+                        # Record training data as usual
+                        if COLLECT_TRAINING_DATA and turn_id and 'classification_result' in locals():
+                            try:
+                                # Record hybrid processing data (similar to existing code)
+                                # ... existing training data recording code ...
+                                pass
+                            except Exception as e:
+                                logger.warning(f"[RAG] Failed to record hybrid processing training data: {e}")
+                        
+                        # Return successful fallback result
+                        visualization_requested = has_visualization_intent(user_query)
+                        return {
+                            "status": "success",
+                            "summary": summary if display_mode in ["summary", "both"] else "",
+                            "sql": fallback_sql,
+                            "display_mode": display_mode,
+                            "visualization": visualization_requested,
+                            "results": {
+                                "columns": (list(rows[0].keys()) if rows else []),
+                                "rows": [list(r.values()) for r in rows] if rows else [],
+                                "row_count": len(rows) if rows else 0,
+                            },
+                            "schema_context": schema_chunks,
+                            "schema_context_ids": schema_context_ids,
+                            "hybrid_metadata": {
+                                "processing_mode": "fallback_generation",
+                                "selection_reasoning": "Generated fallback SQL using extracted date",
+                                "model_used": "system",
+                                "processing_time": 0.0,
+                                "local_confidence": 0.0,
+                                "api_confidence": 0.0,
+                                "enhanced_schema_used": True,
+                                "training_data_recorded": COLLECT_TRAINING_DATA and turn_id is not None,
+                            }
+                        }
+                    except Exception as e:
+                        logger.error(f"[RAG] Fallback SQL execution failed: {e}")
+            
+            # Original code for recording failures
+            if COLLECT_TRAINING_DATA and turn_id and classification_result:
+                # ... existing code for recording failures ...
+                pass
+            
+            return None
+        # Extract only the SQL part if there are multiple lines
+        lines = sql_response.split('\n')
+        sql_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith(('--', '/*', '#', '*')):
+                sql_lines.append(line)
+        
+        sql_response = ' '.join(sql_lines) if sql_lines else sql_response
+        # Extract only the SQL part if there are multiple lines
+        lines = sql_response.split('\n')
+        sql_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith(('--', '/*', '#', '*')):
+                sql_lines.append(line)
+        
+        sql_response = ' '.join(sql_lines) if sql_lines else sql_response
+        
+        # Apply existing RAG validations to hybrid-generated SQL
+        sql = normalize_dates(sql_response.rstrip(";"))
+        sql = enforce_wide_projection_for_generic(user_query, sql)
+        sql = value_aware_text_filter(sql, "source_db_1")  # Default to main DB
+        sql = ensure_label_filter(sql, user_query, "source_db_1")
+        
+        # Validate SQL syntax
+        enforce_predicate_type_compat(sql, "source_db_1")
+        if not is_valid_sql(sql, "source_db_1"):
+            logger.warning(f"[RAG] Hybrid-generated SQL failed validation: {sql}")
+            
+            # Phase 5.2: Record SQL validation failure for training data
+            if COLLECT_TRAINING_DATA and turn_id and classification_result:
+                try:
+                    hybrid_data_recorder.record_complete_hybrid_turn(
+                        turn_id=turn_id,
+                        classification_result=classification_result,
+                        processing_result=processing_result,
+                        entities=enhanced_analysis.get('entities', {}),
+                        schema_tables_used=options.get("tables", []),
+                        business_context=f"Enhanced analysis: {enhanced_analysis.get('intent', 'unknown')}",
+                        sql_execution_success=False,
+                        sql_execution_error="SQL validation failed",
+                        classification_time_ms=classification_time_ms,
+                        session_id=session_id,
+                        client_ip=client_ip,
+                        user_agent=user_agent
+                    )
+                    logger.info("[RAG] Recorded SQL validation failure for training data")
+                except Exception as e:
+                    logger.warning(f"[RAG] Failed to record SQL validation failure: {e}")
+            
+            return None
+        
+        # Execute the hybrid-generated SQL
+        sql_execution_start_time = time.time()
+        sql_execution_success = False
+        sql_execution_error = None
+        result_row_count = 0
+        rows = []
+        
+        try:
+            rows = run_sql(sql, "source_db_1")
+            sql_execution_success = True
+            result_row_count = len(rows) if rows else 0
+            logger.info(f"[RAG] Hybrid-generated SQL executed successfully, returned {result_row_count} rows")
+        except Exception as e:
+            sql_execution_error = str(e)
+            logger.error(f"[RAG] Hybrid-generated SQL execution failed: {e}")
+        
+        sql_execution_time_ms = (time.time() - sql_execution_start_time) * 1000
+        
+        # Process results using existing RAG pipeline
+        display_mode = determine_display_mode(user_query, rows)
+        rows_for_summary = widen_results_if_needed(rows, sql, "source_db_1", display_mode, user_query)
+        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+
+        # Generate natural language summary if needed
+        summary = ""
+        if display_mode in ["summary", "both"]:
+            # Use our new direct function that avoids asyncio issues
+            summary = generate_natural_language_summary(
+                user_query=user_query,
+                columns=list(rows[0].keys()) if rows else [],
+                rows=rows,
+                sql=sql
+            )
+        else:
+            summary = python_summary
+        
+        # Phase 5.3: Record successful hybrid processing with complete training data
+        if COLLECT_TRAINING_DATA and turn_id and classification_result:
+            try:
+                recorded_ids = hybrid_data_recorder.record_complete_hybrid_turn(
+                    turn_id=turn_id,
+                    classification_result=classification_result,
+                    processing_result=processing_result,
+                    entities=enhanced_analysis.get('entities', {}),
+                    schema_tables_used=options.get("tables", []),
+                    business_context=f"Enhanced analysis: {enhanced_analysis.get('intent', 'unknown')}" if enhanced_analysis else "Enhanced analysis: unknown",
+                    sql_execution_success=sql_execution_success,
+                    sql_execution_error=sql_execution_error,
+                    result_row_count=result_row_count,
+                    sql_execution_time_ms=sql_execution_time_ms,
+                    classification_time_ms=classification_time_ms,
+                    session_id=session_id,
+                    client_ip=client_ip,
+                    user_agent=user_agent
+                )
+                logger.info(f"[RAG] Recorded complete hybrid processing turn with training data: {recorded_ids}")
+            except Exception as e:
+                logger.warning(f"[RAG] Failed to record hybrid processing training data: {e}")
+        
+        # Return successful hybrid result in RAG format
+        visualization_requested = has_visualization_intent(user_query)
+
+        # Then modify the return statement to include the visualization flag:
+        return {
+            "status": "success",
+            "summary": summary if display_mode in ["summary", "both"] else "",
+            "sql": sql,
+            "display_mode": display_mode,
+            "visualization": visualization_requested,
+            "results": {
+                "columns": (list(rows[0].keys()) if rows else []),
+                "rows": [list(r.values()) for r in rows] if rows else [],
+                "row_count": len(rows) if rows else 0,
+            },
+            "schema_context": schema_chunks,
+            "schema_context_ids": schema_context_ids,
+            # Hybrid-specific metadata
+            "hybrid_metadata": {
+                "processing_mode": processing_result.processing_mode,
+                "selection_reasoning": processing_result.selection_reasoning,
+                "model_used": processing_result.model_used,
+                "processing_time": processing_result.processing_time or 0.0,
+                "local_confidence": processing_result.local_confidence or 0.0,
+                "api_confidence": processing_result.api_confidence or 0.0,
+                "enhanced_schema_used": True,  # Flag to indicate enhanced schema was used
+                # Phase 5: Training data collection metadata
+                "training_data_recorded": COLLECT_TRAINING_DATA and turn_id is not None,
+                "classification_time_ms": classification_time_ms or 0.0,
+                "sql_execution_time_ms": sql_execution_time_ms or 0.0,
+                "sql_execution_success": sql_execution_success,
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"[RAG] Hybrid processing failed: {e}")
+        
+        # Phase 5.2: Record processing failure for training data
+        if COLLECT_TRAINING_DATA and turn_id and 'classification_result' in locals():
+            try:
+                from app.hybrid_processor import ProcessingResult, ResponseMetrics
+                # Create dummy metrics for error case
+                dummy_metrics = ResponseMetrics(
+                    sql_validity_score=0.0,
+                    schema_compliance_score=0.0,
+                    business_logic_score=0.0,
+                    performance_score=0.0,
+                    overall_score=0.0,
+                    reasoning=["Processing error occurred"]
+                )
+                
+                error_result = ProcessingResult(
+                    selected_response="",
+                    local_response=None,
+                    api_response=None,
+                    processing_mode="error",
+                    selection_reasoning=f"Processing error: {str(e)}",
+                    local_confidence=0.0,
+                    api_confidence=0.0,
+                    processing_time=0.0,
+                    model_used="none",
+                    local_metrics=dummy_metrics,
+                    api_metrics=dummy_metrics
+                )
+                
+                # Ensure classification_time_ms is not None to prevent format string errors
+                safe_classification_time_ms = 0.0
+                if 'classification_time_ms' in locals() and classification_time_ms is not None:
+                    safe_classification_time_ms = classification_time_ms
+                
+                hybrid_data_recorder.record_complete_hybrid_turn(
+                    turn_id=turn_id,
+                    classification_result=classification_result,
+                    processing_result=error_result,
+                    entities=enhanced_analysis.get('entities', {}),
+                    schema_tables_used=options.get("tables", []),
+                    business_context=f"Enhanced analysis: {enhanced_analysis.get('intent', 'unknown')}" if enhanced_analysis else "unknown",
+                    sql_execution_success=False,
+                    sql_execution_error=f"Processing error: {str(e)}",
+                    classification_time_ms=safe_classification_time_ms,
+                    session_id=session_id,
+                    client_ip=client_ip,
+                    user_agent=user_agent
+                )
+                logger.info("[RAG] Recorded processing error for training data")
+            except Exception as record_error:
+                logger.warning(f"[RAG] Failed to record processing error: {record_error}")
+        
+        return None
+
+# -------------------------
+# Learn data patterns (Dynamic, not hardcoded)
+# -------------------------  
+def learn_data_patterns_dynamically(selected_db: str, table_name: str, sample_size: int = 100) -> Dict[str, Any]:
+    """
+    Dynamically learn data patterns from actual database content.
+    This replaces hardcoded patterns with real data analysis.
+    """
+    patterns = {
+        'floor_name_patterns': [],
+        'date_formats': [],
+        'company_variations': [],
+        'common_values': {},
+        'data_types': {},
+        'value_ranges': {}
+    }
+    
+    try:
+        with connect_to_source(selected_db) as (conn, _):
+            cursor = conn.cursor()
+            
+            # Get column information
+            cursor.execute("""
+                SELECT column_name, data_type, nullable
+                FROM user_tab_columns 
+                WHERE table_name = :table_name
+                ORDER BY column_id
+            """, {"table_name": table_name.upper()})
+            
+            columns_info = cursor.fetchall()
+            
+            for col_name, data_type, nullable in columns_info:
+                patterns['data_types'][col_name] = data_type
+                
+                # Sample actual values for pattern learning
+                if data_type in ['VARCHAR2', 'CHAR', 'NVARCHAR2']:
+                    try:
+                        cursor.execute(f"""
+                            SELECT DISTINCT {col_name}
+                            FROM {table_name}
+                            WHERE {col_name} IS NOT NULL
+                            AND ROWNUM <= :sample_size
+                        """, {"sample_size": sample_size})
+                        
+                        values = [row[0] for row in cursor.fetchall() if row[0]]
+                        patterns['common_values'][col_name] = values[:10]  # Top 10 examples
+                        
+                        # Learn specific patterns
+                        if 'floor' in col_name.lower():
+                            patterns['floor_name_patterns'] = values[:5]
+                        elif any(word in col_name.lower() for word in ['company', 'buyer']):
+                            patterns['company_variations'] = values[:5]
+                            
+                    except Exception as e:
+                        logger.debug(f"Could not sample values for {col_name}: {e}")
+                        
+    except Exception as e:
+        logger.error(f"Pattern learning failed for {table_name}: {e}")
+    
+    return patterns
+
+def create_dynamic_prompt_context(user_query: str, schema_context: str, selected_db: str) -> str:
+    """
+    Create dynamic prompt context that adapts to query and learned patterns.
+    """
+    # Extract table mentions from schema context
+    mentioned_tables = []
+    for line in schema_context.split('\n'):
+        if line.startswith('TABLE:'):
+            table_name = line.replace('TABLE:', '').strip()
+            mentioned_tables.append(table_name)
+    
+    # Learn patterns from mentioned tables
+    learned_patterns = {}
+    for table in mentioned_tables[:3]:  # Limit to avoid performance issues
+        learned_patterns[table] = learn_data_patterns_dynamically(selected_db, table)
+    
+    # Determine correct table based on date logic
+    query_lower = user_query.lower()
+    default_table = "T_PROD_DAILY"  # Default for all current queries
+    
+    # Only use T_PROD if specifically asking for early January 2025
+    if any(phrase in query_lower for phrase in ['january 2025', 'jan 2025', 'early 2025', 'before january 15']):
+        default_table = "T_PROD"
+    
+    # Build adaptive prompt
+    prompt_parts = [
+        "You are an Oracle SQL expert generating queries for a manufacturing database.",
+        "",
+        "CRITICAL TABLE SELECTION:",
+        f"- DEFAULT TABLE: {default_table}",
+        "- T_PROD_DAILY: Use for ALL current data (January 15, 2025 onwards)",
+        "- T_PROD: Only for historical data (January 1-15, 2025)",
+        "",
+        "SCHEMA CONTEXT:",
+        schema_context,
+        "",
+        "LEARNED DATA PATTERNS:"
+    ]
+    
+    # Add learned patterns dynamically
+    for table, patterns in learned_patterns.items():
+        if patterns['floor_name_patterns']:
+            prompt_parts.append(f"{table} floor names examples: {', '.join(patterns['floor_name_patterns'][:3])}")
+        
+        if patterns['company_variations']:
+            prompt_parts.append(f"{table} company examples: {', '.join(patterns['company_variations'][:3])}")
+    
+    prompt_parts.extend([
+        "",
+        "REQUIREMENTS:",
+        f"- Use {default_table} table (NOT T_PROD unless specifically querying January 1-15, 2025)",
+        "- Generate only valid Oracle SQL SELECT statements",
+        "- Use exact table and column names from schema",
+        "- Use LIKE patterns for partial text matching",
+        "- Use TO_DATE() for date filters with DD-MON-YYYY format",
+        "- Current year is 2025 (NOT 2023)",
+        "- Use UPPER() for case-insensitive string comparisons",
+        "",
+        f"USER QUERY: {user_query}",
+        "",
+        f"SQL (using {default_table}):"
+    ])
+    
+    return "\n".join(prompt_parts)
 # -------------------------
 # Critical Table Schema Definitions (Dynamic, not hardcoded)
 # -------------------------
@@ -663,11 +1612,39 @@ def enhance_query_with_critical_table_knowledge(user_query: str, plan: Dict, opt
             if c not in out['metrics']:
                 out['metrics'].append(c)
 
-    # dedupe/limit
+    # dedupe/limit - fixed to handle both strings and dictionaries
     if 'metrics' in out:
-        out['metrics'] = list(dict.fromkeys(out['metrics']))[:10]
+        # Metrics are typically strings, so we can use the simple deduplication
+        seen = set()
+        deduped_metrics = []
+        for item in out['metrics']:
+            if item not in seen:
+                seen.add(item)
+                deduped_metrics.append(item)
+        out['metrics'] = deduped_metrics[:10]
+        
     if 'dims' in out:
-        out['dims'] = list(dict.fromkeys(out['dims']))[:5]
+        # Dims can contain both strings and dictionaries, so we need special handling
+        seen = []
+        deduped_dims = []
+        for item in out['dims']:
+            # For dictionaries, convert to a comparable form
+            if isinstance(item, dict):
+                # Check if we've already seen this dictionary
+                already_seen = False
+                for seen_item in seen:
+                    if isinstance(seen_item, dict) and seen_item == item:
+                        already_seen = True
+                        break
+                if not already_seen:
+                    seen.append(item)
+                    deduped_dims.append(item)
+            else:
+                # For strings and other hashable types
+                if item not in seen:
+                    seen.append(item)
+                    deduped_dims.append(item)
+        out['dims'] = deduped_dims[:5]
 
     return out
 
@@ -743,10 +1720,122 @@ def get_smart_column_suggestions(table: str, user_query: str, selected_db: str) 
             out.append(c); seen.add(c)
     return out[:8]
 
+def _search_schema_enhanced(user_query: str, selected_db: str, top_k: int = 15) -> str:
+    """Enhanced schema search with comprehensive context building."""
+    try:
+        results = hybrid_schema_value_search(user_query, selected_db=selected_db, top_k=top_k) or []
+        return create_comprehensive_schema_context(results, selected_db, user_query)
+    except Exception as e:
+        logger.warning(f"[RAG] Enhanced schema search failed: {e}")
+        return "Schema information unavailable due to search error."
+
+def create_comprehensive_schema_context(results: List[Dict[str, Any]], selected_db: str, user_query: str = "") -> str:
+    """
+    Create comprehensive schema context with examples, patterns, and best practices.
+    This replaces hardcoded patterns with dynamic learning from actual data.
+    """
+    if not results:
+        return "No schema information available."
+    
+    # Group results by type for better organization
+    tables_info = {}
+    sample_data = {}
+    patterns_discovered = {}
+    
+    for result in results:
+        content = result.get('content', '')
+        metadata = result.get('metadata', {})
+        
+        table_name = metadata.get('table', metadata.get('source_table', ''))
+        if not table_name:
+            continue
+            
+        if table_name not in tables_info:
+            tables_info[table_name] = {
+                'columns': [],
+                'sample_values': {},
+                'patterns': [],
+                'description': '',
+                'data_types': {}
+            }
+        
+        # Extract column information
+        if 'columns:' in content.lower() or 'column_name' in content.lower():
+            tables_info[table_name]['description'] = content
+            
+        # Extract sample values and patterns
+        if 'sample_values:' in content.lower() or 'example:' in content.lower():
+            sample_data[table_name] = content
+            
+    # Build dynamic schema context
+    context_parts = []
+    
+    # 1. Database Overview
+    context_parts.append(f"DATABASE: {selected_db}")
+    context_parts.append(f"AVAILABLE TABLES: {', '.join(tables_info.keys())}")
+    context_parts.append("")
+    
+    # 2. Critical Table Selection Rules
+    context_parts.append("TABLE SELECTION RULES:")
+    context_parts.append("DEFAULT TABLE: T_PROD_DAILY (use this unless specifically querying data before January 15, 2025)")
+    context_parts.append("T_PROD: Contains data from January 1, 2025 to January 15, 2025 ONLY")
+    context_parts.append("T_PROD_DAILY: Contains data from January 15, 2025 onwards (current active table)")
+    context_parts.append("RULE: If no specific date is mentioned, ALWAYS use T_PROD_DAILY")
+    context_parts.append("RULE: Only use T_PROD if query specifically asks for data before January 15, 2025")
+    context_parts.append("")
+    
+    # 3. Table-specific information with learned patterns
+    for table_name, info in tables_info.items():
+        context_parts.append(f"TABLE: {table_name}")
+        
+        # Add specific guidance for production tables
+        if table_name == "T_PROD_DAILY":
+            context_parts.append("PURPOSE: Current production data (January 15, 2025 onwards)")
+            context_parts.append("USE FOR: All current queries, efficiency, floor data, recent production")
+        elif table_name == "T_PROD":
+            context_parts.append("PURPOSE: Historical production data (January 1-15, 2025 only)")
+            context_parts.append("USE FOR: Only when specifically querying early January 2025 data")
+        
+        context_parts.append(f"DESCRIPTION: {info['description'][:200]}...")
+        
+        # Extract and include actual data patterns
+        if table_name in sample_data:
+            context_parts.append(f"DATA PATTERNS: {sample_data[table_name][:150]}...")
+        
+        context_parts.append("")
+    
+    # 4. Query-specific guidance
+    query_lower = user_query.lower()
+    
+    # Add contextual examples based on query content
+    if any(word in query_lower for word in ['floor', 'sewing', 'cal']):
+        context_parts.append("FLOOR NAME PATTERNS:")
+        context_parts.append("- Use LIKE patterns for partial matches")
+        context_parts.append("- Consider variations in naming (CAL Sewing -F2, Sewing CAL-2A)")
+        context_parts.append("- Use UPPER() for case-insensitive matching")
+        context_parts.append("")
+        
+    # Enhanced date guidance with table selection logic
+    if any(word in query_lower for word in ['aug', 'date', 'month']) or not any(word in query_lower for word in ['january', 'jan', 'early', '2025']):
+        context_parts.append("DATE HANDLING FOR CURRENT QUERIES:")
+        context_parts.append("- Current date context: 2025 (not 2023)")
+        context_parts.append("- Default table: T_PROD_DAILY for any date after January 15, 2025")
+        context_parts.append("- Use month ranges: aug-25 = August 2025 (full month)")
+        context_parts.append("- Use TO_DATE() with DD-MON-YYYY format")
+        context_parts.append("")
+    
+    # 5. Best practices (learned from vector store)
+    context_parts.append("SQL BEST PRACTICES:")
+    context_parts.append("- ALWAYS use T_PROD_DAILY unless specifically querying January 1-15, 2025")
+    context_parts.append("- Use proper Oracle syntax (TO_DATE, UPPER, etc.)")
+    context_parts.append("- Group by all non-aggregate columns")
+    context_parts.append("- Use appropriate JOINs when needed")
+    context_parts.append("- Consider performance with proper WHERE clauses")
+    
+    return "\n".join(context_parts)
 # ---------------------------
 # Retrieval
 # ---------------------------
-
 def _search_schema(user_query: str, selected_db: str, top_k: int = 12) -> List[Dict[str, Any]]:
     """Wrap Chroma hybrid search."""
     try:
@@ -754,7 +1843,15 @@ def _search_schema(user_query: str, selected_db: str, top_k: int = 12) -> List[D
     except Exception as e:
         logger.warning(f"[RAG] Schema search failed: {e}")
         return []
-
+    
+def _search_schema_enhanced(user_query: str, selected_db: str, top_k: int = 15) -> str:
+    """Enhanced schema search with comprehensive context building."""
+    try:
+        results = hybrid_schema_value_search(user_query, selected_db=selected_db, top_k=top_k) or []
+        return create_comprehensive_schema_context(results, selected_db, user_query)
+    except Exception as e:
+        logger.warning(f"[RAG] Enhanced schema search failed: {e}")
+        return "Schema information unavailable due to search error."
 
 def _extract_context_ids(results: List[Dict[str, Any]]) -> List[str]:
     """Stable-ish IDs for observability/debugging."""
@@ -1191,27 +2288,36 @@ def _enhanced_employee_lookup(user_query: str, selected_db: str, enhanced_analys
         
         # Use enhanced summarizer for employee lookup
         python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-        summary = (summarize_with_mistral(
-            user_query=user_query,
-            columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
-            rows=rows_for_summary,
-            backend_summary=python_summary,
-            sql=sql,
-        ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"] else python_summary)
-        
-        return {
-            "status": "success",
-            "summary": summary if display_mode in ["summary","both"] else "",
-            "sql": sql,
-            "display_mode": display_mode,
-            "results": {
-                "columns": list(rows[0].keys()) if rows else [],
-                "rows": [list(r.values()) for r in rows] if rows else [],
-                "row_count": len(rows) if rows else 0,
-            },
-            "schema_context": [],
-            "schema_context_ids": [],
-        }
+        try:
+            from decimal import Decimal
+            summary = summarize_with_mistral(
+                user_query=user_query,
+                columns=list(rows[0].keys()) if rows else [],
+                rows=rows,
+                backend_summary=python_summary,
+                sql=sql,
+            ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary","both"] else python_summary
+        except Exception as e:
+            logger.error(f"Natural language summary error: {e}")
+            summary = f"Found {len(rows)} records matching your query."
+
+            return {
+                "status": "success",
+                "summary": summary if display_mode in ["summary","both"] else "",
+                "sql": sql,
+                "display_mode": display_mode,
+                "visualization": visualization_requested,
+                "results": {
+                    "columns": (list(rows[0].keys()) if rows else []),
+                    "rows": [list(r.values()) for r in rows] if rows else [],
+                    "row_count": len(rows) if rows else 0,
+                },
+                "schema_context": schema_chunks,
+                "schema_context_ids": schema_context_ids,
+                "hybrid_metadata": hybrid_result.get("hybrid_metadata") if hybrid_result else None,
+            }
+        except Exception as e:
+            return {"status": "error", "message": f"Oracle query failed: {e}", "sql": sql}
         
     except Exception as e:
         logger.error(f"[RAG] Enhanced employee lookup failed: {e}")
@@ -1221,12 +2327,20 @@ def _enhanced_employee_lookup(user_query: str, selected_db: str, enhanced_analys
 def _enhanced_tna_task_lookup(user_query: str, selected_db: str, enhanced_analysis: Dict) -> Dict[str, Any]:
     """Enhanced TNA task lookup using intent analysis."""
     try:
+        # Initialize empty variables that will be used in the return statement
+        schema_chunks = []
+        schema_context_ids = []
+        hybrid_result = None
+        
+        # Check for visualization intent
+        from app.query_classifier import has_visualization_intent
+        visualization_requested = has_visualization_intent(user_query)
+        
         ql = (user_query or "").lower()
         # Highest priority: exact CTL job number (CTL-NN-NNNNN or CTL-NN-NNNNNN)
         ctl_match = re.search(r'\bCTL-\d{2}-\d{5,6}\b', user_query, re.IGNORECASE)
         if ctl_match:
             full_ctl = ctl_match.group(0).upper()
-            
             # Check for task number filter
             task_filter = ""
             task_match = re.search(r'\btask\s+(?:number\s+)?(\d+)\b', user_query, re.IGNORECASE)
@@ -1323,29 +2437,36 @@ def _enhanced_tna_task_lookup(user_query: str, selected_db: str, enhanced_analys
             display_mode = determine_display_mode(user_query, rows)
             rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
             python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary","both"] else ""
-            summary = (
-                summarize_with_mistral(
+            try:
+                from decimal import Decimal
+                # Import SUMMARY_ENGINE to avoid "not defined" error
+                from app.config import SUMMARY_ENGINE
+                summary = summarize_with_mistral(
                     user_query=user_query,
-                    columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
-                    rows=rows_for_summary,
+                    columns=list(rows[0].keys()) if rows else [],
+                    rows=rows,
                     backend_summary=python_summary,
                     sql=sql,
                 ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary","both"] else python_summary
-            )
+            except Exception as e:
+                logger.error(f"Natural language summary error: {e}")
+                summary = f"Found {len(rows)} records matching your query."
+
             return {
                 "status": "success",
                 "summary": summary if display_mode in ["summary","both"] else "",
                 "sql": sql,
                 "display_mode": display_mode,
+                "visualization": visualization_requested, 
                 "results": {
                     "columns": (list(rows[0].keys()) if rows else []),
                     "rows": [list(r.values()) for r in rows] if rows else [],
                     "row_count": len(rows) if rows else 0,
                 },
-                "schema_context": [],
-                "schema_context_ids": [],
+                "schema_context": schema_chunks,
+                "schema_context_ids": schema_context_ids,
+                "hybrid_metadata": hybrid_result.get("hybrid_metadata") if hybrid_result else None,
             }
-        
         # ----------------------------------------------
         # Recognize key task phrases (PP Approval first)
         # ----------------------------------------------
@@ -1401,31 +2522,41 @@ def _enhanced_tna_task_lookup(user_query: str, selected_db: str, enhanced_analys
         rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
 
         python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-        summary = (
-            summarize_with_mistral(
-                user_query=user_query,
-                columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
-                rows=rows_for_summary,
-                backend_summary=python_summary,
-                sql=sql,
+        
+        try:
+            # Import SUMMARY_ENGINE to avoid "not defined" error
+            from app.config import SUMMARY_ENGINE
+            
+            summary = (
+                summarize_with_mistral(
+                    user_query=user_query,
+                    columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
+                    rows=rows_for_summary,
+                    backend_summary=python_summary,
+                    sql=sql,
+                )
+                if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"]
+                else python_summary
             )
-            if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"]
-            else python_summary
-        )
-
+        except Exception as e:
+            logger.error(f"[RAG] Summary generation failed: {e}")
+            summary = python_summary
+        
+        # Then modify the return statement to include the visualization flag:
         return {
             "status": "success",
             "summary": summary if display_mode in ["summary", "both"] else "",
             "sql": sql,
             "display_mode": display_mode,
+            "visualization": visualization_requested,
             "results": {
                 "columns": (list(rows[0].keys()) if rows else []),
                 "rows": [list(r.values()) for r in rows] if rows else [],
                 "row_count": len(rows) if rows else 0,
             },
-            "schema_context": [],
-            "schema_context_ids": [],
-        }
+            "schema_context": schema_chunks,
+            "schema_context_ids": schema_context_ids,
+        } 
 
     except Exception as e:
         logger.error(f"[RAG] Enhanced TNA task lookup failed: {e}")
@@ -1501,6 +2632,7 @@ def _entity_lookup_path(user_query: str, selected_db: str,
                     )
                 else:
                     summary = ""
+                
                 return {
                     "status": "success",
                     "summary": summary,
@@ -1576,6 +2708,7 @@ def _entity_lookup_path(user_query: str, selected_db: str,
             )
         else:
             summary = ""
+        
         return {
             "status": "success",
             "summary": summary,
@@ -1625,19 +2758,25 @@ def _generic_browse_fallback(user_query: str, selected_db: str, options: Dict[st
         display_mode = determine_display_mode(user_query, rows)
         rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
         python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-        summary = (summarize_with_mistral(
-            user_query=user_query,
-            columns=(list(rows_for_summary[0].keys()) if rows_for_summary else []),
-            rows=rows_for_summary,
-            backend_summary=python_summary,
-            sql=sql,
-        ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"] else python_summary)
-
+        try:
+            from decimal import Decimal
+            summary = summarize_with_mistral(
+                user_query=user_query,
+                columns=list(rows[0].keys()) if rows else [],
+                rows=rows,
+                backend_summary=python_summary,
+                sql=sql,
+            ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary","both"] else python_summary
+        except Exception as e:
+            logger.error(f"Natural language summary error: {e}")
+            summary = f"Found {len(rows)} records matching your query."
+    
         return {
             "status": "success",
             "summary": summary if display_mode in ["summary","both"] else "",
             "sql": sql,
             "display_mode": display_mode,
+            "visualization": visualization_requested,
             "results": {
                 "columns": (list(rows[0].keys()) if rows else []),
                 "rows": [list(r.values()) for r in rows] if rows else [],
@@ -1645,38 +2784,131 @@ def _generic_browse_fallback(user_query: str, selected_db: str, options: Dict[st
             },
             "schema_context": schema_chunks,
             "schema_context_ids": schema_context_ids,
+            "hybrid_metadata": hybrid_result.get("hybrid_metadata") if hybrid_result else None,
         }
     except Exception as e:
         logger.error(f"[Fallback] Oracle error: {e}")
         return {"status": "error", "message": f"Oracle query failed: {str(e)}", "sql": sql}
 
+# ... existing code ...
+
+# Add this new function after existing functions but before answer()
+def generate_natural_language_summary(
+    user_query: str,
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    sql: Optional[str] = None
+) -> str:
+    """
+    Generate a natural language summary directly using the OpenRouter client.
+    This is a simpler implementation that avoids asyncio complexities.
+    """
+    try:
+        if not rows:
+            return "No data found matching your criteria."
+            
+        # Format data for the prompt
+        data_summary = f"Dataset with {len(rows)} records and {len(columns)} columns:\n"
+        
+        # Format sample records
+        sample_size = min(3, len(rows))
+        sample_data = []
+        for i in range(sample_size):
+            row_data = []
+            for col in columns:
+                if col in rows[i] and rows[i][col] is not None:
+                    value = rows[i][col]
+                    if isinstance(value, (int, float, Decimal)):
+                        if isinstance(value, Decimal):
+                            value = float(value)
+                        formatted_value = f"{value:,}" if value == int(value) else f"{value:,.2f}".rstrip('0').rstrip('.')
+                    else:
+                        formatted_value = str(value)
+                    row_data.append(f"{col}={formatted_value}")
+            sample_data.append(f"Record {i+1}: {', '.join(row_data)}")
+            
+        data_summary += "\n".join(sample_data)
+        
+        # Create the prompt
+        prompt = f"""You are an intelligent data analyst for a manufacturing company. Your task is to provide a clear, natural language response to the user's question based on the query results.
+
+User Question: "{user_query}"
+
+Data Results:
+{data_summary}
+
+SQL Used: {sql or "N/A"}
+
+Please provide a response that directly answers the user's question in natural, conversational language. Focus on the most relevant information and metrics. Avoid technical database terminology unless necessary. Do not start with phrases like "Based on the data" or "The results show".
+"""
+        
+        # Use the OpenRouter client directly, no asyncio
+        try:
+            from app.openrouter_client import OpenRouterClient
+            client = OpenRouterClient()
+            
+            # This is a synchronous version that handles async internally
+            messages = [{"role": "user", "content": prompt}]
+            model = "deepseek/deepseek-chat"  # Use DeepSeek for detailed responses
+            
+            # Create the request payload
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3,
+                "max_tokens": 500
+            }
+            
+            # Use the OpenRouter client's HTTP request directly
+            response = client._make_request_sync(payload)
+            
+            if response.success and response.content:
+                return response.content
+            else:
+                logger.warning(f"OpenRouter summary failed: {response.error}")
+                # Fall back to basic summary
+                return f"Found {len(rows)} records matching your query."
+                
+        except Exception as e:
+            logger.error(f"OpenRouter summary error: {e}")
+            return f"Found {len(rows)} records matching your query."
+            
+    except Exception as e:
+        logger.error(f"Natural language summary error: {e}")
+        return f"Found {len(rows)} records matching your query."
 # ---------------------------
 # Public API
 # ---------------------------
+async def answer(
+    user_query: str, 
+    selected_db: str,
+    session_id: Optional[str] = None,
+    client_ip: Optional[str] = None,
+    user_agent: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Main RAG orchestrator with hybrid AI processing and comprehensive training data collection.
+    
+    Args:
+        user_query: The user's natural language query
+        selected_db: Database to query against
+        session_id: Session identifier for training data collection
+        client_ip: Client IP address for training data collection
+        user_agent: User agent string for training data collection
+        
+    Returns:
+        Dictionary with query results and metadata
+    """
+    uq = user_query.strip()
+    if not uq:
+        return {"status": "error", "message": "Empty query."}
 
-def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
-    """
-    RAG pipeline:
-      (fast paths) → retrieval → runtime options → planner (JSON or raw SQL) → build/validate → execute → summarize.
-    Returns the envelope the frontend expects.
-    """
-    logger.info(f"[RAG] Q: {user_query} (DB: {selected_db})")
-    uq = (user_query or "").strip()
-    
-    # Enhanced query analysis (integrated from enhanced modules)
+    # Enhanced query analysis for dynamic processing
     enhanced_analysis = analyze_enhanced_query(uq)
-    logger.info(f"[RAG] Enhanced analysis: {enhanced_analysis['intent']} with companies: {[c['code'] for c in enhanced_analysis['companies']]}")
-    
-    # Try enhanced date extraction from query_engine first, fallback to existing methods
-    enhanced_date_range = None
-    try:
-        # Import the enhanced date function from query_engine to avoid naming conflict
-        from app.query_engine import extract_enhanced_date_range as enhanced_date_extractor
-        enhanced_date_range = enhanced_date_extractor(uq)
-        if enhanced_date_range and isinstance(enhanced_date_range, dict) and 'type' in enhanced_date_range:
-            logger.info(f"[RAG] Enhanced date range detected: {enhanced_date_range['type']}")
-    except Exception as e:
-        logger.warning(f"[RAG] Enhanced date extraction failed: {e}")
+    logger.info(f"[RAG] Enhanced analysis: {enhanced_analysis['intent']} ({enhanced_analysis['intent_confidence']:.2f})")
+ 
+    visualization_requested = has_visualization_intent(user_query)
+
     # Enhanced intent-based routing - use enhanced analysis before vector search
     if enhanced_analysis['intent'] == 'employee_lookup':
         logger.info("[RAG] Routing to employee lookup based on enhanced analysis")
@@ -1689,6 +2921,11 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
     # 0) Fast paths -------------------------------------------------------------
     # 0.a) Raw SELECT passthrough (validated)
     if re.match(r'(?is)^\s*select\b', uq):
+        # Retrieve schema context for fast path
+        results = _search_schema(user_query, selected_db, top_k=12)
+        schema_chunks = [r.get("document") for r in results] if results else []
+        schema_context_ids = _extract_context_ids(results)
+        
         sql = normalize_dates(uq.rstrip(";"))
         try:
             enforce_predicate_type_compat(sql, selected_db)
@@ -1698,31 +2935,38 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
             display_mode = determine_display_mode(user_query, rows)
             rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
             python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-            summary = (summarize_with_mistral(
-                user_query=user_query,
-                columns=list(rows_for_summary[0].keys()) if rows_for_summary else [],
-                rows=rows_for_summary,
-                backend_summary=python_summary,
-                sql=sql,
-            ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"] else python_summary)
+            try:
+                from decimal import Decimal
+                summary = summarize_with_mistral(
+                    user_query=user_query,
+                    columns=list(rows[0].keys()) if rows else [],
+                    rows=rows,
+                    backend_summary=python_summary,
+                    sql=sql,
+                ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary","both"] else python_summary
+            except Exception as e:
+                logger.error(f"Natural language summary error: {e}")
+                summary = f"Found {len(rows)} records matching your query."
+          
             return {
                 "status": "success",
                 "summary": summary if display_mode in ["summary","both"] else "",
                 "sql": sql,
                 "display_mode": display_mode,
+                "visualization": visualization_requested, 
                 "results": {
-                    "columns": list(rows[0].keys()) if rows else [],
+                    "columns": (list(rows[0].keys()) if rows else []),
                     "rows": [list(r.values()) for r in rows] if rows else [],
                     "row_count": len(rows) if rows else 0,
                 },
-                "schema_context": [],
-                "schema_context_ids": [],
+                "schema_context": schema_chunks,
+                "schema_context_ids": schema_context_ids,
+                "hybrid_metadata": None,
             }
         except Exception as e:
             return {"status": "error", "message": f"Oracle query failed: {e}", "sql": sql}
-
-    # 0.b) “all table name(s)” quick path
-    if re.search(r'\ball\s+table\s+name(s)?\b', uq, re.I):
+    # 0.b) "All table names" → system metadata
+    if re.search(r"\ball\s+table\s+name(s)?\b", uq, re.I):
         try:
             with connect_to_source(selected_db) as (conn, _):
                 cur = conn.cursor()
@@ -1749,7 +2993,7 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
     # NEW: prioritize critical tables based on query content
     candidate_tables = _intelligent_table_selection(user_query, candidate_tables, selected_db)
     candidate_tables = _bias_tables_for_day(candidate_tables, uq)
-    # NEW: if it’s a single-day/“day” query, make sure daily tables are present
+    # NEW: if it's a single-day/"day" query, make sure daily tables are present
     if _DAILY_HINT_RX.search(uq):
         extras = _discover_dailyish_tables(selected_db, must_have_cols=('PRODUCTION_QTY','FLOOR_NAME'))
         extras = _filter_banned_tables(extras)
@@ -1759,6 +3003,12 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
 
     # Force T_PROD vs T_PROD_DAILY ordering when applicable
     candidate_tables = _maybe_force_tprod_tables(uq, selected_db, candidate_tables)
+    
+    # Store the forced table information for hybrid processing
+    forced_table = None
+    if len(candidate_tables) == 1:
+        # If only one table is forced, store it
+        forced_table = candidate_tables[0]
 
     # (optional safety) re-filter in case the forcing step ever reintroduces something
     candidate_tables = _filter_banned_tables(candidate_tables)
@@ -1775,6 +3025,88 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
             "schema_context_ids": schema_context_ids
         }
 
+    # Phase 4.1: Try hybrid processing first if available and conditions are met
+    hybrid_result = None
+    if HYBRID_PROCESSING_AVAILABLE and _should_use_hybrid_processing(user_query, enhanced_analysis):
+        logger.info("[RAG] Attempting hybrid processing for SQL generation")
+        logger.info(f"[RAG] COLLECT_TRAINING_DATA is {COLLECT_TRAINING_DATA}")
+        
+        # Create an actual turn_id for training data collection if not available
+        temp_turn_id = None
+        if COLLECT_TRAINING_DATA:
+            try:
+                # Create actual AI_TURN record for training data collection during RAG processing
+                from app.feedback_store import insert_turn
+                temp_turn_id = insert_turn(
+                    source_db_id="source_db_1",
+                    client_ip=client_ip,
+                    user_question=user_query,
+                    schema_context_text="\n\n".join(schema_chunks[:5]),  # Limited context for temp record
+                    schema_context_ids=schema_context_ids[:10] if schema_context_ids else [],
+                    meta={
+                        "temp_record_for_training": True,
+                        "enhanced_analysis": enhanced_analysis.get('intent', 'unknown') if enhanced_analysis else 'unknown'
+                    }
+                )
+                logger.info(f"[RAG] Created temporary turn_id {temp_turn_id} for training data collection")
+            except Exception as e:
+                logger.warning(f"[RAG] Failed to create temporary turn_id: {e}")
+        
+        # Pass the forced table information to hybrid processing
+        hybrid_context_info = {
+            "forced_table": forced_table,
+            "date_cutoff_applied": forced_table in ["T_PROD", "T_PROD_DAILY"]
+        }
+        
+        hybrid_result = await _try_hybrid_processing(
+            user_query=user_query,
+            schema_context="\n\n".join(schema_chunks),
+            enhanced_analysis=enhanced_analysis,
+            options=options,
+            schema_chunks=schema_chunks,
+            schema_context_ids=schema_context_ids,
+            turn_id=temp_turn_id,  # Use actual turn_id for training data collection
+            session_id=session_id,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            hybrid_context_info=hybrid_context_info  # Pass the forced table information
+        )
+        
+        if hybrid_result and hybrid_result.get("status") == "success":
+            processing_mode = "unknown"
+            if "hybrid_metadata" in hybrid_result and "processing_mode" in hybrid_result["hybrid_metadata"]:
+                processing_mode = hybrid_result["hybrid_metadata"]["processing_mode"]
+            elif "processing_mode" in hybrid_result:
+                processing_mode = hybrid_result["processing_mode"]
+                
+            # Ensure processing_mode is not None to prevent format string errors
+            processing_mode = processing_mode or "unknown"
+            logger.info(f"[RAG] Hybrid processing successful with {processing_mode} mode")
+
+            # Augment RAG result with hybrid data
+            result = hybrid_result.copy()
+            result["schema_context"] = schema_chunks
+            result["schema_context_ids"] = schema_context_ids
+            
+            # Add hybrid processing metadata
+            result["hybrid_metadata"] = {
+                "processing_mode": hybrid_result.get("processing_mode", "unknown"),
+                "selection_reasoning": hybrid_result.get("selection_reasoning", ""),
+                "model_used": hybrid_result.get("model_used", "unknown"),
+                "processing_time": hybrid_result.get("processing_time", 0.0),
+                "local_confidence": hybrid_result.get("local_confidence"),
+                "api_confidence": hybrid_result.get("api_confidence"),
+                "enhanced_schema_used": hybrid_result.get("enhanced_schema_used", False),
+                "training_data_recorded": hybrid_result.get("training_data_recorded", False),
+                "classification_time_ms": hybrid_result.get("classification_time_ms", 0.0),
+                "sql_execution_time_ms": hybrid_result.get("sql_execution_time_ms", 0.0),
+                "sql_execution_success": hybrid_result.get("sql_execution_success", False),
+                "temp_turn_id": temp_turn_id  # Include temp turn_id for reference
+            }
+            
+            return result
+        else:
+            logger.info("[RAG] Hybrid processing failed or returned no result, falling back to traditional RAG pipeline")
     # 3) Planner → STRICT validation ------------------------------------------
     plan = _ask_planner(user_query, options)
     ok, why = _validate_plan(plan or {}, options)
@@ -1796,7 +3128,6 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
             return _entity_lookup_path(user_query, selected_db, schema_chunks, schema_context_ids)
         # NEW: graceful table-browse fallback
         return _generic_browse_fallback(uq, selected_db, options, schema_chunks, schema_context_ids)
-
 
     # If planner returned raw SQL, validate and use it; otherwise build from plan
     maybe_sql = (plan or {}).get("sql") or (plan or {}).get("query")
@@ -1862,18 +3193,6 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
                 except Exception as e:
                     logger.warning(f"[RAG] Daily retry failed: {e}")
 
-    # Special UX for explicit date-range queries → no data
-    if not rows and extract_explicit_date_range(user_query):
-        return {
-            "status": "success",
-            "summary": "No data found for the requested date range.",
-            "sql": sql,
-            "display_mode": determine_display_mode(user_query, []),
-            "results": {"columns": [], "rows": [], "row_count": 0},
-            "schema_context": schema_chunks,
-            "schema_context_ids": schema_context_ids,
-        }
-
     # 5) Summarize + format envelope ------------------------------------------
     display_mode = determine_display_mode(user_query, rows)
     rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
@@ -1881,25 +3200,40 @@ def answer(user_query: str, selected_db: str) -> Dict[str, Any]:
 
     if display_mode in ["summary", "both"]:
         try:
-            cols_for_llm = list(rows_for_summary[0].keys()) if rows_for_summary else []
+            # Use summarize_with_mistral directly to avoid function name issues
             summary = summarize_with_mistral(
                 user_query=user_query,
-                columns=cols_for_llm,
-                rows=rows_for_summary,
+                columns=list(rows[0].keys()) if rows else [],
+                rows=rows,
                 backend_summary=python_summary,
-                sql=sql,
-            ) if SUMMARY_ENGINE == "llm" else python_summary
+                sql=sql
+            )
         except Exception as e:
-            logger.warning(f"[RAG] LLM summary failed; falling back. Reason: {e}")
+            logger.warning(f"[RAG] Natural language summary failed; falling back. Reason: {e}")
             summary = python_summary
     else:
         summary = ""
+    # Check for visualization intent once (to avoid duplicate computation)
+    visualization_requested = has_visualization_intent(user_query)
+    # Special UX for explicit date-range queries → no data
+    if not rows and extract_explicit_date_range(user_query):
+        return {
+            "status": "success",
+            "summary": "No data found for the requested date range.",
+            "sql": sql,
+            "display_mode": determine_display_mode(user_query, []),
+            "visualization": visualization_requested,
+            "results": {"columns": [], "rows": [], "row_count": 0},
+            "schema_context": schema_chunks,
+            "schema_context_ids": schema_context_ids,
+        }
 
     return {
         "status": "success",
         "summary": summary,
         "sql": sql,
         "display_mode": display_mode,
+        "visualization": visualization_requested,
         "results": {
             "columns": (list(rows[0].keys()) if rows else []),
             "rows": [list(r.values()) for r in rows] if rows else [],

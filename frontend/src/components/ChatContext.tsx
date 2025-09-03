@@ -15,11 +15,24 @@ type OracleError = {
   suggestions?: string[]; // ← added to match backend and ChatPanel
 };
 
+// Phase 4.2: Enhanced hybrid AI metadata structure
+type HybridMetadata = {
+  processing_mode?: string;
+  model_used?: string;
+  selection_reasoning?: string;
+  processing_time?: number;
+  local_confidence?: number;
+  api_confidence?: number;
+};
+
 type Message = {
   sender: "user" | "bot";
   content: string | TableData | OracleError;
   id: string;
   type: "user" | "status" | "summary" | "table" | "error";
+  // Phase 4.2: Add hybrid metadata to messages
+  hybrid_metadata?: HybridMetadata;
+  response_time?: number; // Track total response time from request to completion
 };
 
 type LastIds = { turn_id?: number; sql_sample_id?: number | null; summary_sample_id?: number | null };
@@ -97,6 +110,9 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
     setLastIds({});
     setIsTyping(true);
 
+    // Phase 4.2: Track request start time for response time calculation
+    const requestStartTime = Date.now();
+
     addMessage({ sender: "user", content: q, id: generateId(), type: "user" });
     const thinkingId = addMessage({
       sender: "bot",
@@ -115,9 +131,16 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
       });
 
       const payload = await res.json();
+      
+      // Phase 4.2: Calculate total response time
+      const responseTime = Date.now() - requestStartTime;
+      
       if (!res.ok) {
         const text = typeof payload === "string" ? payload : payload?.detail || res.statusText;
-        updateMessage(thinkingId, { error: "HTTPError", message: text } as any, { type: "error" });
+        updateMessage(thinkingId, { error: "HTTPError", message: text } as any, { 
+          type: "error",
+          response_time: responseTime 
+        });
         setIsTyping(false);
         return;
       }
@@ -134,7 +157,10 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
             missing_tables: payload.missing_tables,
             suggestions: payload.suggestions,
           } as any,
-          { type: "error" }
+          { 
+            type: "error",
+            response_time: responseTime 
+          }
         );
         setIsTyping(false);
         return;
@@ -166,7 +192,10 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
             missing_tables: payload.missing_tables,
             suggestions: payload.suggestions,
           } as any,
-          { type: "error" }
+          { 
+            type: "error",
+            response_time: responseTime 
+          }
         );
         setIsTyping(false);
         return;
@@ -174,10 +203,17 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
 
       const mode: string = payload?.display_mode || "table";
 
+      // Phase 4.2: Extract hybrid metadata from response
+      const hybridMetadata = payload?.hybrid_metadata;
+
       // 🫧 Prefer morphing the "Thinking..." bubble into the summary if present
       let usedThinkingBubble = false;
       if ((mode === "summary" || mode === "both") && payload?.summary) {
-        updateMessage(thinkingId, payload.summary as string, { type: "summary" });
+        updateMessage(thinkingId, payload.summary as string, { 
+          type: "summary",
+          hybrid_metadata: hybridMetadata,
+          response_time: responseTime
+        });
         usedThinkingBubble = true;
       }
 
@@ -195,6 +231,9 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
             content: [columns, ...(rows || [])],
             id: generateId(),
             type: "table",
+            // Phase 4.2: Add hybrid metadata to table messages too
+            hybrid_metadata: hybridMetadata,
+            response_time: responseTime,
           });
         }
       }
