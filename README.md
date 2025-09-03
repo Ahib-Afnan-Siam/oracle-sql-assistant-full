@@ -71,6 +71,8 @@ This application converts English queries into **executable Oracle SQL**, runs t
 - **Quality Metrics Analysis** — Monitor success rates and user satisfaction.
 - **Continuous Improvement** — Use feedback data to enhance model performance.
 
+---
+
 ## 🏗️ Architecture
 
 ```text
@@ -91,7 +93,7 @@ oracle-sql-assistant/
     └── package.json             # Frontend dependencies
 
 
-
+---
 
 ## 🧰 Technology Stack
 
@@ -115,6 +117,8 @@ oracle-sql-assistant/
 - **Database:** Oracle access  
 - **Local Inference:** Ollama  
 - **Vector DB:** ChromaDB
+
+---
 
 ## 🛠️ Installation
 
