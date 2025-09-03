@@ -5,11 +5,42 @@
 ---
 
 ## 📑 Table of Contents
+
 - [Overview](#overview)
 - [✨ Features](#-features)
   - [Core Functionality](#core-functionality)
   - [Advanced AI Capabilities](#advanced-ai-capabilities)
   - [Training & Feedback System](#training--feedback-system)
+- [🏗️ Architecture](#-architecture)
+- [🧰 Technology Stack](#-technology-stack)
+- [🛠️ Installation](#-installation)
+  - [Backend Setup](#backend-setup)
+  - [Frontend Setup](#frontend-setup)
+- [⚙️ Configuration](#-configuration)
+  - [Database Configuration](#database-configuration)
+  - [LLM Configuration](#llm-configuration)
+  - [Enable Hybrid Processing](#enable-hybrid-processing)
+- [▶️ Running the Application](#%EF%B8%8F-running-the-application)
+- [🚀 Usage](#-usage)
+  - [Example Queries](#-example-queries)
+  - [Advanced Features](#-advanced-features)
+    - [Hybrid AI Processing](#hybrid-ai-processing)
+    - [Training Data Collection](#training-data-collection)
+    - [Quality Metrics](#quality-metrics)
+- [📡 API Endpoints](#-api-endpoints)
+  - [Core Endpoints](#core-endpoints)
+  - [Export Endpoints](#export-endpoints)
+  - [Quality Metrics Endpoints](#quality-metrics-endpoints)
+- [🧩 Development](#-development)
+  - [Backend Development (FastAPI)](#backend-development-fastapi)
+  - [Frontend Development (React--TypeScript)](#frontend-development-react--typescript)
+- [✅ Testing](#-testing)
+- [🧰 Troubleshooting](#-troubleshooting)
+  - [Common Issues](#common-issues)
+  - [Logs](#logs)
+- [🤝 Contributing](#-contributing)
+- [📄 License](#-license)
+- [🆘 Support](#-support)
 
 ---
 
@@ -58,6 +89,8 @@ oracle-sql-assistant/
     │   ├── components/          # UI components
     │   └── utils/               # Utility functions
     └── package.json             # Frontend dependencies
+
+
 
 
 ## 🧰 Technology Stack
