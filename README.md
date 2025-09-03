@@ -20,7 +20,7 @@
   - [Database Configuration](#database-configuration)
   - [LLM Configuration](#llm-configuration)
   - [Enable Hybrid Processing](#enable-hybrid-processing)
-- [▶️ Running the Application](#%EF%B8%8F-running-the-application)
+- [▶️ Running the Application](#running-the-application)
 - [🚀 Usage](#-usage)
   - [Example Queries](#-example-queries)
   - [Advanced Features](#-advanced-features)
@@ -33,7 +33,7 @@
   - [Quality Metrics Endpoints](#quality-metrics-endpoints)
 - [🧩 Development](#-development)
   - [Backend Development (FastAPI)](#backend-development-fastapi)
-  - [Frontend Development (React--TypeScript)](#frontend-development-react--typescript)
+  - [Frontend Development (React--typescript)](#frontend-development-react--typescript)
 - [✅ Testing](#-testing)
 - [🧰 Troubleshooting](#-troubleshooting)
   - [Common Issues](#common-issues)
@@ -74,7 +74,6 @@ This application converts English queries into **executable Oracle SQL**, runs t
 ---
 
 ## 🏗️ Architecture
-
 ```text
 oracle-sql-assistant/
 ├── backend/                     # FastAPI backend application
@@ -91,7 +90,7 @@ oracle-sql-assistant/
     │   ├── components/          # UI components
     │   └── utils/               # Utility functions
     └── package.json             # Frontend dependencies
-
+```
 
 ---
 
@@ -192,11 +191,12 @@ npm install
 npm run dev
 ```
 
+---
+
 ## ⚙️ Configuration
 
 ### Database Configuration
 Update `backend/config/sources.json` with your Oracle database connections:
-
 ```json
 [
   {
@@ -212,12 +212,12 @@ Update `backend/config/sources.json` with your Oracle database connections:
 ```
 
 ### LLM Configuration
-Configure your LLM settings in the `.env` file (see Installation section):
+Set LLM settings in `.env` (see Installation):
 - **Local models** via **Ollama**
 - **Cloud models** via **OpenRouter API**
 - **Hybrid processing** (combine both)
 
-#### Enable Hybrid Processing
+### Enable Hybrid Processing
 ```env
 HYBRID_ENABLED=true
 OPENROUTER_API_KEY=your_openrouter_api_key
@@ -243,6 +243,7 @@ npm run dev
 ```
 The frontend will be available at **http://localhost:5173**
 
+---
 
 ## 🚀 Usage
 
@@ -263,50 +264,47 @@ The frontend will be available at **http://localhost:5173**
 ## 🧠 Advanced Features
 
 ### Hybrid AI Processing
-The system uses both local and cloud-based LLMs:
-- **Local Processing:** Fast, private, runs without internet (limited capacity)
-- **Cloud Processing:** More powerful; requires internet access
-- **Parallel Processing:** Local and cloud models run simultaneously
-- **Intelligent Selection:** Automatically chooses the best response using confidence scores
+- **Local Processing:** Fast, private, runs without internet (limited capacity)  
+- **Cloud Processing:** More powerful; requires internet access  
+- **Parallel Processing:** Local and cloud models run simultaneously  
+- **Intelligent Selection:** Chooses the best response using confidence scores  
 
 ### Training Data Collection
-When enabled, the system collects comprehensive training signals:
-- Query context and classification
-- Model responses and performance metrics
-- User feedback and satisfaction scores
-- API usage and cost tracking
+- Query context and classification  
+- Model responses and performance metrics  
+- User feedback and satisfaction scores  
+- API usage and cost tracking  
 
 ### Quality Metrics
-Monitor system performance through:
-- Query understanding accuracy
-- SQL execution success rates
-- User satisfaction indicators
-- Business logic compliance
-- Response time analysis
+- Query understanding accuracy  
+- SQL execution success rates  
+- User satisfaction indicators  
+- Business logic compliance  
+- Response time analysis  
 
 ---
 
 ## 📡 API Endpoints
 
 ### Core Endpoints
-| Method | Path         | Description                         |
-|-------:|--------------|-------------------------------------|
-| POST   | `/chat`      | Process natural-language queries    |
-| POST   | `/feedback`  | Submit feedback on responses        |
-| GET    | `/health`    | Health check with quality metrics   |
+| Method | Path        | Description                       |
+|-------:|-------------|-----------------------------------|
+| POST   | `/chat`     | Process natural-language queries  |
+| POST   | `/feedback` | Submit feedback on responses      |
+| GET    | `/health`   | Health check with quality metrics |
 
 ### Export Endpoints
-| Method | Path              | Description                        |
-|-------:|-------------------|------------------------------------|
-| GET    | `/export/sql`     | Export SQL training data as CSV    |
-| GET    | `/export/summary` | Export summary training data as CSV|
+| Method | Path               | Description                       |
+|-------:|--------------------|-----------------------------------|
+| GET    | `/export/sql`      | Export SQL training data as CSV   |
+| GET    | `/export/summary`  | Export summary training data as CSV |
 
 ### Quality Metrics Endpoints
-| Method | Path                              | Description                   |
-|-------:|-----------------------------------|-------------------------------|
-| GET    | `/quality-metrics`                | Comprehensive quality report  |
-| GET    | `/quality-metrics/success-rates`  | Success rate metrics          |
-| GET    | `/quality-metrics/user-satisfaction` | User satisfaction metrics  |
+| Method | Path                               | Description                    |
+|-------:|------------------------------------|--------------------------------|
+| GET    | `/quality-metrics`                 | Comprehensive quality report   |
+| GET    | `/quality-metrics/success-rates`   | Success rate metrics           |
+| GET    | `/quality-metrics/user-satisfaction` | User satisfaction metrics    |
 
 ---
 
@@ -329,7 +327,6 @@ Monitor system performance through:
 ---
 
 ## ✅ Testing
-
 Run backend tests:
 ```bash
 cd backend
@@ -341,19 +338,18 @@ python -m pytest
 ## 🧰 Troubleshooting
 
 ### Common Issues
-- **Database Connection Errors:** Verify credentials in `backend/config/sources.json`
-- **LLM Not Responding:** Check **Ollama** installation and that required models are pulled
-- **Hybrid Processing Not Working:** Ensure **OPENROUTER_API_KEY** is set and `HYBRID_ENABLED=true`
-- **Schema Cache Issues:** Restart the backend to refresh cached schema/embeddings
+- **Database Connection Errors:** Verify credentials in `backend/config/sources.json`  
+- **LLM Not Responding:** Check **Ollama** install and pulled models  
+- **Hybrid Processing Not Working:** Ensure **OPENROUTER_API_KEY** is set and `HYBRID_ENABLED=true`  
+- **Schema Cache Issues:** Restart the backend to refresh cached schema/embeddings  
 
 ### Logs
-- **Backend:** Shown in the terminal where the FastAPI server runs  
-- **Frontend:** Open browser **Developer Tools → Console**
+- **Backend:** Terminal where FastAPI server runs  
+- **Frontend:** Browser **Developer Tools → Console**  
 
 ---
 
 ## 🤝 Contributing
-
 1. Fork the repository  
 2. Create a feature branch  
 3. Make your changes  
