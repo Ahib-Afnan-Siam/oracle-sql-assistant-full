@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------ SQL extractor ------------------------------
-
 def _extract_sql_from_response(response_text: str) -> Optional[str]:
     """
     Robustly extract SQL from LLM responses that may contain explanations.
@@ -39,6 +38,11 @@ def _extract_sql_from_response(response_text: str) -> Optional[str]:
             return None
         if _looks_like_incomplete_multifield(basic_sql):
             return None
+        # Fix for truncated SQL ending with comma
+        basic_sql = basic_sql.rstrip(',').strip()
+        # Ensure we have a complete FROM clause with table name
+        if re.search(r'\bFROM\s*$', basic_sql.upper()):
+            return None  # Incomplete FROM clause
         return basic_sql.strip()
 
     # If basic extraction failed, do a robust parse
@@ -49,7 +53,20 @@ def _extract_sql_from_response(response_text: str) -> Optional[str]:
     elif cleaned_text.startswith('```'):
         cleaned_text = cleaned_text.replace('```', '', 1).strip()
 
+    # Handle closing backticks with or without trailing dots
     if cleaned_text.endswith('```'):
+        cleaned_text = cleaned_text[:-3].strip()
+    elif cleaned_text.endswith('```...'):
+        cleaned_text = cleaned_text[:-6].strip()
+    elif '```' in cleaned_text:
+        # Find the last occurrence of ``` and remove everything after it
+        last_backticks = cleaned_text.rfind('```')
+        if last_backticks != -1:
+            cleaned_text = cleaned_text[:last_backticks].strip()
+
+    # Handle trailing dots case
+    if cleaned_text.endswith('...'):
+        # Remove trailing dots
         cleaned_text = cleaned_text[:-3].strip()
 
     if '...' in cleaned_text:
@@ -63,70 +80,51 @@ def _extract_sql_from_response(response_text: str) -> Optional[str]:
     sql_lines: List[str] = []
     in_sql_block = False
     found_select = False
+    found_from = False
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
+            if in_sql_block and found_from:
+                # allow blank after FROM+clauses; continue
+                continue
+            elif in_sql_block and not found_from:
+                # still in SELECT-list; keep waiting for FROM
+                continue
+            else:
+                continue
+
+        # Stop if the code fence closes
+        if stripped.startswith('```'):
+            break
+
+        # Skip obvious non-SQL commenty lines
+        if stripped.startswith(('--', '/*', '#', '*')):
             continue
 
-        # comments/explanations
-        if (stripped.startswith(('--', '/*', '#', '*'))
-            or stripped.lower().startswith(('since ', 'note:', 'explanation:', 'however', 'but ', 'if '))):
-            if found_select and not in_sql_block:
-                break
-            continue
-
-        if stripped.upper().startswith('SELECT'):
+        # Enter SQL block on SELECT (or WITH)
+        if not in_sql_block and re.search(r'^\s*(SELECT|WITH)\b', stripped, re.IGNORECASE):
             in_sql_block = True
             found_select = True
             sql_lines.append(stripped)
-        elif in_sql_block:
-            if (stripped.upper().startswith(('FROM', 'WHERE', 'GROUP', 'ORDER', 'HAVING', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'UNION'))
-                or stripped.endswith((',', ';'))
-                or '=' in stripped
-                or any(k in stripped.upper() for k in ['AND', 'OR', 'ON', 'AS', 'BY'])):
+            continue
 
-                if '...' in stripped:
-                    pos = stripped.find('...')
-                    if pos > 0:
-                        s2 = stripped[:pos].strip()
-                        if s2:
-                            sql_lines.append(s2)
-                    break
+        if in_sql_block:
+            # Once in SQL, just accumulate lines until we hit ';' or fence/end
+            sql_lines.append(stripped)
+            if re.search(r'^\s*FROM\b', stripped, re.IGNORECASE):
+                found_from = True
+            if stripped.endswith(';'):
+                break
 
-                sql_lines.append(stripped)
-            else:
-                if stripped.endswith(';'):
-                    if '...' in stripped:
-                        pos = stripped.find('...')
-                        if pos > 0:
-                            s2 = stripped[:pos].rstrip(';').strip()
-                            if s2:
-                                sql_lines.append(s2)
-                        break
-                    sql_lines.append(stripped)
-                    break
-                elif not stripped.endswith((',', '(')):
-                    break
-        elif not found_select and 'SELECT' in stripped.upper():
-            m = re.search(r'\bSELECT\b', stripped, re.IGNORECASE)
-            if m:
-                before = stripped[:m.start()].strip()
-                if not before or before in ['```sql', '```']:
-                    in_sql_block = True
-                    found_select = True
-                    sql_part = stripped[m.start():]
-                    if '...' in sql_part:
-                        pos = sql_part.find('...')
-                        if pos > 0:
-                            sql_part = sql_part[:pos].strip()
-                    if sql_part:
-                        sql_lines.append(sql_part)
-
-    if not sql_lines:
+    # Require we actually saw FROM
+    if not sql_lines or not found_from:
         return None
 
     final_sql = ' '.join(sql_lines).rstrip(';').rstrip('`').strip()
+
+
+
 
     if '...' in final_sql:
         pos = final_sql.find('...')
@@ -138,11 +136,16 @@ def _extract_sql_from_response(response_text: str) -> Optional[str]:
     if _looks_like_incomplete_multifield(final_sql):
         return None
 
+    # Fix for truncated SQL ending with comma
+    final_sql = final_sql.rstrip(',').strip()
+    
+    # Additional validation to ensure we have a complete SQL statement
     if final_sql.upper().startswith(('SELECT', 'WITH')):
-        return final_sql
-
-    return None
-
+        # Confirm a real table token immediately after FROM
+        if re.search(r'\bFROM\s+([A-Z_][A-Z0-9_]*)\b', final_sql, re.IGNORECASE):
+            return final_sql
+        else:
+            return None
 
 # ------------------------------ Dataclasses ------------------------------
 
@@ -230,6 +233,19 @@ class SQLValidator:
             'TO_DATE', 'TO_CHAR', 'SYSDATE', 'ADD_MONTHS', 'MONTHS_BETWEEN',
             'DECODE', 'NVL', 'NVL2', 'COALESCE', 'CASE', 'TRUNC', 'ROUND'
         }
+
+    def _first_table_after_from(self, sql: str) -> Optional[str]:
+        """
+        Return the first base table name that appears immediately after FROM,
+        ignoring whitespace, aliases, commas, and JOIN keywords.
+        """
+        m = re.search(
+            r'\bFROM\s+([A-Z_][A-Z0-9_]*)(?=\s*(?:AS\b|\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|,|\)|$))',
+            sql,
+            re.IGNORECASE
+        )
+        return m.group(1) if m else None
+
 
     def validate_sql(self, sql: str, query_context: Dict[str, Any]) -> ResponseMetrics:
         reasoning: List[str] = []
@@ -492,6 +508,7 @@ class SQLValidator:
             reasoning.append("Incomplete SQL with ellipsis")
             return 0.0
 
+        # Check for truncated SQL ending with comma
         if sql.endswith(','):
             reasoning.append("Truncated SQL ending with comma")
             return 0.0
@@ -503,11 +520,13 @@ class SQLValidator:
             reasoning.append("Missing SELECT statement")
             return 0.0
 
-        if 'FROM' in sql_upper:
+        # ✅ Correct FROM parsing (uses helper)
+        first_table = self._first_table_after_from(sql)
+        if first_table:
             score += 0.3
-            reasoning.append("Has FROM clause")
+            reasoning.append(f"Has FROM clause with table: {first_table}")
         else:
-            reasoning.append("Missing FROM clause")
+            reasoning.append("Missing or malformed FROM clause")
             return 0.0
 
         if sql.count('(') == sql.count(')'):
@@ -1295,6 +1314,68 @@ ORDER BY
             self.logger.error(f"Local processing failed: {e}")
             return None
 
+    # -------- SQL normalizer for Oracle date patterns --------
+    def _normalize_sql(self, sql: str) -> str:
+        """
+        Normalize common Oracle date patterns while avoiding TRUNC(SYSDATE ...),
+        because downstream lint rejects it.
+
+        Rules:
+        - WHERE/AND <DATE_COL> >= TRUNC(SYSDATE) - N
+            -> WHERE/AND TRUNC(<DATE_COL>) >= SYSDATE - N
+        - WHERE/AND <DATE_COL> >= SYSDATE - N   (leave it, but ensure left side is TRUNC(col))
+            -> WHERE/AND TRUNC(<DATE_COL>) >= SYSDATE - N
+        - BETWEEN variants:
+            WHERE <DATE_COL> BETWEEN (TRUNC(SYSDATE) - N) AND TRUNC(SYSDATE)
+            -> WHERE TRUNC(<DATE_COL>) BETWEEN (SYSDATE - N) AND SYSDATE
+        - If the model already produced TRUNC(SYSDATE) anywhere, rewrite to SYSDATE.
+        """
+        if not sql or not isinstance(sql, str):
+            return sql
+
+        # 0) Strip TRUNC around SYSDATE globally (safest since linter forbids it)
+        sql = re.sub(r'TRUNC\s*\(\s*SYSDATE\s*\)', 'SYSDATE', sql, flags=re.IGNORECASE)
+
+        # 1) >= patterns with explicit TRUNC(SYSDATE) - N (after step 0 it's just SYSDATE - N)
+        def wrap_col_ge_repl(m):
+            kw = m.group(1)          # WHERE/AND
+            col = m.group(2)         # <DATE_COL> like PROD_DATE
+            days = m.group(3)        # N
+            return f"{kw} TRUNC({col}) >= SYSDATE - {days}"
+
+        sql = re.sub(
+            r'\b(WHERE|AND)\s+([A-Z_][A-Z0-9_]*_DATE)\s*>=\s*SYSDATE\s*-\s*(\d+)',
+            wrap_col_ge_repl,
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # 2) BETWEEN SYSDATE - N AND SYSDATE (or had TRUNCs, already removed)
+        def between_repl(m):
+            kw = m.group(1)      # WHERE
+            col = m.group(2)     # <DATE_COL>
+            days = m.group(3)    # N
+            return f"{kw} TRUNC({col}) BETWEEN SYSDATE - {days} AND SYSDATE"
+
+        sql = re.sub(
+            r'\b(WHERE)\s+([A-Z_][A-Z0-9_]*_DATE)\s+BETWEEN\s+SYSDATE\s*-\s*(\d+)\s+AND\s+SYSDATE\b',
+            between_repl,
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # 3) >= TRUNC(SYSDATE) - N case that might still show up (defensive)
+        #    (Step 0 already removed TRUNC(SYSDATE), but keep a safety pass for mixed casing/spacing)
+        sql = re.sub(
+            r'\b(WHERE|AND)\s+([A-Z_][A-Z0-9_]*_DATE)\s*>=\s*TRUNC\s*\(\s*SYSDATE\s*\)\s*-\s*(\d+)',
+            wrap_col_ge_repl,
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        return sql
+
+
     # -------- API/local processing --------
 
     async def _api_processing(self, user_query: str, schema_context: str, classification) -> Optional[str]:
@@ -1324,23 +1405,38 @@ ORDER BY
                 return None
 
             final_sql = _extract_sql_from_response(response.content)
+            if final_sql:
+                final_sql = self._normalize_sql(final_sql)
             if not final_sql:
                 self.logger.warning(f"API did not return valid SQL: {response.content[:200]}...")
                 return None
 
-            # Multi-field post-check: ensure SELECT contains multiple fields if requested
+            # Multi-field post-check: prefer multiple fields but allow dim+aggregate
             if has_multi_fields:
-                sm = re.search(r'SELECT\s+(.*?)\s+FROM', final_sql.upper(), re.IGNORECASE | re.DOTALL)
+                sm = re.search(r'SELECT\s+(.*?)\s+FROM', final_sql, re.IGNORECASE | re.DOTALL)
                 if sm:
                     sel = sm.group(1).strip()
-                    if ',' not in sel:
-                        self.logger.warning(f"API returned single-field SQL for multi-field query: {final_sql}")
-                        return None
+                    has_comma = (',' in sel)
+                    has_dim = re.search(r'\bFLOOR_NAME\b', final_sql, re.IGNORECASE) is not None
+                    has_agg = re.search(r'\b(SUM|AVG|COUNT|MAX|MIN)\s*\(', final_sql, re.IGNORECASE) is not None
+
+                    if not (has_comma or (has_dim and has_agg)):
+                        self.logger.warning(
+                            f"API returned likely single-field SQL for multi-field query: {final_sql}"
+                        )
 
             validity_score = self.sql_validator._assess_sql_validity(final_sql, [])
             if validity_score < 0.3:
-                self.logger.warning(f"API returned low validity SQL (score: {validity_score}): {final_sql}")
-                return None
+                # Soft gate: keep structurally acceptable SQL (has SELECT/FROM and a table)
+                if self.sql_validator._first_table_after_from(final_sql):
+                    self.logger.warning(
+                        f"Low validity score ({validity_score:.2f}) but structurally acceptable; keeping candidate."
+                    )
+                else:
+                    self.logger.warning(
+                        f"Dropping SQL (no table after FROM): {final_sql[:160]}..."
+                    )
+                    return None
 
             self.logger.info(f"API generated SQL: {final_sql}")
             return final_sql
@@ -1387,14 +1483,22 @@ ORDER BY
             sql_response = await asyncio.to_thread(ask_sql_model, dynamic_prompt)
 
             self._local_processing_time = time.time() - local_start
-
             if sql_response and isinstance(sql_response, str):
                 final_sql = _extract_sql_from_response(sql_response)
                 if final_sql:
+                    final_sql = self._normalize_sql(final_sql)  # ← add this line
                     validity_score = self.sql_validator._assess_sql_validity(final_sql, [])
                     if validity_score < 0.3:
-                        self.logger.warning(f"Local model returned low validity SQL (score: {validity_score}): {final_sql}")
-                        return None
+                        if self.sql_validator._first_table_after_from(final_sql):
+                            self.logger.warning(
+                                f"Low validity score ({validity_score:.2f}) but structurally acceptable; keeping candidate."
+                            )
+                        else:
+                            self.logger.warning(
+                                f"Dropping SQL (no table after FROM): {final_sql[:160]}..."
+                            )
+                            return None
+
                     self.logger.info(f"Local Ollama generated SQL: {final_sql[:200]}...")
                     return final_sql
                 else:

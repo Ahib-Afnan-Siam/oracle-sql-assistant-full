@@ -350,8 +350,8 @@ Database Query Results:
 Your response should be direct, comprehensive, and clearly answer what the user is asking about the TNA tasks or CTL code in question.
 """
     else:
-        prompt += """Please provide a detailed analytical report that:
-1. Starts with a clear overview of what the data shows, addressing the user's specific question
+        prompt += """Please provide a detailed analytical business report that:
+1. Starts with a clear executive overview of what the data shows, addressing the user's specific question
 2. Highlights key metrics and their significance (production quantities, defects, efficiency rates, etc.)
 3. Identifies notable patterns, top performers, and areas that may need attention
 4. Compares different floors or categories and points out significant differences
@@ -360,7 +360,21 @@ Your response should be direct, comprehensive, and clearly answer what the user 
 7. Includes specific numbers and percentages to support observations
 8. Concludes with 2-3 key takeaways or recommendations based on the data
 
-Your response should be comprehensive (at least 150-200 words) and formatted as a proper business report with sections.
+Additionally, please include the following in your analysis:
+- Visual Pattern Detection: Analyze the data distribution to identify outliers, trends, or anomalies that would be visually apparent in charts. Look for patterns such as:
+  * Significant variations between categories (e.g., one floor producing much more than others)
+  * Time-based trends (if date information is present)
+  * Correlation patterns between different metrics
+  * Clusters or groupings in the data
+- Statistical Insights: Include relevant statistical measures (averages, ranges, standard deviations) to support your findings
+- Visualization Opportunities: Based on the data structure and patterns you identified, suggest specific chart types that would best represent the data:
+  * Bar charts for comparing categorical data (e.g., production by floor)
+  * Line charts for time series data (e.g., production over time)
+  * Pie charts for showing proportions (e.g., percentage of total production by floor)
+  * Scatter plots for correlation analysis (e.g., efficiency vs. production volume)
+  Mention these visualization opportunities explicitly in a separate section titled "Data Visualization Opportunities"
+
+Structure your response with clear section headers and maintain a professional business report format. Your response should be comprehensive (at least 150-200 words) and formatted as a proper business report with sections.
 """
     
     return prompt

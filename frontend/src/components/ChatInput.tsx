@@ -31,9 +31,9 @@ export default function ChatInput() {
   };
   return (
     <form onSubmit={handleSubmit} className="w-full flex justify-center px-4 pb-6 relative z-20">
-      <div className="w-full max-w-2xl flex items-center gap-3">
+      <div className="w-full max-w-2xl flex flex-col sm:flex-row items-center gap-3">
         {/* make the input a positioned container */}
-        <div className="relative flex-1">
+        <div className="relative flex-1 w-full">
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -66,12 +66,12 @@ export default function ChatInput() {
           </button>
         </div>
 
-        {/* STOP — stays outside the input, won’t overlap */}
+        {/* STOP — sits below input on mobile, beside on larger screens */}
         <button
           type="button"
           onClick={handleStop}
           disabled={!isTyping}
-          className={`px-3 py-2 rounded-lg text-sm transition ${
+          className={`w-full sm:w-auto px-3 py-2 rounded-lg text-sm transition ${
             isTyping
               ? "bg-red-600 text-white hover:bg-red-700"
               : "opacity-30 cursor-not-allowed bg-gray-100 text-gray-400"

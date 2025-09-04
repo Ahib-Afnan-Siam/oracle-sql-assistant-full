@@ -106,7 +106,29 @@ DYNAMIC_ENTITY_PATTERNS = {
         r'\b\d{1,2}[-\s][a-z]{3}[-\s]\d{2,4}\b',
         r'\b[a-z]{3}[-\s]\d{2,4}\b',
         r'\bthis\s+month\b',
-        r'\blast\s+\d+\s+days?\b'
+        r'\blast\s+\d+\s+days?\b',
+        r'\blast\s+day\b',
+        r'\blast\s+week\b',
+        r'\blast\s+month\b'
+    ],
+    'ordering_patterns': [
+        r'\basc\b',
+        r'\bascending\b',
+        r'\bdesc\b',
+        r'\bdescending\b'
+    ],
+    'lowest_patterns': [
+        r'\blowest\b',
+        r'\bmin\b',
+        r'\bsmallest\b',
+        r'\bleast\b'
+    ],
+    'aggregation_patterns': [
+        r'\baverage\b',
+        r'\bavarage\b',  # Typo handling
+        r'\bavg\b',
+        r'\bsum\b',
+        r'\btotal\b'
     ]
 }
 
@@ -135,6 +157,16 @@ INTENT_CLASSIFICATION_PATTERNS = {
         'keywords': ['task', 'tna', 'job', 'po', 'buyer', 'style', 'ctl', 'information'],
         'variations': ['task status', 'job information', 'po status'],
         'table_preference': ['T_TNA_STATUS']
+    },
+    'trend_analysis': {
+        'keywords': ['trend', 'analysis', 'over time', 'monthly', 'weekly'],
+        'variations': ['trend analysis', 'time series', 'historical'],
+        'table_preference': ['T_PROD_DAILY']
+    },
+    'ranking_query': {
+        'keywords': ['lowest', 'highest', 'top', 'bottom', 'rank'],
+        'variations': ['rank by', 'order by', 'sort by'],
+        'table_preference': ['T_PROD_DAILY']
     }
 }
 
@@ -147,6 +179,71 @@ _DAILY_HINT_RX = re.compile(
     r"\bday\b",
     re.IGNORECASE,
 )
+
+def _parse_relative_date_expression(expression: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse relative date expressions like 'last day', 'last 7 days', 'last week' into 
+    appropriate date filters for Oracle SQL.
+    """
+    expression = expression.lower().strip()
+    
+    # Handle "last day" - find the most recent date with data
+    if expression in ['last day', 'yesterday']:
+        return {
+            'type': 'max_date',
+            'table': 'T_PROD_DAILY',
+            'date_column': 'PROD_DATE'
+        }
+    
+    # Handle "last week" - previous 7 days including today
+    if expression == 'last week':
+        return {
+            'type': 'range',
+            'start': "TRUNC(SYSDATE) - 7",
+            'end': "TRUNC(SYSDATE) - 1",
+            'inclusive': True
+        }
+    
+    # Handle "last N days" patterns
+    days_match = re.search(r'last\s+(\d+)\s+days?', expression)
+    if days_match:
+        days = int(days_match.group(1))
+        return {
+            'type': 'range',
+            'start': f"TRUNC(SYSDATE) - {days}",
+            'end': "TRUNC(SYSDATE) - 1",
+            'inclusive': True
+        }
+    
+    # Handle "last month"
+    if expression == 'last month':
+        return {
+            'type': 'range',
+            'start': "TRUNC(SYSDATE, 'MM') - INTERVAL '1' MONTH",
+            'end': "TRUNC(SYSDATE, 'MM') - INTERVAL '1' DAY",
+            'inclusive': True
+        }
+    
+    return None
+
+def _build_date_filter_from_relative_expression(expression: str, date_column: str = 'PROD_DATE') -> Optional[str]:
+    """
+    Build an appropriate Oracle SQL WHERE clause for relative date expressions.
+    """
+    parsed = _parse_relative_date_expression(expression)
+    if not parsed:
+        return None
+    
+    if parsed['type'] == 'max_date':
+        return f"{date_column} = (SELECT MAX({date_column}) FROM {parsed['table']})"
+    
+    if parsed['type'] == 'range':
+        if parsed['inclusive']:
+            return f"{date_column} BETWEEN {parsed['start']} AND {parsed['end']}"
+        else:
+            return f"{date_column} > {parsed['start']} AND {date_column} <= {parsed['end']}"
+    
+    return None
 
 def _bias_tables_for_day(tables: List[str], user_query: str) -> List[str]:
     if not tables:
@@ -191,6 +288,8 @@ def _score_metric_col(col: str, phrase: str) -> int:
     if "dhu" in p and "dhu" in c: score += 8
     if ("defect" in p or "reject" in p) and ("defect" in c or "rej" in c): score += 4
     if ("stain" in p or "dirty" in p) and ("stain" in c or "dirty" in c): score += 6
+    # Handle "average" and "avarage" typos
+    if ("average" in p or "avarage" in p) and ("avg" in c): score += 7
     return score
 
 def _choose_metrics_for_phrases(phrases: list[str], table: str, options: dict,
@@ -238,8 +337,57 @@ def _augment_plan_with_metrics(uq: str, plan: dict, options: dict) -> dict:
         if "limit" in plan and not re.search(r"\b(top\s*\d+|top|max|min|highest|lowest|first|last)\b", uq or "", re.I):
             plan.pop("limit", None)
 
-    return plan
+    # Add ordering information if present
+    entities = dynamic_entity_recognition(uq)
+    if entities.get('ordering') or entities.get('extremes'):
+        # Initialize order_by if not present
+        if "order_by" not in plan:
+            plan["order_by"] = []
+        
+        # Determine ordering direction
+        direction = "DESC"  # Default to DESC
+        
+        # Check for explicit ordering direction
+        if entities.get('ordering'):
+            ordering = entities['ordering'][0].upper()
+            if ordering in ['ASC', 'ASCENDING']:
+                direction = "ASC"
+            elif ordering in ['DESC', 'DESCENDING']:
+                direction = "DESC"
+        
+        # If we have extremes like 'lowest', adjust direction
+        if entities.get('extremes'):
+            extremes = [e.upper() for e in entities['extremes']]
+            if any(e in ['LOWEST', 'MIN', 'SMALLEST', 'LEAST'] for e in extremes):
+                direction = "ASC"
+            elif any(e in ['HIGHEST', 'MAX', 'BIGGEST', 'MOST'] for e in extremes):
+                direction = "DESC"
+        
+        # Add ordering to plan if we have metrics
+        if picks and plan.get("order_by") is not None:
+            # Use the first metric for ordering if not already specified
+            if not plan["order_by"]:
+                plan["order_by"].append({"key": picks[0], "dir": direction})
+    
+    # Handle relative dates
+    if entities.get('relative_dates'):
+        # Import the date filter function from query_engine
+        from app.query_engine import _build_date_filter_from_relative_expression
+        
+        # Get the date column for this table
+        date_col = plan.get("date_col", "PROD_DATE")  # Default to PROD_DATE
+        
+        # Build date filter for the first relative date expression found
+        if entities['relative_dates']:
+            rel_date_expr = entities['relative_dates'][0]
+            date_filter = _build_date_filter_from_relative_expression(rel_date_expr, date_col)
+            if date_filter:
+                # Add to filters if not already present
+                if "filters" not in plan:
+                    plan["filters"] = []
+                plan["filters"].append(date_filter)
 
+    return plan
 
 def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
     """Enhanced entity recognition with pattern matching"""
@@ -250,7 +398,10 @@ def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
         'dates': [],
         'ctl_codes': [],
         'aggregations': [],
-        'metrics': []
+        'metrics': [],
+        'ordering': None,  # New field for ordering direction
+        'extremes': [],  # New field for min/max indicators
+        'relative_dates': []
     }
     
     query_lower = user_query.lower()
@@ -268,9 +419,21 @@ def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
     
     # Date pattern recognition
     for pattern in DYNAMIC_ENTITY_PATTERNS['date_patterns']:
-        matches = re.finditer(pattern, user_query)
-        for match in matches:
-            entities['dates'].append(match.group(0))
+        matches = re.findall(pattern, user_query, re.IGNORECASE)
+        entities['dates'].extend(matches)
+    
+    # Special handling for relative date expressions
+    relative_date_patterns = [
+        r'\blast\s+day\b',
+        r'\blast\s+week\b',
+        r'\blast\s+month\b',
+        r'\blast\s+\d+\s+days?\b',
+        r'\byesterday\b'
+    ]
+    
+    for pattern in relative_date_patterns:
+        matches = re.findall(pattern, user_query, re.IGNORECASE)
+        entities['relative_dates'].extend(matches)
     
     # CTL code recognition
     ctl_matches = re.finditer(r'\bCTL-\d{2}-\d{5,6}\b', user_query)
@@ -288,6 +451,18 @@ def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
     for metric in metric_patterns:
         if metric in query_lower:
             entities['metrics'].append(metric)
+    
+    # Ordering direction detection
+    if re.search(r'\basc\b|\bascending\b', query_lower):
+        entities['ordering'] = 'ASC'
+    elif re.search(r'\bdesc\b|\bdescending\b', query_lower):
+        entities['ordering'] = 'DESC'
+    
+    # Extreme value detection (min/max)
+    if re.search(r'\blowest\b|\bmin\b|\bsmallest\b|\bleast\b', query_lower):
+        entities['extremes'].append('min')
+    if re.search(r'\bhighest\b|\bmax\b|\bbiggest\b|\btop\b|\bmost\b', query_lower):
+        entities['extremes'].append('max')
     
     return entities
 

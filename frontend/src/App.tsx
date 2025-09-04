@@ -11,7 +11,10 @@ function App() {
   return (
     <div className="relative w-full h-full">
       <div className="flex h-full w-full relative z-10">
-        <Sidebar />
+        {/* Hide sidebar on mobile devices */}
+        <div className="hidden md:block">
+          <Sidebar />
+        </div>
         <div className="flex-1 flex flex-col bg-transparent bg-none">
           <div className="flex-1 flex flex-col overflow-y-auto">
             <AnimatePresence mode="wait">

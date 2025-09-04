@@ -10,7 +10,7 @@ export default function Sidebar() {
   };
 
   return (
-    <aside className="group w-[260px] h-screen bg-white/20 backdrop-blur-sm shadow-none hover:backdrop-blur-xl hover:shadow-xl border-r border-white/30 p-4 flex flex-col transition-all duration-700 ease-in-out">
+    <aside className="group w-64 md:w-[260px] h-screen bg-white/20 backdrop-blur-sm shadow-none hover:backdrop-blur-xl hover:shadow-xl border-r border-white/30 p-4 flex flex-col transition-all duration-700 ease-in-out overflow-y-auto">
       <button
         onClick={clearMessages}
         className="w-full bg-white/60 border border-white/40 py-2 rounded-xl text-sm font-semibold text-gray-800 shadow transition-all duration-300 ease-in-out

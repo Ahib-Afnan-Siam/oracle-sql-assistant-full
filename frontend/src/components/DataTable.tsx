@@ -107,10 +107,10 @@ export default function DataTable({ data }: { data: TableData }) {
   const columns = headers;
   const rows = sorted;
 
-  const TableCore = (
+  return (
     <div className={`border rounded-xl bg-white/95 shadow-sm ${full ? "p-4" : "p-3"}`}>
       {/* Toolbar with existing controls + Visualize button */}
-      <div className="flex justify-between items-center mb-4">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4">
         {/* Left cluster: existing toolbar controls */}
         <div className="flex flex-wrap items-center gap-2">
           <div className="text-xs text-gray-600 mr-2">
@@ -118,7 +118,7 @@ export default function DataTable({ data }: { data: TableData }) {
           </div>
 
           {/* Search */}
-          <div className="relative">
+          <div className="relative w-full sm:w-auto">
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
             <input
               value={query}
@@ -127,7 +127,7 @@ export default function DataTable({ data }: { data: TableData }) {
                 setPage(1);
               }}
               placeholder="Search…"
-              className="pl-8 pr-3 py-1.5 text-sm border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
+              className="pl-8 pr-3 py-1.5 text-sm border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 w-full sm:w-32 md:w-40"
             />
           </div>
 
@@ -135,7 +135,7 @@ export default function DataTable({ data }: { data: TableData }) {
           <select
             value={pageSize}
             onChange={(e) => {
-              setPageSize(Number(e.target.value));
+              setPageSize(Number(e.value));
               setPage(1);
             }}
             className="text-sm border rounded-lg py-1.5 px-2"
@@ -148,48 +148,46 @@ export default function DataTable({ data }: { data: TableData }) {
             ))}
           </select>
 
-          {/* Copy / CSV / Expand */}
-          <button
-            onClick={() => navigator.clipboard.writeText(csvAll)}
-            className="text-xs px-2 py-1.5 rounded-lg border bg-white hover:bg-gray-50 flex items-center gap-1"
-            title="Copy CSV to clipboard"
-          >
-            <Copy size={14} /> Copy
-          </button>
-          <a
-            href={`data:text/csv;charset=utf-8,${encodeURIComponent(csvAll)}`}
-            download="table.csv"
-            className="text-xs px-2 py-1.5 rounded-lg border bg-white hover:bg-gray-50 flex items-center gap-1"
-            title="Download CSV"
-          >
-            <Download size={14} /> CSV
-          </a>
-          <button
-            onClick={() => setFull((v) => !v)}
-            className="text-xs px-2 py-1.5 rounded-lg border bg-white hover:bg-gray-50 flex items-center gap-1"
-            title={full ? "Exit fullscreen" : "Expand"}
-          >
-            {full ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-            {full ? "Close" : "Expand"}
-          </button>
-        </div>
-        <div className="flex justify-between items-center mb-4">
-          {/* Left cluster: existing toolbar controls */}
-          <div className="flex flex-wrap items-center gap-2">
-            {/* ... existing code ... */}
+          {/* Copy / CSV / Expand - stacked vertically on mobile */}
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={() => navigator.clipboard.writeText(csvAll)}
+              className="text-xs px-2 py-1.5 rounded-lg border bg-white hover:bg-gray-50 flex items-center gap-1"
+              title="Copy CSV to clipboard"
+            >
+              <Copy size={14} /> <span className="hidden sm:inline">Copy</span>
+            </button>
+            <a
+              href={`data:text/csv;charset=utf-8,${encodeURIComponent(csvAll)}`}
+              download="table.csv"
+              className="text-xs px-2 py-1.5 rounded-lg border bg-white hover:bg-gray-50 flex items-center gap-1"
+              title="Download CSV"
+            >
+              <Download size={14} /> <span className="hidden sm:inline">CSV</span>
+            </a>
+            <button
+              onClick={() => setFull((v) => !v)}
+              className="text-xs px-2 py-1.5 rounded-lg border bg-white hover:bg-gray-50 flex items-center gap-1"
+              title={full ? "Exit fullscreen" : "Expand"}
+            >
+              {full ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+              <span className="hidden sm:inline">{full ? "Close" : "Expand"}</span>
+            </button>
           </div>
+        </div>
+        <div className="flex justify-between items-center w-full md:w-auto">
           {/* Right: NEW Visualize button */}
           {!showVisualization ? (
             <button
               onClick={() => setShowVisualization(true)}
-              className="px-3 py-1 bg-[#3b0764] text-white rounded hover:bg-[#4c0a85] text-sm"
+              className="px-3 py-1 bg-[#3b0764] text-white rounded hover:bg-[#4c0a85] text-sm w-full sm:w-auto"
             >
               Visualize Data
             </button>
           ) : (
             <button
               onClick={() => setShowVisualization(false)}
-              className="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm"
+              className="px-3 py-1 bg-gray-700 text-white rounded hover:bg-gray-800 text-sm w-full sm:w-auto"
             >
               Back to Table
             </button>
@@ -199,135 +197,129 @@ export default function DataTable({ data }: { data: TableData }) {
 
       {/* MAIN AREA: conditional render (Visualization vs Table) */}
       {showVisualization ? (
-        <div>
-          <div>Visualization Component Should Appear Here</div>
-          <DataVisualization
-            columns={columns as string[]}
-            rows={rows as (string | number | null)[][]}
-            onBackToTable={() => setShowVisualization(false)}
-          />
-        </div>
+        <DataVisualization
+          columns={columns}
+          rows={rows}
+          onBackToTable={() => setShowVisualization(false)}
+        />
       ) : (
-        <>
-          {/* Table container */}
-          <div className={`${full ? "max-h-[70vh]" : "max-h-72"} overflow-auto rounded-lg border`}>
-            {/* Changed table-fixed -> table-auto to let columns size by content */}
-            <table className="table-auto w-full border-collapse">
-              <thead className="bg-gray-100 sticky top-0 z-10">
-                <tr>
-                  {headers.map((h, i) => (
-                    <th
-                      key={i}
-                      className={`px-3 py-2 text-xs font-semibold text-gray-700 border-b border-gray-200 ${
-                        i === 0 ? "sticky left-0 bg-gray-100 z-10" : ""
-                      } ${numericCols[i] ? "text-right" : "text-left"} ${
-                        String(h ?? "").length > 20 ? "max-w-[180px] overflow-hidden text-ellipsis" : ""
-                      }`}
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead>
+              <tr>
+                {headers.map((h, idx) => (
+                  <th
+                    key={idx}
+                    onClick={() => handleHeaderClick(idx)}
+                    className="px-4 py-2 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider cursor-pointer hover:bg-gray-50"
+                  >
+                    <div className="flex items-center">
+                      {h}
+                      <ArrowUpDown className="ml-1 h-3 w-3" />
+                    </div>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200">
+              {pageRows.map((row, rowIdx) => (
+                <tr key={rowIdx} className={rowIdx % 2 === 0 ? "bg-white" : "bg-gray-50"}>
+                  {row.map((cell, cellIdx) => (
+                    <td
+                      key={cellIdx}
+                      className="px-4 py-2 whitespace-nowrap text-sm font-medium text-gray-700"
                     >
-                      <button
-                        onClick={() => handleHeaderClick(i)}
-                        className="inline-flex items-center gap-1 hover:opacity-80"
-                        title="Sort"
-                      >
-                        <span>{h}</span>
-                        <ArrowUpDown className="h-3.5 w-3.5 text-gray-400" />
-                        {sort?.col === i ? (
-                          <span className="text-[10px] text-gray-500">{sort.dir === "asc" ? "▲" : "▼"}</span>
-                        ) : null}
-                      </button>
-                    </th>
+                      {formatCell(cell, cellIdx)}
+                    </td>
                   ))}
                 </tr>
-              </thead>
-              <tbody>
-                {pageRows.map((row, r) => (
-                  <tr key={r} className={r % 2 === 0 ? "bg-white" : "bg-gray-50 hover:bg-gray-100"}>
-                    {row.map((cell, c) => {
-                      const long = String(cell ?? "").length > 30;
-                      return (
-                        <td
-                          key={c}
-                          className={`px-3 py-2 text-sm border-b border-gray-200 align-top min-w-[100px] ${
-                            c === 0 ? "sticky left-0 bg-inherit z-0" : ""
-                          } ${numericCols[c] ? "text-right tabular-nums" : "text-left"} ${
-                            long ? "max-w-[200px] overflow-hidden text-ellipsis whitespace-nowrap" : ""
-                          }`}
-                          title={String(cell ?? "")}
-                        >
-                          {formatCell(cell, c)}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                ))}
-                {pageRows.length === 0 && (
-                  <tr>
-                    <td className="px-3 py-6 text-sm text-gray-500 text-center" colSpan={headers.length}>
-                      No rows.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </table>
 
           {/* Pagination */}
-          <div className="flex items-center justify-between mt-3 text-xs text-gray-600">
-            <div>
-              Showing{" "}
-              <strong>
-                {sorted.length === 0 ? 0 : sliceStart + 1}-{Math.min(sorted.length, sliceStart + pageSize)}
-              </strong>{" "}
-              of <strong>{sorted.length}</strong>
+          <div className="flex items-center justify-between border-t border-gray-200 bg-white px-4 py-3 sm:px-6">
+            <div className="flex flex-1 justify-between sm:hidden">
+              <button
+                onClick={() => setPage(p => Math.max(1, p - 1))}
+                disabled={currentPage <= 1}
+                className="relative inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                Previous
+              </button>
+              <button
+                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                disabled={currentPage >= totalPages}
+                className="relative ml-3 inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                Next
+              </button>
             </div>
-            <div className="flex items-center gap-1">
-              <button
-                className="px-2 py-1 rounded border disabled:opacity-40"
-                onClick={() => setPage(1)}
-                disabled={currentPage <= 1}
-              >
-                ⏮
-              </button>
-              <button
-                className="px-2 py-1 rounded border disabled:opacity-40"
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                disabled={currentPage <= 1}
-              >
-                ◀
-              </button>
-              <span className="px-2">
-                Page <strong>{currentPage}</strong> / {totalPages}
-              </span>
-              <button
-                className="px-2 py-1 rounded border disabled:opacity-40"
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                disabled={currentPage >= totalPages}
-              >
-                ▶
-              </button>
-              <button
-                className="px-2 py-1 rounded border disabled:opacity-40"
-                onClick={() => setPage(totalPages)}
-                disabled={currentPage >= totalPages}
-              >
-                ⏭
-              </button>
+            <div className="hidden sm:flex sm:flex-1 sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm text-gray-700">
+                  Showing <span className="font-medium">{sliceStart + 1}</span> to{" "}
+                  <span className="font-medium">{sliceStart + pageRows.length}</span> of{" "}
+                  <span className="font-medium">{sorted.length}</span> results
+                </p>
+              </div>
+              <div>
+                <nav
+                  className="isolate inline-flex -space-x-px rounded-md shadow-sm"
+                  aria-label="Pagination"
+                >
+                  <button
+                    onClick={() => setPage(p => Math.max(1, p - 1))}
+                    disabled={currentPage <= 1}
+                    className="relative inline-flex items-center rounded-l-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0"
+                  >
+                    Previous
+                  </button>
+                  {[...Array(totalPages)].map((_, i) => {
+                    const pageNum = i + 1;
+                    if (
+                      pageNum === 1 ||
+                      pageNum === totalPages ||
+                      (pageNum >= currentPage - 1 && pageNum <= currentPage + 1)
+                    ) {
+                      return (
+                        <button
+                          key={pageNum}
+                          onClick={() => setPage(pageNum)}
+                          className={`relative inline-flex items-center px-4 py-2 text-sm font-semibold ${
+                            currentPage === pageNum
+                              ? "z-10 bg-[#3b0764] text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3b0764]"
+                              : "text-gray-900 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:outline-offset-0"
+                          }`}
+                        >
+                          {pageNum}
+                        </button>
+                      );
+                    } else if (pageNum === currentPage - 2 || pageNum === currentPage + 2) {
+                      return (
+                        <span
+                          key={pageNum}
+                          className="relative inline-flex items-center px-4 py-2 text-sm font-semibold text-gray-700 ring-1 ring-inset ring-gray-300 focus:outline-offset-0"
+                        >
+                          ...
+                        </span>
+                      );
+                    }
+                    return null;
+                  })}
+                  <button
+                    onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                    disabled={currentPage >= totalPages}
+                    className="relative inline-flex items-center rounded-r-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0"
+                  >
+                    Next
+                  </button>
+                </nav>
+              </div>
             </div>
           </div>
-        </>
+        </div>
       )}
     </div>
   );
-
-  // Fullscreen overlay when expanded
-  if (full) {
-    return (
-      <>
-        <div className="fixed inset-0 bg-black/40 z-40" onClick={() => setFull(false)} />
-        <div className="fixed inset-4 md:inset-10 z-50">{TableCore}</div>
-      </>
-    );
-  }
-
-  return TableCore;
 }
