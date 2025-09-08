@@ -11,9 +11,10 @@ from app.query_engine import _MONTH_ALIASES
 from app.vector_store_chroma import hybrid_schema_value_search
 from app.db_connector import connect_to_source
 from app.ollama_llm import ask_sql_planner
-from app.config import SUMMARY_ENGINE, SUMMARY_MAX_ROWS, SUMMARY_CHAR_BUDGET
+from app.config import SUMMARY_ENGINE, SUMMARY_MAX_ROWS, SUMMARY_CHAR_BUDGET, SUMMARIZATION_CONFIG
 from app.query_engine import _get_table_colmeta
 from functools import lru_cache
+from app.summarizer import summarize_results_async
 
 # Reuse the deterministic SQL toolbox + summarizer you already have
 from app.query_engine import (
@@ -106,7 +107,29 @@ DYNAMIC_ENTITY_PATTERNS = {
         r'\b\d{1,2}[-\s][a-z]{3}[-\s]\d{2,4}\b',
         r'\b[a-z]{3}[-\s]\d{2,4}\b',
         r'\bthis\s+month\b',
-        r'\blast\s+\d+\s+days?\b'
+        r'\blast\s+\d+\s+days?\b',
+        r'\blast\s+day\b',
+        r'\blast\s+week\b',
+        r'\blast\s+month\b'
+    ],
+    'ordering_patterns': [
+        r'\basc\b',
+        r'\bascending\b',
+        r'\bdesc\b',
+        r'\bdescending\b'
+    ],
+    'lowest_patterns': [
+        r'\blowest\b',
+        r'\bmin\b',
+        r'\bsmallest\b',
+        r'\bleast\b'
+    ],
+    'aggregation_patterns': [
+        r'\baverage\b',
+        r'\bavarage\b',  # Typo handling
+        r'\bavg\b',
+        r'\bsum\b',
+        r'\btotal\b'
     ]
 }
 
@@ -135,6 +158,16 @@ INTENT_CLASSIFICATION_PATTERNS = {
         'keywords': ['task', 'tna', 'job', 'po', 'buyer', 'style', 'ctl', 'information'],
         'variations': ['task status', 'job information', 'po status'],
         'table_preference': ['T_TNA_STATUS']
+    },
+    'trend_analysis': {
+        'keywords': ['trend', 'analysis', 'over time', 'monthly', 'weekly'],
+        'variations': ['trend analysis', 'time series', 'historical'],
+        'table_preference': ['T_PROD_DAILY']
+    },
+    'ranking_query': {
+        'keywords': ['lowest', 'highest', 'top', 'bottom', 'rank'],
+        'variations': ['rank by', 'order by', 'sort by'],
+        'table_preference': ['T_PROD_DAILY']
     }
 }
 
@@ -147,6 +180,71 @@ _DAILY_HINT_RX = re.compile(
     r"\bday\b",
     re.IGNORECASE,
 )
+
+def _parse_relative_date_expression(expression: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse relative date expressions like 'last day', 'last 7 days', 'last week' into 
+    appropriate date filters for Oracle SQL.
+    """
+    expression = expression.lower().strip()
+    
+    # Handle "last day" - find the most recent date with data
+    if expression in ['last day', 'yesterday']:
+        return {
+            'type': 'max_date',
+            'table': 'T_PROD_DAILY',
+            'date_column': 'PROD_DATE'
+        }
+    
+    # Handle "last week" - previous 7 days including today
+    if expression == 'last week':
+        return {
+            'type': 'range',
+            'start': "TRUNC(SYSDATE) - 7",
+            'end': "TRUNC(SYSDATE) - 1",
+            'inclusive': True
+        }
+    
+    # Handle "last N days" patterns
+    days_match = re.search(r'last\s+(\d+)\s+days?', expression)
+    if days_match:
+        days = int(days_match.group(1))
+        return {
+            'type': 'range',
+            'start': f"TRUNC(SYSDATE) - {days}",
+            'end': "TRUNC(SYSDATE) - 1",
+            'inclusive': True
+        }
+    
+    # Handle "last month"
+    if expression == 'last month':
+        return {
+            'type': 'range',
+            'start': "TRUNC(SYSDATE, 'MM') - INTERVAL '1' MONTH",
+            'end': "TRUNC(SYSDATE, 'MM') - INTERVAL '1' DAY",
+            'inclusive': True
+        }
+    
+    return None
+
+def _build_date_filter_from_relative_expression(expression: str, date_column: str = 'PROD_DATE') -> Optional[str]:
+    """
+    Build an appropriate Oracle SQL WHERE clause for relative date expressions.
+    """
+    parsed = _parse_relative_date_expression(expression)
+    if not parsed:
+        return None
+    
+    if parsed['type'] == 'max_date':
+        return f"{date_column} = (SELECT MAX({date_column}) FROM {parsed['table']})"
+    
+    if parsed['type'] == 'range':
+        if parsed['inclusive']:
+            return f"{date_column} BETWEEN {parsed['start']} AND {parsed['end']}"
+        else:
+            return f"{date_column} > {parsed['start']} AND {date_column} <= {parsed['end']}"
+    
+    return None
 
 def _bias_tables_for_day(tables: List[str], user_query: str) -> List[str]:
     if not tables:
@@ -191,6 +289,8 @@ def _score_metric_col(col: str, phrase: str) -> int:
     if "dhu" in p and "dhu" in c: score += 8
     if ("defect" in p or "reject" in p) and ("defect" in c or "rej" in c): score += 4
     if ("stain" in p or "dirty" in p) and ("stain" in c or "dirty" in c): score += 6
+    # Handle "average" and "avarage" typos
+    if ("average" in p or "avarage" in p) and ("avg" in c): score += 7
     return score
 
 def _choose_metrics_for_phrases(phrases: list[str], table: str, options: dict,
@@ -238,8 +338,57 @@ def _augment_plan_with_metrics(uq: str, plan: dict, options: dict) -> dict:
         if "limit" in plan and not re.search(r"\b(top\s*\d+|top|max|min|highest|lowest|first|last)\b", uq or "", re.I):
             plan.pop("limit", None)
 
-    return plan
+    # Add ordering information if present
+    entities = dynamic_entity_recognition(uq)
+    if entities.get('ordering') or entities.get('extremes'):
+        # Initialize order_by if not present
+        if "order_by" not in plan:
+            plan["order_by"] = []
+        
+        # Determine ordering direction
+        direction = "DESC"  # Default to DESC
+        
+        # Check for explicit ordering direction
+        if entities.get('ordering'):
+            ordering = entities['ordering'][0].upper()
+            if ordering in ['ASC', 'ASCENDING']:
+                direction = "ASC"
+            elif ordering in ['DESC', 'DESCENDING']:
+                direction = "DESC"
+        
+        # If we have extremes like 'lowest', adjust direction
+        if entities.get('extremes'):
+            extremes = [e.upper() for e in entities['extremes']]
+            if any(e in ['LOWEST', 'MIN', 'SMALLEST', 'LEAST'] for e in extremes):
+                direction = "ASC"
+            elif any(e in ['HIGHEST', 'MAX', 'BIGGEST', 'MOST'] for e in extremes):
+                direction = "DESC"
+        
+        # Add ordering to plan if we have metrics
+        if picks and plan.get("order_by") is not None:
+            # Use the first metric for ordering if not already specified
+            if not plan["order_by"]:
+                plan["order_by"].append({"key": picks[0], "dir": direction})
+    
+    # Handle relative dates
+    if entities.get('relative_dates'):
+        # Import the date filter function from query_engine
+        from app.query_engine import _build_date_filter_from_relative_expression
+        
+        # Get the date column for this table
+        date_col = plan.get("date_col", "PROD_DATE")  # Default to PROD_DATE
+        
+        # Build date filter for the first relative date expression found
+        if entities['relative_dates']:
+            rel_date_expr = entities['relative_dates'][0]
+            date_filter = _build_date_filter_from_relative_expression(rel_date_expr, date_col)
+            if date_filter:
+                # Add to filters if not already present
+                if "filters" not in plan:
+                    plan["filters"] = []
+                plan["filters"].append(date_filter)
 
+    return plan
 
 def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
     """Enhanced entity recognition with pattern matching"""
@@ -250,7 +399,10 @@ def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
         'dates': [],
         'ctl_codes': [],
         'aggregations': [],
-        'metrics': []
+        'metrics': [],
+        'ordering': None,  # New field for ordering direction
+        'extremes': [],  # New field for min/max indicators
+        'relative_dates': []
     }
     
     query_lower = user_query.lower()
@@ -268,9 +420,21 @@ def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
     
     # Date pattern recognition
     for pattern in DYNAMIC_ENTITY_PATTERNS['date_patterns']:
-        matches = re.finditer(pattern, user_query)
-        for match in matches:
-            entities['dates'].append(match.group(0))
+        matches = re.findall(pattern, user_query, re.IGNORECASE)
+        entities['dates'].extend(matches)
+    
+    # Special handling for relative date expressions
+    relative_date_patterns = [
+        r'\blast\s+day\b',
+        r'\blast\s+week\b',
+        r'\blast\s+month\b',
+        r'\blast\s+\d+\s+days?\b',
+        r'\byesterday\b'
+    ]
+    
+    for pattern in relative_date_patterns:
+        matches = re.findall(pattern, user_query, re.IGNORECASE)
+        entities['relative_dates'].extend(matches)
     
     # CTL code recognition
     ctl_matches = re.finditer(r'\bCTL-\d{2}-\d{5,6}\b', user_query)
@@ -288,6 +452,18 @@ def dynamic_entity_recognition(user_query: str) -> Dict[str, Any]:
     for metric in metric_patterns:
         if metric in query_lower:
             entities['metrics'].append(metric)
+    
+    # Ordering direction detection
+    if re.search(r'\basc\b|\bascending\b', query_lower):
+        entities['ordering'] = 'ASC'
+    elif re.search(r'\bdesc\b|\bdescending\b', query_lower):
+        entities['ordering'] = 'DESC'
+    
+    # Extreme value detection (min/max)
+    if re.search(r'\blowest\b|\bmin\b|\bsmallest\b|\bleast\b', query_lower):
+        entities['extremes'].append('min')
+    if re.search(r'\bhighest\b|\bmax\b|\bbiggest\b|\btop\b|\bmost\b', query_lower):
+        entities['extremes'].append('max')
     
     return entities
 
@@ -2099,7 +2275,6 @@ def _validate_tochar_dim(dim_obj: dict, table: str, options: Dict[str, Any]) -> 
     date_cols = set(options.get("date_columns", {}).get(table, []))
     return col in date_cols
 
-
 def _validate_plan(plan: Dict[str, Any], options: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     Strict plan validator. Every identifier must exist in options.
@@ -2161,7 +2336,37 @@ def _validate_plan(plan: Dict[str, Any], options: Dict[str, Any]) -> Tuple[bool,
     dims = plan.get("dims") or []
     metrics = plan.get("metrics") or []
     date_col = plan.get("date_col", None)
-    filters = plan.get("filters") or []
+
+    # ---------- Filters normalization & basic structure checks ----------
+    # Make sure filters is always a list[dict]. Accept dict -> [dict], try JSON if string.
+    filters_raw = plan.get("filters", [])
+    if isinstance(filters_raw, list):
+        filters = filters_raw
+    elif isinstance(filters_raw, dict):
+        filters = [filters_raw]
+    elif isinstance(filters_raw, str):
+        # Attempt to parse a JSON string form
+        try:
+            parsed = json.loads(filters_raw)
+            if isinstance(parsed, dict):
+                filters = [parsed]
+            elif isinstance(parsed, list):
+                filters = parsed
+            else:
+                return False, "Filters must be a list of dictionaries"
+        except Exception:
+            return False, "Filters must be a list of dictionaries"
+    elif filters_raw in (None, ""):
+        filters = []
+    else:
+        return False, "Filters must be a list of dictionaries"
+
+    # Every filter item must be a dict with at least a 'col' key
+    for f in filters:
+        if not isinstance(f, dict):
+            return False, "Invalid filter format"
+        if "col" not in f:
+            return False, "Invalid filter format"
 
     # ---- Dimensions: only columns of the base table or TO_CHAR(<date_col>,'FMT') ----
     for d in dims:
@@ -2200,7 +2405,7 @@ def _validate_plan(plan: Dict[str, Any], options: Dict[str, Any]) -> Tuple[bool,
             return False, "invalid op"
         if op == "BETWEEN" and not (isinstance(f.get("val"), list) and len(f["val"]) == 2):
             return False, "invalid op"
-        
+
         okcol = False
         if isinstance(c, str):
             # plain column on base or second table
@@ -2732,6 +2937,10 @@ def _generic_browse_fallback(user_query: str, selected_db: str, options: Dict[st
     If the planner fails, show *something sensible*:
     pick the best-matching table from options and return SELECT * ... FETCH FIRST 200.
     """
+    # ADD THESE TWO LINES
+    visualization_requested = has_visualization_intent(user_query)
+    hybrid_result = None
+    
     tables = options.get("tables") or []
     if not tables:
         return {
@@ -2776,7 +2985,7 @@ def _generic_browse_fallback(user_query: str, selected_db: str, options: Dict[st
             "summary": summary if display_mode in ["summary","both"] else "",
             "sql": sql,
             "display_mode": display_mode,
-            "visualization": visualization_requested,
+            "visualization": visualization_requested,   # now defined
             "results": {
                 "columns": (list(rows[0].keys()) if rows else []),
                 "rows": [list(r.values()) for r in rows] if rows else [],
@@ -2784,14 +2993,12 @@ def _generic_browse_fallback(user_query: str, selected_db: str, options: Dict[st
             },
             "schema_context": schema_chunks,
             "schema_context_ids": schema_context_ids,
-            "hybrid_metadata": hybrid_result.get("hybrid_metadata") if hybrid_result else None,
+            "hybrid_metadata": None,  # remove reference to out-of-scope variable
         }
     except Exception as e:
         logger.error(f"[Fallback] Oracle error: {e}")
         return {"status": "error", "message": f"Oracle query failed: {str(e)}", "sql": sql}
-
-# ... existing code ...
-
+        
 # Add this new function after existing functions but before answer()
 def generate_natural_language_summary(
     user_query: str,
@@ -2849,14 +3056,14 @@ Please provide a response that directly answers the user's question in natural, 
             
             # This is a synchronous version that handles async internally
             messages = [{"role": "user", "content": prompt}]
-            model = "deepseek/deepseek-chat"  # Use DeepSeek for detailed responses
-            
+            model = "deepseek/deepseek-chat-v3.1:free"  # Changed from "deepseek/deepseek-chat"
             # Create the request payload
+            max_tokens = SUMMARIZATION_CONFIG.get("api_max_tokens", 500)
             payload = {
                 "model": model,
                 "messages": messages,
                 "temperature": 0.3,
-                "max_tokens": 500
+                "max_tokens": max_tokens
             }
             
             # Use the OpenRouter client's HTTP request directly
@@ -2880,22 +3087,22 @@ Please provide a response that directly answers the user's question in natural, 
 # Public API
 # ---------------------------
 async def answer(
-    user_query: str, 
+    user_query: str,
     selected_db: str,
     session_id: Optional[str] = None,
     client_ip: Optional[str] = None,
-    user_agent: Optional[str] = None
+    user_agent: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main RAG orchestrator with hybrid AI processing and comprehensive training data collection.
-    
+
     Args:
         user_query: The user's natural language query
         selected_db: Database to query against
         session_id: Session identifier for training data collection
         client_ip: Client IP address for training data collection
         user_agent: User agent string for training data collection
-        
+
     Returns:
         Dictionary with query results and metadata
     """
@@ -2903,57 +3110,86 @@ async def answer(
     if not uq:
         return {"status": "error", "message": "Empty query."}
 
+    # Detect trend analysis intent (used to force a summary even if UI mode = table)
+    trend_intent = bool(re.search(r"\btrend\s+analysis\b", uq, re.IGNORECASE))
+
     # Enhanced query analysis for dynamic processing
     enhanced_analysis = analyze_enhanced_query(uq)
-    logger.info(f"[RAG] Enhanced analysis: {enhanced_analysis['intent']} ({enhanced_analysis['intent_confidence']:.2f})")
- 
+    logger.info(
+        f"[RAG] Enhanced analysis: {enhanced_analysis['intent']} "
+        f"({enhanced_analysis['intent_confidence']:.2f})"
+    )
     visualization_requested = has_visualization_intent(user_query)
 
     # Enhanced intent-based routing - use enhanced analysis before vector search
-    if enhanced_analysis['intent'] == 'employee_lookup':
+    if enhanced_analysis["intent"] == "employee_lookup":
         logger.info("[RAG] Routing to employee lookup based on enhanced analysis")
         return _enhanced_employee_lookup(uq, selected_db, enhanced_analysis)
+
     # NEW: TNA/task routing
-    if enhanced_analysis['intent'] in ('tna_task_query', 'tna_task_data'):
+    if enhanced_analysis["intent"] in ("tna_task_query", "tna_task_data"):
         logger.info("[RAG] Routing to TNA task query based on enhanced analysis")
         return _enhanced_tna_task_lookup(uq, selected_db, enhanced_analysis)
 
     # 0) Fast paths -------------------------------------------------------------
     # 0.a) Raw SELECT passthrough (validated)
-    if re.match(r'(?is)^\s*select\b', uq):
+    if re.match(r"(?is)^\s*select\b", uq):
         # Retrieve schema context for fast path
         results = _search_schema(user_query, selected_db, top_k=12)
         schema_chunks = [r.get("document") for r in results] if results else []
         schema_context_ids = _extract_context_ids(results)
-        
         sql = normalize_dates(uq.rstrip(";"))
         try:
             enforce_predicate_type_compat(sql, selected_db)
             if not is_valid_sql(sql, selected_db):
                 return {"status": "error", "message": "Invalid SQL", "sql": sql}
+
             rows = run_sql(sql, selected_db)
             display_mode = determine_display_mode(user_query, rows)
-            rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
-            python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
-            try:
-                from decimal import Decimal
-                summary = summarize_with_mistral(
+
+            # Build python_summary using async trend-aware summarizer when needed
+            rows_for_summary = widen_results_if_needed(
+                rows, sql, selected_db, display_mode, user_query
+            )
+            if display_mode in ["summary", "both"] or trend_intent:
+                columns_for_summary = list(rows[0].keys()) if rows else []
+                python_summary = await summarize_results_async(
+                    results={"rows": rows_for_summary},
                     user_query=user_query,
-                    columns=list(rows[0].keys()) if rows else [],
-                    rows=rows,
-                    backend_summary=python_summary,
+                    columns=columns_for_summary,
                     sql=sql,
-                ) if SUMMARY_ENGINE == "llm" and display_mode in ["summary","both"] else python_summary
+                )
+            else:
+                python_summary = ""
+
+            try:
+                from decimal import Decimal  # noqa: F401
+
+                if trend_intent:
+                    # Prefer the trend-focused summary we just generated
+                    summary = python_summary
+                else:
+                    summary = (
+                        summarize_with_mistral(
+                            user_query=user_query,
+                            columns=list(rows[0].keys()) if rows else [],
+                            rows=rows,
+                            backend_summary=python_summary,
+                            sql=sql,
+                        )
+                        if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"]
+                        else python_summary
+                    )
             except Exception as e:
                 logger.error(f"Natural language summary error: {e}")
                 summary = f"Found {len(rows)} records matching your query."
-          
+
             return {
                 "status": "success",
-                "summary": summary if display_mode in ["summary","both"] else "",
+                "summary": summary if (display_mode in ["summary", "both"] or trend_intent) else "",
                 "sql": sql,
                 "display_mode": display_mode,
-                "visualization": visualization_requested, 
+                "visualization": visualization_requested,
                 "results": {
                     "columns": (list(rows[0].keys()) if rows else []),
                     "rows": [list(r.values()) for r in rows] if rows else [],
@@ -2965,6 +3201,7 @@ async def answer(
             }
         except Exception as e:
             return {"status": "error", "message": f"Oracle query failed: {e}", "sql": sql}
+
     # 0.b) "All table names" → system metadata
     if re.search(r"\ball\s+table\s+name(s)?\b", uq, re.I):
         try:
@@ -2977,7 +3214,11 @@ async def answer(
                 "summary": "",
                 "sql": "SELECT table_name FROM user_tables ORDER BY table_name",
                 "display_mode": "table",
-                "results": {"columns": ["TABLE_NAME"], "rows": [[r["TABLE_NAME"]] for r in rows], "row_count": len(rows)},
+                "results": {
+                    "columns": ["TABLE_NAME"],
+                    "rows": [[r["TABLE_NAME"]] for r in rows],
+                    "row_count": len(rows),
+                },
                 "schema_context": [],
                 "schema_context_ids": [],
             }
@@ -2988,14 +3229,17 @@ async def answer(
     results = _search_schema(user_query, selected_db, top_k=12)
     schema_chunks = [r.get("document") for r in results] if results else []
     schema_context_ids = _extract_context_ids(results)
+
     candidate_tables = _tables_from_results(results)
     candidate_tables = _filter_banned_tables(candidate_tables)
+
     # NEW: prioritize critical tables based on query content
     candidate_tables = _intelligent_table_selection(user_query, candidate_tables, selected_db)
     candidate_tables = _bias_tables_for_day(candidate_tables, uq)
+
     # NEW: if it's a single-day/"day" query, make sure daily tables are present
     if _DAILY_HINT_RX.search(uq):
-        extras = _discover_dailyish_tables(selected_db, must_have_cols=('PRODUCTION_QTY','FLOOR_NAME'))
+        extras = _discover_dailyish_tables(selected_db, must_have_cols=("PRODUCTION_QTY", "FLOOR_NAME"))
         extras = _filter_banned_tables(extras)
         # keep order: already-retrieved tables first, then extras not already present
         seen = {t.upper() for t in candidate_tables}
@@ -3003,11 +3247,10 @@ async def answer(
 
     # Force T_PROD vs T_PROD_DAILY ordering when applicable
     candidate_tables = _maybe_force_tprod_tables(uq, selected_db, candidate_tables)
-    
+
     # Store the forced table information for hybrid processing
     forced_table = None
     if len(candidate_tables) == 1:
-        # If only one table is forced, store it
         forced_table = candidate_tables[0]
 
     # (optional safety) re-filter in case the forcing step ever reintroduces something
@@ -3016,13 +3259,12 @@ async def answer(
     # 2) Build runtime options from live metadata (keep this **tight**) --------
     options = _build_runtime_options(selected_db, candidate_tables)
     if not options.get("tables"):
-        # If retrieval gave nothing usable, still try an entity lookup if that fits
         if _is_entity_lookup(user_query):
             return _entity_lookup_path(user_query, selected_db, schema_chunks, schema_context_ids)
         return {
             "status": "error",
             "message": "No relevant tables found.",
-            "schema_context_ids": schema_context_ids
+            "schema_context_ids": schema_context_ids,
         }
 
     # Phase 4.1: Try hybrid processing first if available and conditions are met
@@ -3030,13 +3272,14 @@ async def answer(
     if HYBRID_PROCESSING_AVAILABLE and _should_use_hybrid_processing(user_query, enhanced_analysis):
         logger.info("[RAG] Attempting hybrid processing for SQL generation")
         logger.info(f"[RAG] COLLECT_TRAINING_DATA is {COLLECT_TRAINING_DATA}")
-        
+
         # Create an actual turn_id for training data collection if not available
         temp_turn_id = None
         if COLLECT_TRAINING_DATA:
             try:
                 # Create actual AI_TURN record for training data collection during RAG processing
                 from app.feedback_store import insert_turn
+
                 temp_turn_id = insert_turn(
                     source_db_id="source_db_1",
                     client_ip=client_ip,
@@ -3045,19 +3288,21 @@ async def answer(
                     schema_context_ids=schema_context_ids[:10] if schema_context_ids else [],
                     meta={
                         "temp_record_for_training": True,
-                        "enhanced_analysis": enhanced_analysis.get('intent', 'unknown') if enhanced_analysis else 'unknown'
-                    }
+                        "enhanced_analysis": enhanced_analysis.get("intent", "unknown")
+                        if enhanced_analysis
+                        else "unknown",
+                    },
                 )
                 logger.info(f"[RAG] Created temporary turn_id {temp_turn_id} for training data collection")
             except Exception as e:
                 logger.warning(f"[RAG] Failed to create temporary turn_id: {e}")
-        
+
         # Pass the forced table information to hybrid processing
         hybrid_context_info = {
             "forced_table": forced_table,
-            "date_cutoff_applied": forced_table in ["T_PROD", "T_PROD_DAILY"]
+            "date_cutoff_applied": forced_table in ["T_PROD", "T_PROD_DAILY"],
         }
-        
+
         hybrid_result = await _try_hybrid_processing(
             user_query=user_query,
             schema_context="\n\n".join(schema_chunks),
@@ -3069,26 +3314,22 @@ async def answer(
             session_id=session_id,
             client_ip=client_ip,
             user_agent=user_agent,
-            hybrid_context_info=hybrid_context_info  # Pass the forced table information
+            hybrid_context_info=hybrid_context_info,  # Pass the forced table information
         )
-        
+
         if hybrid_result and hybrid_result.get("status") == "success":
             processing_mode = "unknown"
             if "hybrid_metadata" in hybrid_result and "processing_mode" in hybrid_result["hybrid_metadata"]:
                 processing_mode = hybrid_result["hybrid_metadata"]["processing_mode"]
             elif "processing_mode" in hybrid_result:
                 processing_mode = hybrid_result["processing_mode"]
-                
-            # Ensure processing_mode is not None to prevent format string errors
+
             processing_mode = processing_mode or "unknown"
             logger.info(f"[RAG] Hybrid processing successful with {processing_mode} mode")
 
-            # Augment RAG result with hybrid data
             result = hybrid_result.copy()
             result["schema_context"] = schema_chunks
             result["schema_context_ids"] = schema_context_ids
-            
-            # Add hybrid processing metadata
             result["hybrid_metadata"] = {
                 "processing_mode": hybrid_result.get("processing_mode", "unknown"),
                 "selection_reasoning": hybrid_result.get("selection_reasoning", ""),
@@ -3101,14 +3342,22 @@ async def answer(
                 "classification_time_ms": hybrid_result.get("classification_time_ms", 0.0),
                 "sql_execution_time_ms": hybrid_result.get("sql_execution_time_ms", 0.0),
                 "sql_execution_success": hybrid_result.get("sql_execution_success", False),
-                "temp_turn_id": temp_turn_id  # Include temp turn_id for reference
+                "temp_turn_id": temp_turn_id,
             }
-            
             return result
         else:
             logger.info("[RAG] Hybrid processing failed or returned no result, falling back to traditional RAG pipeline")
+
     # 3) Planner → STRICT validation ------------------------------------------
     plan = _ask_planner(user_query, options)
+
+    # ---- Additional upfront plan structure check ----
+    if not isinstance(plan, dict):
+        return {
+            "status": "error",
+            "message": "Invalid plan format",
+        }
+
     ok, why = _validate_plan(plan or {}, options)
     if not ok:
         logger.info(f"[RAG] Planner not directly usable ({why}).")
@@ -3119,14 +3368,20 @@ async def answer(
 
     # NEW: add business-aware dims/metrics for critical tables
     plan = enhance_query_with_critical_table_knowledge(user_query, plan, options, selected_db)
-
     plan = _augment_plan_with_metrics(uq, plan, options)
+
+    # (plan remains a dict after augmentation, but be defensive anyway)
+    if not isinstance(plan, dict):
+        return {
+            "status": "error",
+            "message": "Invalid plan format after augmentation",
+        }
+
     ok, why = _validate_plan(plan or {}, options)
     if not ok:
         logger.info(f"[RAG] Plan invalid after augmentation ({why}).")
         if _is_entity_lookup(user_query):
             return _entity_lookup_path(user_query, selected_db, schema_chunks, schema_context_ids)
-        # NEW: graceful table-browse fallback
         return _generic_browse_fallback(uq, selected_db, options, schema_chunks, schema_context_ids)
 
     # If planner returned raw SQL, validate and use it; otherwise build from plan
@@ -3141,7 +3396,6 @@ async def answer(
         sql = enforce_wide_projection_for_generic(user_query, sql)
         sql = value_aware_text_filter(sql, selected_db)
         sql = ensure_label_filter(sql, user_query, selected_db)
-
         enforce_predicate_type_compat(sql, selected_db)
         if not is_valid_sql(sql, selected_db):
             raise ValueError("Generated SQL failed prepare() validation")
@@ -3152,7 +3406,7 @@ async def answer(
         return {
             "status": "error",
             "message": f"SQL generation failed: {str(e)}",
-            "schema_context_ids": schema_context_ids
+            "schema_context_ids": schema_context_ids,
         }
 
     # 4) Execute ---------------------------------------------------------------
@@ -3164,9 +3418,10 @@ async def answer(
             "status": "error",
             "message": f"Oracle query failed: {str(e)}",
             "sql": sql,
-            "schema_context_ids": schema_context_ids
+            "schema_context_ids": schema_context_ids,
         }
-    # --- Retry path for day-level questions that returned 0 rows -----------------
+
+    # --- Retry path for day-level questions that returned 0 rows -------------
     if not rows and _DAILY_HINT_RX.search(uq):
         # Prefer only daily-ish tables from the earlier retrieval set
         daily_only = _filter_banned_tables([t for t in candidate_tables if _DAILY_NAME_RX.search(t)])
@@ -3174,47 +3429,67 @@ async def answer(
             # Apply T_PROD vs T_PROD_DAILY forcing within the daily-only set
             forced_daily = _maybe_force_tprod_tables(uq, selected_db, daily_only)
             options2 = _build_runtime_options(selected_db, forced_daily)
-
             plan2 = _ask_planner(uq, options2)
-            ok2, _ = _validate_plan(plan2 or {}, options2)
-            if ok2:
-                try:
-                    sql2 = build_sql_from_plan(plan2, selected_db, uq)
-                    sql2 = normalize_dates(sql2)
-                    sql2 = enforce_wide_projection_for_generic(uq, sql2)
-                    sql2 = value_aware_text_filter(sql2, selected_db)
-                    sql2 = ensure_label_filter(sql2, uq, selected_db) 
-                    enforce_predicate_type_compat(sql2, selected_db)
-                    if is_valid_sql(sql2, selected_db):
-                        rows2 = run_sql(sql2, selected_db)
-                        if rows2:
-                            # promote the successful retry to the main flow
-                            sql, rows = sql2, rows2
-                except Exception as e:
-                    logger.warning(f"[RAG] Daily retry failed: {e}")
+
+            # ---- Additional upfront check for retry plan as well ----
+            if not isinstance(plan2, dict):
+                logger.warning("[RAG] Daily retry planner returned invalid plan format")
+            else:
+                ok2, _ = _validate_plan(plan2 or {}, options2)
+                if ok2:
+                    try:
+                        sql2 = build_sql_from_plan(plan2, selected_db, uq)
+                        sql2 = normalize_dates(sql2)
+                        sql2 = enforce_wide_projection_for_generic(uq, sql2)
+                        sql2 = value_aware_text_filter(sql2, selected_db)
+                        sql2 = ensure_label_filter(sql2, uq, selected_db)
+                        enforce_predicate_type_compat(sql2, selected_db)
+                        if is_valid_sql(sql2, selected_db):
+                            rows2 = run_sql(sql2, selected_db)
+                            if rows2:
+                                # promote the successful retry to the main flow
+                                sql, rows = sql2, rows2
+                    except Exception as e:
+                        logger.warning(f"[RAG] Daily retry failed: {e}")
 
     # 5) Summarize + format envelope ------------------------------------------
     display_mode = determine_display_mode(user_query, rows)
-    rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
-    python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
 
-    if display_mode in ["summary", "both"]:
+    rows_for_summary = widen_results_if_needed(
+        rows, sql, selected_db, display_mode, user_query
+    )
+    if display_mode in ["summary", "both"] or trend_intent:
+        columns_for_summary = list(rows[0].keys()) if rows else []
+        python_summary = await summarize_results_async(
+            results={"rows": rows_for_summary},
+            user_query=user_query,
+            columns=columns_for_summary,
+            sql=sql,
+        )
+    else:
+        python_summary = ""
+
+    if display_mode in ["summary", "both"] or trend_intent:
         try:
-            # Use summarize_with_mistral directly to avoid function name issues
-            summary = summarize_with_mistral(
-                user_query=user_query,
-                columns=list(rows[0].keys()) if rows else [],
-                rows=rows,
-                backend_summary=python_summary,
-                sql=sql
-            )
+            if trend_intent:
+                summary = python_summary
+            else:
+                summary = summarize_with_mistral(
+                    user_query=user_query,
+                    columns=list(rows[0].keys()) if rows else [],
+                    rows=rows,
+                    backend_summary=python_summary,
+                    sql=sql,
+                )
         except Exception as e:
             logger.warning(f"[RAG] Natural language summary failed; falling back. Reason: {e}")
             summary = python_summary
     else:
         summary = ""
+
     # Check for visualization intent once (to avoid duplicate computation)
     visualization_requested = has_visualization_intent(user_query)
+
     # Special UX for explicit date-range queries → no data
     if not rows and extract_explicit_date_range(user_query):
         return {

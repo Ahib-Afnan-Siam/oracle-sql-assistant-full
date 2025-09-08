@@ -1,26 +1,17 @@
-// HomePrompts.tsx
+// src/components/HomePrompts.tsx
 import React from "react";
 import { useChat } from "./ChatContext";
+import { getPrompts } from "../utils/prompts"; // ← path fixed
 
 export default function HomePrompts() {
   const { processMessage, isTyping, selectedDB } = useChat();
-
-  const prompts =
-    selectedDB === "source_db_1"
-      ? [
-          "Show floor-wise production and give summary",
-          "List employee names and summarize their salaries",
-        ]
-      : [
-          "Give me report on orders audit",
-          "Show me the summary of import payments",
-        ];
+  const prompts = getPrompts(selectedDB);
 
   return (
     <div className="flex flex-col items-center justify-center h-full text-center px-4">
       <h2 className="text-2xl font-semibold mb-2">Ask our AI anything</h2>
       <p className="text-sm text-gray-500 mb-6">
-        🧠 Welcome! Ask anything about sales, policies, or projects.
+        🧠 Welcome! Curious about efficiency, performance, or trends? Just ask!
       </p>
       <div className="flex flex-wrap gap-4 justify-center">
         {prompts.map((text) => (

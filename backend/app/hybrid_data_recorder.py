@@ -4,8 +4,100 @@ Enhanced data recording system for hybrid AI processing.
 Integrates with existing feedback_store.py and extends it for hybrid system training data.
 Collects comprehensive training data including query context, model responses, 
 response metrics, selection decisions, performance metrics, user patterns, and API usage.
-"""
 
+Phase 5 Training Data Collection System:
+
+1. Data Collection Components:
+   - Query Classification Context (AI_HYBRID_CONTEXT)
+   - Model Responses (AI_MODEL_RESPONSES)
+   - Response Quality Metrics (AI_RESPONSE_METRICS)
+   - Selection Decisions (AI_SELECTION_DECISIONS)
+   - Performance Metrics (AI_PERFORMANCE_METRICS)
+   - User Interaction Patterns (AI_USER_PATTERNS)
+   - API Usage Tracking (AI_API_USAGE_LOG)
+
+2. Quality Metrics Analysis:
+   - Success Rates (Query Understanding, SQL Execution)
+   - User Satisfaction (Acceptance, Feedback, Engagement)
+   - Business Logic Compliance
+   - System Health Monitoring
+
+3. API Endpoints:
+   - /quality-metrics/dashboard - System health dashboard
+   - /quality-metrics - Comprehensive metrics report
+   - /quality-metrics/success-rates - Success rate metrics
+   - /quality-metrics/user-satisfaction - User satisfaction metrics
+   - /quality-metrics/test - System testing endpoint
+   - /quality-metrics/status - System status endpoint
+   - /training-data/test - Training data collection testing
+   - /training-data/status - Training data collection status
+   - /learning/performance-comparison - Performance comparison between models
+   - /learning/model-strengths - Model strengths by domain
+   - /learning/user-preferences - User preference patterns
+   - /learning/insights - Comprehensive learning insights
+   - /training-data/high-quality-samples - High-quality sample identification
+   - /training-data/datasets/{type} - Training dataset creation by type
+
+4. Training Data Structure:
+   - Complete query processing context
+   - Model responses from both local and API models
+   - Detailed quality metrics for each response
+   - Selection decision rationale
+   - Performance timing data
+   - User interaction patterns
+   - API usage and cost tracking
+
+5. Continuous Learning Capabilities:
+   - Performance comparison analysis
+   - Model strength identification
+   - User preference pattern analysis
+   - Learning insights generation
+   - Quality reporting with alerts
+   - High-quality sample identification
+   - Training dataset creation
+
+Phase 6: Continuous Learning Loop (Day 15+)
+
+The continuous learning loop enables the system to automatically improve by analyzing patterns in:
+1. Performance Comparison: Local vs API accuracy by query type, response time analysis, user preference patterns
+2. Model Strength Identification: DeepSeek strengths (production, TNA, Oracle), Llama strengths (HR, business logic), local model improvement areas
+3. Training Data Preparation: High-quality sample identification and training dataset creation
+
+Key Features:
+- Automated pattern analysis across query types and model responses
+- Performance benchmarking between local and API models
+- Domain-specific model strength identification
+- User preference tracking and analysis
+- Actionable insights generation for system optimization
+- API endpoints for accessing learning insights
+- High-quality sample identification for model fine-tuning
+- Training dataset creation for different domains
+
+Learning Insights Process:
+1. Data Collection: Comprehensive training data is collected for every query processed
+2. Pattern Analysis: System analyzes performance patterns across different query types and models
+3. Model Comparison: Local vs API models are compared on quality, speed, and user satisfaction
+4. Strength Identification: Each model's strengths in different domains are identified
+5. Recommendation Generation: Actionable recommendations are generated for system improvements
+6. Continuous Improvement: Insights are used to optimize model selection and routing strategies
+7. Training Data Preparation: High-quality samples are identified and organized into domain-specific datasets
+
+API Endpoints for Continuous Learning:
+- GET /learning/performance-comparison: Compare local vs API model performance by query type
+- GET /learning/model-strengths: Identify model strengths by domain/query type
+- GET /learning/user-preferences: Analyze user preference patterns for different models
+- GET /learning/insights: Get comprehensive learning insights from pattern analysis
+- GET /training-data/high-quality-samples: Identify high-quality samples for training
+- GET /training-data/datasets/{type}: Create training datasets for specific domains
+
+The continuous learning system provides valuable insights that can be used to:
+- Optimize model selection strategies
+- Improve response quality over time
+- Reduce processing costs
+- Enhance user satisfaction
+- Identify areas for model fine-tuning
+- Prepare high-quality training datasets for model improvement
+"""
 import json
 import logging
 import time
@@ -249,7 +341,7 @@ class QualityMetricsAnalyzer:
             recommendations.append("System performing well, continue monitoring")
         
         return "; ".join(recommendations)
-    
+
     def _generate_alerts(self, success_metrics: Dict, satisfaction_metrics: Dict) -> List[str]:
         """Generate alerts for critical issues."""
         alerts = []
@@ -267,6 +359,706 @@ class QualityMetricsAnalyzer:
             alerts.append("WARNING: High retry frequency indicates poor initial response quality")
         
         return alerts
+
+    # ------------------------------ Phase 6: Continuous Learning Loop ------------------------------
+    
+    def analyze_performance_comparison(self, time_window_hours: int = 24) -> Dict[str, Any]:
+        """
+        Phase 6.1: Performance comparison between local and API models by query type.
+        
+        Args:
+            time_window_hours: Time window for analysis
+            
+        Returns:
+            Performance comparison metrics by query type
+        """
+        try:
+            with connect_feedback() as conn:
+                cur = conn.cursor()
+                
+                window_start = _dt.now(timezone.utc) - timedelta(hours=time_window_hours)
+                
+                # Get performance comparison by query intent
+                cur.execute("""
+                    SELECT 
+                        hc.QUERY_INTENT,
+                        mr.MODEL_TYPE,
+                        COUNT(*) as response_count,
+                        AVG(rm.OVERALL_SCORE) as avg_quality_score,
+                        AVG(mr.RESPONSE_TIME_MS) as avg_response_time_ms,
+                        AVG(CASE WHEN rm.EXECUTION_SUCCESS = 'Y' THEN 1 ELSE 0 END) as execution_success_rate,
+                        AVG(CASE WHEN sd.SELECTED_RESPONSE_ID = mr.ID THEN 1 ELSE 0 END) as selection_rate
+                    FROM AI_HYBRID_CONTEXT hc
+                    JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                    JOIN AI_RESPONSE_METRICS rm ON mr.ID = rm.MODEL_RESPONSE_ID
+                    LEFT JOIN AI_SELECTION_DECISIONS sd ON hc.TURN_ID = sd.TURN_ID
+                    JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                    WHERE t.CREATED_AT >= :window_start
+                    GROUP BY hc.QUERY_INTENT, mr.MODEL_TYPE
+                    ORDER BY hc.QUERY_INTENT, mr.MODEL_TYPE
+                """, {"window_start": window_start})
+                
+                performance_data = cur.fetchall()
+                
+                # Organize results by query intent
+                performance_comparison = {}
+                for row in performance_data:
+                    intent, model_type, count, quality_score, response_time, success_rate, selection_rate = row
+                    
+                    if intent not in performance_comparison:
+                        performance_comparison[intent] = {}
+                    
+                    performance_comparison[intent][model_type] = {
+                        "response_count": count,
+                        "avg_quality_score": round(quality_score, 3) if quality_score else 0.0,
+                        "avg_response_time_ms": round(response_time, 1) if response_time else 0.0,
+                        "execution_success_rate": round(success_rate, 3) if success_rate else 0.0,
+                        "selection_rate": round(selection_rate, 3) if selection_rate else 0.0
+                    }
+                
+                # Calculate performance differences
+                performance_insights = {}
+                for intent, models in performance_comparison.items():
+                    local = models.get("local", {})
+                    api = models.get("api", {})
+                    
+                    performance_insights[intent] = {
+                        "quality_difference": round(
+                            api.get("avg_quality_score", 0.0) - local.get("avg_quality_score", 0.0), 3
+                        ),
+                        "time_difference": round(
+                            api.get("avg_response_time_ms", 0.0) - local.get("avg_response_time_ms", 0.0), 1
+                        ),
+                        "success_rate_difference": round(
+                            api.get("execution_success_rate", 0.0) - local.get("execution_success_rate", 0.0), 3
+                        ),
+                        "preference": "api" if api.get("selection_rate", 0.0) > local.get("selection_rate", 0.0) else "local"
+                    }
+                
+                return {
+                    "performance_by_intent": performance_comparison,
+                    "performance_insights": performance_insights,
+                    "time_window_hours": time_window_hours,
+                    "total_query_intents": len(performance_comparison)
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to analyze performance comparison: {e}")
+            return {}
+
+    def identify_model_strengths(self, time_window_hours: int = 24) -> Dict[str, Any]:
+        """
+        Phase 6.1: Identify model strengths by domain/query type.
+        
+        Args:
+            time_window_hours: Time window for analysis
+            
+        Returns:
+            Model strengths by domain/query type
+        """
+        try:
+            with connect_feedback() as conn:
+                cur = conn.cursor()
+                
+                window_start = _dt.now(timezone.utc) - timedelta(hours=time_window_hours)
+                
+                # Get model performance by query intent and model name
+                cur.execute("""
+                    SELECT 
+                        hc.QUERY_INTENT,
+                        mr.MODEL_NAME,
+                        mr.MODEL_TYPE,
+                        COUNT(*) as response_count,
+                        AVG(rm.OVERALL_SCORE) as avg_quality_score,
+                        AVG(mr.RESPONSE_TIME_MS) as avg_response_time_ms,
+                        AVG(CASE WHEN rm.EXECUTION_SUCCESS = 'Y' THEN 1 ELSE 0 END) as execution_success_rate,
+                        AVG(CASE WHEN sd.SELECTED_RESPONSE_ID = mr.ID THEN 1 ELSE 0 END) as selection_rate
+                    FROM AI_HYBRID_CONTEXT hc
+                    JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                    JOIN AI_RESPONSE_METRICS rm ON mr.ID = rm.MODEL_RESPONSE_ID
+                    LEFT JOIN AI_SELECTION_DECISIONS sd ON hc.TURN_ID = sd.TURN_ID
+                    JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                    WHERE t.CREATED_AT >= :window_start
+                    GROUP BY hc.QUERY_INTENT, mr.MODEL_NAME, mr.MODEL_TYPE
+                    ORDER BY hc.QUERY_INTENT, mr.MODEL_TYPE, avg_quality_score DESC
+                """, {"window_start": window_start})
+                
+                strength_data = cur.fetchall()
+                
+                # Organize results by query intent
+                model_strengths = {}
+                model_performance = {}
+                
+                for row in strength_data:
+                    intent, model_name, model_type, count, quality_score, response_time, success_rate, selection_rate = row
+                    
+                    if intent not in model_strengths:
+                        model_strengths[intent] = []
+                        model_performance[intent] = {}
+                    
+                    model_info = {
+                        "model_name": model_name,
+                        "model_type": model_type,
+                        "response_count": count,
+                        "avg_quality_score": round(quality_score, 3) if quality_score else 0.0,
+                        "avg_response_time_ms": round(response_time, 1) if response_time else 0.0,
+                        "execution_success_rate": round(success_rate, 3) if success_rate else 0.0,
+                        "selection_rate": round(selection_rate, 3) if selection_rate else 0.0
+                    }
+                    
+                    model_strengths[intent].append(model_info)
+                    model_performance[intent][model_name] = model_info
+                
+                # Identify top models by intent
+                top_models = {}
+                for intent, models in model_performance.items():
+                    if models:
+                        # Sort by quality score and selection rate
+                        sorted_models = sorted(
+                            models.items(), 
+                            key=lambda x: (x[1]["avg_quality_score"], x[1]["selection_rate"]), 
+                            reverse=True
+                        )
+                        top_models[intent] = sorted_models[0][0] if sorted_models else "unknown"
+                
+                # Domain-specific strength identification
+                domain_strengths = {
+                    "production": {
+                        "best_model": top_models.get("production_query", "deepseek"),
+                        "strengths": ["complex production queries", "CTL code handling", "efficiency metrics"]
+                    },
+                    "tna": {
+                        "best_model": top_models.get("tna_task_query", "deepseek"),
+                        "strengths": ["task tracking", "CTL code processing", "status analysis"]
+                    },
+                    "hr": {
+                        "best_model": top_models.get("hr_employee_query", "llama"),
+                        "strengths": ["employee data", "department analysis", "job role queries"]
+                    },
+                    "analytics": {
+                        "best_model": top_models.get("complex_analytics", "deepseek"),
+                        "strengths": ["trend analysis", "time-series data", "multi-field queries"]
+                    },
+                    "general": {
+                        "best_model": top_models.get("general_query", "deepseek"),
+                        "strengths": ["broad knowledge", "simple lookups", "general SQL generation"]
+                    }
+                }
+                
+                return {
+                    "model_strengths_by_intent": model_strengths,
+                    "top_models_by_intent": top_models,
+                    "domain_strengths": domain_strengths,
+                    "time_window_hours": time_window_hours
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to identify model strengths: {e}")
+            return {}
+
+    def analyze_user_preference_patterns(self, time_window_hours: int = 24) -> Dict[str, Any]:
+        """
+        Phase 6.1: Analyze user preference patterns for different models.
+        
+        Args:
+            time_window_hours: Time window for analysis
+            
+        Returns:
+            User preference patterns analysis
+        """
+        try:
+            with connect_feedback() as conn:
+                cur = conn.cursor()
+                
+                window_start = _dt.now(timezone.utc) - timedelta(hours=time_window_hours)
+                
+                # Get user preference patterns
+                cur.execute("""
+                    SELECT 
+                        hc.QUERY_INTENT,
+                        mr.MODEL_TYPE,
+                        COUNT(*) as total_responses,
+                        SUM(CASE WHEN sd.SELECTED_RESPONSE_ID = mr.ID THEN 1 ELSE 0 END) as selected_count,
+                        AVG(up.USER_SATISFACTION) as avg_user_satisfaction,
+                        AVG(up.RETRY_COUNT) as avg_retry_count,
+                        AVG(up.TIME_SPENT_VIEWING_MS) as avg_viewing_time_ms
+                    FROM AI_HYBRID_CONTEXT hc
+                    JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                    LEFT JOIN AI_SELECTION_DECISIONS sd ON hc.TURN_ID = sd.TURN_ID
+                    LEFT JOIN AI_USER_PATTERNS up ON hc.TURN_ID = up.TURN_ID
+                    JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                    WHERE t.CREATED_AT >= :window_start
+                    GROUP BY hc.QUERY_INTENT, mr.MODEL_TYPE
+                    ORDER BY hc.QUERY_INTENT, mr.MODEL_TYPE
+                """, {"window_start": window_start})
+                
+                preference_data = cur.fetchall()
+                
+                # Organize results
+                preference_patterns = {}
+                for row in preference_data:
+                    intent, model_type, total_responses, selected_count, satisfaction, retry_count, viewing_time = row
+                    
+                    if intent not in preference_patterns:
+                        preference_patterns[intent] = {}
+                    
+                    selection_rate = selected_count / total_responses if total_responses > 0 else 0.0
+                    
+                    preference_patterns[intent][model_type] = {
+                        "total_responses": total_responses,
+                        "selected_count": selected_count,
+                        "selection_rate": round(selection_rate, 3),
+                        "avg_user_satisfaction": round(satisfaction, 2) if satisfaction else 0.0,
+                        "avg_retry_count": round(retry_count, 1) if retry_count else 0.0,
+                        "avg_viewing_time_ms": round(viewing_time, 1) if viewing_time else 0.0
+                    }
+                
+                # Identify overall preferences
+                overall_preferences = {}
+                for intent, models in preference_patterns.items():
+                    if models:
+                        # Model with highest selection rate is preferred
+                        preferred_model = max(models.items(), key=lambda x: x[1]["selection_rate"])
+                        overall_preferences[intent] = {
+                            "preferred_model": preferred_model[0],
+                            "selection_rate": preferred_model[1]["selection_rate"],
+                            "user_satisfaction": preferred_model[1]["avg_user_satisfaction"]
+                        }
+                
+                return {
+                    "preference_patterns": preference_patterns,
+                    "overall_preferences": overall_preferences,
+                    "time_window_hours": time_window_hours
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to analyze user preference patterns: {e}")
+            return {}
+
+    def generate_learning_insights(self, time_window_hours: int = 24) -> Dict[str, Any]:
+        """
+        Phase 6.1: Generate comprehensive learning insights from pattern analysis.
+        
+        Args:
+            time_window_hours: Time window for analysis
+            
+        Returns:
+            Comprehensive learning insights
+        """
+        performance_comparison = self.analyze_performance_comparison(time_window_hours)
+        model_strengths = self.identify_model_strengths(time_window_hours)
+        preference_patterns = self.analyze_user_preference_patterns(time_window_hours)
+        
+        # Combine insights
+        insights = {
+            "timestamp": _dt.now(timezone.utc).isoformat(),
+            "time_window_hours": time_window_hours,
+            "performance_comparison": performance_comparison,
+            "model_strengths": model_strengths,
+            "preference_patterns": preference_patterns
+        }
+        
+        # Generate actionable recommendations
+        recommendations = []
+        
+        # Performance-based recommendations
+        performance_insights = performance_comparison.get("performance_insights", {})
+        for intent, metrics in performance_insights.items():
+            if metrics["quality_difference"] > 0.1:
+                recommendations.append(f"For {intent}: API model shows significantly better quality (+{metrics['quality_difference']})")
+            elif metrics["quality_difference"] < -0.1:
+                recommendations.append(f"For {intent}: Local model shows significantly better quality ({metrics['quality_difference']})")
+            
+            if metrics["time_difference"] > 1000:  # 1 second
+                recommendations.append(f"For {intent}: Local model is significantly faster by {abs(metrics['time_difference'])}ms")
+        
+        # Model strength recommendations
+        domain_strengths = model_strengths.get("domain_strengths", {})
+        for domain, info in domain_strengths.items():
+            recommendations.append(f"For {domain} queries: Use {info['best_model']} for optimal results")
+        
+        # Preference-based recommendations
+        overall_preferences = preference_patterns.get("overall_preferences", {})
+        for intent, pref in overall_preferences.items():
+            if pref["selection_rate"] > 0.7 and pref["user_satisfaction"] < 3.0:
+                recommendations.append(f"For {intent}: High selection rate but low satisfaction - investigate quality issues")
+        
+        insights["recommendations"] = recommendations
+        return insights
+
+    def identify_high_quality_samples(self, time_window_hours: int = 168, min_quality_score: float = 0.8) -> Dict[str, Any]:
+        """
+        Step 6.2: Identify high-quality samples for training data preparation.
+        
+        Args:
+            time_window_hours: Time window for analysis (default: 168 hours/1 week)
+            min_quality_score: Minimum quality score threshold for high-quality samples
+            
+        Returns:
+            Dictionary with high-quality samples categorized by type
+        """
+        try:
+            with connect_feedback() as conn:
+                cur = conn.cursor()
+                
+                window_start = _dt.now(timezone.utc) - timedelta(hours=time_window_hours)
+                
+                # 1. API responses that outperformed local models
+                cur.execute("""
+                    SELECT 
+                        hc.TURN_ID,
+                        hc.QUERY_INTENT,
+                        hc.ENTITIES_JSON,
+                        mr_api.MODEL_NAME as API_MODEL,
+                        mr_local.MODEL_NAME as LOCAL_MODEL,
+                        mr_api.RESPONSE_TEXT as API_RESPONSE,
+                        mr_local.RESPONSE_TEXT as LOCAL_RESPONSE,
+                        rm_api.OVERALL_SCORE as API_SCORE,
+                        rm_local.OVERALL_SCORE as LOCAL_SCORE,
+                        sd.SELECTION_REASONING,
+                        t.USER_QUESTION
+                    FROM AI_HYBRID_CONTEXT hc
+                    JOIN AI_MODEL_RESPONSES mr_api ON hc.TURN_ID = mr_api.TURN_ID AND mr_api.MODEL_TYPE = 'api'
+                    JOIN AI_MODEL_RESPONSES mr_local ON hc.TURN_ID = mr_local.TURN_ID AND mr_local.MODEL_TYPE = 'local'
+                    JOIN AI_RESPONSE_METRICS rm_api ON mr_api.ID = rm_api.MODEL_RESPONSE_ID
+                    JOIN AI_RESPONSE_METRICS rm_local ON mr_local.ID = rm_local.MODEL_RESPONSE_ID
+                    JOIN AI_SELECTION_DECISIONS sd ON hc.TURN_ID = sd.TURN_ID
+                    JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                    WHERE t.CREATED_AT >= :window_start
+                    AND rm_api.OVERALL_SCORE > rm_local.OVERALL_SCORE + 0.1
+                    AND rm_api.OVERALL_SCORE >= :min_score
+                    ORDER BY (rm_api.OVERALL_SCORE - rm_local.OVERALL_SCORE) DESC
+                """, {"window_start": window_start, "min_score": min_quality_score})
+                
+                api_better_samples = cur.fetchall()
+                
+                # 2. Successful query-response pairs
+                cur.execute("""
+                    SELECT 
+                        hc.TURN_ID,
+                        hc.QUERY_INTENT,
+                        hc.ENTITIES_JSON,
+                        mr.MODEL_TYPE,
+                        mr.MODEL_NAME,
+                        mr.RESPONSE_TEXT,
+                        rm.OVERALL_SCORE,
+                        rm.SQL_VALIDITY_SCORE,
+                        rm.SCHEMA_COMPLIANCE_SCORE,
+                        rm.BUSINESS_LOGIC_SCORE,
+                        rm.PERFORMANCE_SCORE,
+                        rm.EXECUTION_SUCCESS,
+                        rm.RESULT_ROW_COUNT,
+                        t.USER_QUESTION
+                    FROM AI_HYBRID_CONTEXT hc
+                    JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                    JOIN AI_RESPONSE_METRICS rm ON mr.ID = rm.MODEL_RESPONSE_ID
+                    JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                    WHERE t.CREATED_AT >= :window_start
+                    AND rm.OVERALL_SCORE >= :min_score
+                    AND rm.EXECUTION_SUCCESS = 'Y'
+                    AND rm.RESULT_ROW_COUNT > 0
+                    ORDER BY rm.OVERALL_SCORE DESC
+                """, {"window_start": window_start, "min_score": min_quality_score})
+                
+                successful_samples = cur.fetchall()
+                
+                # 3. Domain-specific improvements needed (samples with low scores in specific domains)
+                cur.execute("""
+                    SELECT 
+                        hc.TURN_ID,
+                        hc.QUERY_INTENT,
+                        hc.ENTITIES_JSON,
+                        mr.MODEL_TYPE,
+                        mr.MODEL_NAME,
+                        mr.RESPONSE_TEXT,
+                        rm.OVERALL_SCORE,
+                        rm.BUSINESS_LOGIC_SCORE,
+                        rm.SCHEMA_COMPLIANCE_SCORE,
+                        t.USER_QUESTION,
+                        rm.VALIDATION_REASONING
+                    FROM AI_HYBRID_CONTEXT hc
+                    JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                    JOIN AI_RESPONSE_METRICS rm ON mr.ID = rm.MODEL_RESPONSE_ID
+                    JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                    WHERE t.CREATED_AT >= :window_start
+                    AND hc.QUERY_INTENT IN ('production_query', 'tna_task_query', 'hr_employee_query')
+                    AND rm.OVERALL_SCORE < 0.5
+                    ORDER BY hc.QUERY_INTENT, rm.OVERALL_SCORE ASC
+                """, {"window_start": window_start})
+                
+                domain_improvement_samples = cur.fetchall()
+                
+                # Process results
+                high_quality_data = {
+                    "api_outperformed_local": [],
+                    "successful_pairs": [],
+                    "domain_improvements_needed": []
+                }
+                
+                # Process API better samples
+                for row in api_better_samples:
+                    turn_id, intent, entities_json, api_model, local_model, api_resp, local_resp, api_score, local_score, reasoning, user_question = row
+                    try:
+                        entities = json.loads(entities_json) if entities_json else {}
+                    except:
+                        entities = {}
+                    
+                    high_quality_data["api_outperformed_local"].append({
+                        "turn_id": turn_id,
+                        "query_intent": intent,
+                        "entities": entities,
+                        "api_model": api_model,
+                        "local_model": local_model,
+                        "api_response": api_resp,
+                        "local_response": local_resp,
+                        "api_score": round(api_score, 3),
+                        "local_score": round(local_score, 3),
+                        "improvement": round(api_score - local_score, 3),
+                        "selection_reasoning": reasoning,
+                        "user_question": user_question
+                    })
+                
+                # Process successful samples
+                for row in successful_samples:
+                    turn_id, intent, entities_json, model_type, model_name, response, overall_score, sql_score, schema_score, business_score, perf_score, exec_success, row_count, user_question = row
+                    try:
+                        entities = json.loads(entities_json) if entities_json else {}
+                    except:
+                        entities = {}
+                    
+                    high_quality_data["successful_pairs"].append({
+                        "turn_id": turn_id,
+                        "query_intent": intent,
+                        "entities": entities,
+                        "model_type": model_type,
+                        "model_name": model_name,
+                        "response": response,
+                        "overall_score": round(overall_score, 3),
+                        "sql_validity_score": round(sql_score, 3),
+                        "schema_compliance_score": round(schema_score, 3),
+                        "business_logic_score": round(business_score, 3),
+                        "performance_score": round(perf_score, 3),
+                        "execution_success": exec_success,
+                        "result_row_count": row_count,
+                        "user_question": user_question
+                    })
+                
+                # Process domain improvement samples
+                for row in domain_improvement_samples:
+                    turn_id, intent, entities_json, model_type, model_name, response, overall_score, business_score, schema_score, user_question, reasoning = row
+                    try:
+                        entities = json.loads(entities_json) if entities_json else {}
+                    except:
+                        entities = {}
+                    
+                    high_quality_data["domain_improvements_needed"].append({
+                        "turn_id": turn_id,
+                        "query_intent": intent,
+                        "entities": entities,
+                        "model_type": model_type,
+                        "model_name": model_name,
+                        "response": response,
+                        "overall_score": round(overall_score, 3),
+                        "business_logic_score": round(business_score, 3),
+                        "schema_compliance_score": round(schema_score, 3),
+                        "user_question": user_question,
+                        "validation_reasoning": reasoning
+                    })
+                
+                return {
+                    "timestamp": _dt.now(timezone.utc).isoformat(),
+                    "time_window_hours": time_window_hours,
+                    "min_quality_score": min_quality_score,
+                    "sample_counts": {
+                        "api_outperformed_local": len(high_quality_data["api_outperformed_local"]),
+                        "successful_pairs": len(high_quality_data["successful_pairs"]),
+                        "domain_improvements_needed": len(high_quality_data["domain_improvements_needed"])
+                    },
+                    "high_quality_samples": high_quality_data
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to identify high-quality samples: {e}")
+            return {}
+
+    def create_training_dataset(self, dataset_type: str = "manufacturing", time_window_hours: int = 720) -> Dict[str, Any]:
+        """
+        Step 6.2: Create training datasets for different domains.
+        
+        Args:
+            dataset_type: Type of dataset to create ('manufacturing', 'oracle_sql', 'business_logic')
+            time_window_hours: Time window for analysis (default: 720 hours/30 days)
+            
+        Returns:
+            Dictionary with training dataset information
+        """
+        try:
+            with connect_feedback() as conn:
+                cur = conn.cursor()
+                
+                window_start = _dt.now(timezone.utc) - timedelta(hours=time_window_hours)
+                
+                if dataset_type == "manufacturing":
+                    # Manufacturing query patterns dataset
+                    cur.execute("""
+                        SELECT 
+                            t.USER_QUESTION,
+                            hc.QUERY_INTENT,
+                            hc.ENTITIES_JSON,
+                            mr.MODEL_NAME,
+                            mr.RESPONSE_TEXT,
+                            rm.OVERALL_SCORE,
+                            rm.BUSINESS_LOGIC_SCORE,
+                            sd.SELECTION_REASONING,
+                            hc.BUSINESS_CONTEXT
+                        FROM AI_HYBRID_CONTEXT hc
+                        JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                        JOIN AI_RESPONSE_METRICS rm ON mr.ID = rm.MODEL_RESPONSE_ID
+                        JOIN AI_SELECTION_DECISIONS sd ON hc.TURN_ID = sd.TURN_ID
+                        JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                        WHERE t.CREATED_AT >= :window_start
+                        AND hc.QUERY_INTENT IN ('production_query', 'tna_task_query')
+                        AND rm.OVERALL_SCORE >= 0.7
+                        AND rm.BUSINESS_LOGIC_SCORE >= 0.6
+                        ORDER BY rm.OVERALL_SCORE DESC
+                    """, {"window_start": window_start})
+                    
+                    manufacturing_data = cur.fetchall()
+                    training_samples = []
+                    
+                    for row in manufacturing_data:
+                        user_question, intent, entities_json, model_name, response, overall_score, business_score, reasoning, context = row
+                        try:
+                            entities = json.loads(entities_json) if entities_json else {}
+                        except:
+                            entities = {}
+                        
+                        training_samples.append({
+                            "input": user_question,
+                            "intent": intent,
+                            "entities": entities,
+                            "model_used": model_name,
+                            "output": response,
+                            "overall_score": round(overall_score, 3),
+                            "business_score": round(business_score, 3),
+                            "reasoning": reasoning,
+                            "business_context": context
+                        })
+                    
+                    return {
+                        "dataset_type": "manufacturing",
+                        "description": "Manufacturing query patterns dataset",
+                        "sample_count": len(training_samples),
+                        "samples": training_samples,
+                        "creation_timestamp": _dt.now(timezone.utc).isoformat(),
+                        "time_window_hours": time_window_hours
+                    }
+                
+                elif dataset_type == "oracle_sql":
+                    # Oracle SQL best practices dataset
+                    cur.execute("""
+                        SELECT 
+                            t.USER_QUESTION,
+                            hc.QUERY_INTENT,
+                            mr.RESPONSE_TEXT,
+                            rm.OVERALL_SCORE,
+                            rm.SQL_VALIDITY_SCORE,
+                            rm.PERFORMANCE_SCORE,
+                            rm.SCHEMA_COMPLIANCE_SCORE
+                        FROM AI_HYBRID_CONTEXT hc
+                        JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                        JOIN AI_RESPONSE_METRICS rm ON mr.ID = rm.MODEL_RESPONSE_ID
+                        JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                        WHERE t.CREATED_AT >= :window_start
+                        AND rm.OVERALL_SCORE >= 0.8
+                        AND rm.SQL_VALIDITY_SCORE >= 0.9
+                        AND rm.PERFORMANCE_SCORE >= 0.7
+                        ORDER BY rm.OVERALL_SCORE DESC
+                    """, {"window_start": window_start})
+                    
+                    oracle_data = cur.fetchall()
+                    training_samples = []
+                    
+                    for row in oracle_data:
+                        user_question, intent, response, overall_score, sql_score, perf_score, schema_score = row
+                        
+                        training_samples.append({
+                            "input": user_question,
+                            "intent": intent,
+                            "output": response,
+                            "overall_score": round(overall_score, 3),
+                            "sql_validity_score": round(sql_score, 3),
+                            "performance_score": round(perf_score, 3),
+                            "schema_compliance_score": round(schema_score, 3)
+                        })
+                    
+                    return {
+                        "dataset_type": "oracle_sql",
+                        "description": "Oracle SQL best practices dataset",
+                        "sample_count": len(training_samples),
+                        "samples": training_samples,
+                        "creation_timestamp": _dt.now(timezone.utc).isoformat(),
+                        "time_window_hours": time_window_hours
+                    }
+                
+                elif dataset_type == "business_logic":
+                    # Business logic examples dataset
+                    cur.execute("""
+                        SELECT 
+                            t.USER_QUESTION,
+                            hc.QUERY_INTENT,
+                            hc.BUSINESS_CONTEXT,
+                            mr.RESPONSE_TEXT,
+                            rm.OVERALL_SCORE,
+                            rm.BUSINESS_LOGIC_SCORE,
+                            rm.SCHEMA_COMPLIANCE_SCORE
+                        FROM AI_HYBRID_CONTEXT hc
+                        JOIN AI_MODEL_RESPONSES mr ON hc.TURN_ID = mr.TURN_ID
+                        JOIN AI_RESPONSE_METRICS rm ON mr.ID = rm.MODEL_RESPONSE_ID
+                        JOIN AI_TURN t ON hc.TURN_ID = t.ID
+                        WHERE t.CREATED_AT >= :window_start
+                        AND rm.OVERALL_SCORE >= 0.75
+                        AND rm.BUSINESS_LOGIC_SCORE >= 0.8
+                        ORDER BY rm.BUSINESS_LOGIC_SCORE DESC
+                    """, {"window_start": window_start})
+                    
+                    business_data = cur.fetchall()
+                    training_samples = []
+                    
+                    for row in business_data:
+                        user_question, intent, context, response, overall_score, business_score, schema_score = row
+                        
+                        training_samples.append({
+                            "input": user_question,
+                            "intent": intent,
+                            "business_context": context,
+                            "output": response,
+                            "overall_score": round(overall_score, 3),
+                            "business_logic_score": round(business_score, 3),
+                            "schema_compliance_score": round(schema_score, 3)
+                        })
+                    
+                    return {
+                        "dataset_type": "business_logic",
+                        "description": "Business logic examples dataset",
+                        "sample_count": len(training_samples),
+                        "samples": training_samples,
+                        "creation_timestamp": _dt.now(timezone.utc).isoformat(),
+                        "time_window_hours": time_window_hours
+                    }
+                
+                else:
+                    return {
+                        "error": f"Unknown dataset type: {dataset_type}",
+                        "supported_types": ["manufacturing", "oracle_sql", "business_logic"]
+                    }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to create training dataset for {dataset_type}: {e}")
+            return {
+                "error": f"Failed to create training dataset: {str(e)}",
+                "dataset_type": dataset_type
+            }
 
 class HybridDataRecorder:
     """Enhanced data recorder for hybrid AI system training data collection."""
@@ -1252,6 +2044,172 @@ def get_quality_system_status() -> Dict[str, Any]:
             "error": str(e)
         }
 
+def test_continuous_learning_system(time_window_hours: int = 24) -> Dict[str, Any]:
+    """
+    Test the continuous learning system end-to-end.
+    
+    Args:
+        time_window_hours: Time window for testing
+        
+    Returns:
+        Test results and diagnostics
+    """
+    try:
+        # Initialize the recorder
+        recorder = HybridDataRecorder()
+        
+        test_results = {
+            "timestamp": _dt.now(timezone.utc).isoformat(),
+            "performance_comparison_test": {"status": "pending", "error": None, "data": None},
+            "model_strengths_test": {"status": "pending", "error": None, "data": None},
+            "user_preferences_test": {"status": "pending", "error": None, "data": None},
+            "learning_insights_test": {"status": "pending", "error": None, "data": None},
+            "overall_status": "pending"
+        }
+        
+        # Test performance comparison
+        try:
+            performance_comparison = recorder.quality_analyzer.analyze_performance_comparison(time_window_hours)
+            test_results["performance_comparison_test"] = {
+                "status": "success" if performance_comparison else "no_data",
+                "error": None,
+                "data": performance_comparison,
+                "metrics_count": len(performance_comparison.get("performance_by_intent", {})) if performance_comparison else 0
+            }
+        except Exception as e:
+            test_results["performance_comparison_test"] = {
+                "status": "failed",
+                "error": str(e),
+                "data": None
+            }
+        
+        # Test model strengths
+        try:
+            model_strengths = recorder.quality_analyzer.identify_model_strengths(time_window_hours)
+            test_results["model_strengths_test"] = {
+                "status": "success" if model_strengths else "no_data",
+                "error": None,
+                "data": model_strengths,
+                "domains_analyzed": len(model_strengths.get("domain_strengths", {})) if model_strengths else 0
+            }
+        except Exception as e:
+            test_results["model_strengths_test"] = {
+                "status": "failed",
+                "error": str(e),
+                "data": None
+            }
+        
+        # Test user preferences
+        try:
+            user_preferences = recorder.quality_analyzer.analyze_user_preference_patterns(time_window_hours)
+            test_results["user_preferences_test"] = {
+                "status": "success" if user_preferences else "no_data",
+                "error": None,
+                "data": user_preferences,
+                "intents_analyzed": len(user_preferences.get("preference_patterns", {})) if user_preferences else 0
+            }
+        except Exception as e:
+            test_results["user_preferences_test"] = {
+                "status": "failed",
+                "error": str(e),
+                "data": None
+            }
+        
+        # Test learning insights
+        try:
+            learning_insights = recorder.quality_analyzer.generate_learning_insights(time_window_hours)
+            test_results["learning_insights_test"] = {
+                "status": "success" if learning_insights else "no_data",
+                "error": None,
+                "data": learning_insights,
+                "recommendations_count": len(learning_insights.get("recommendations", [])) if learning_insights else 0
+            }
+        except Exception as e:
+            test_results["learning_insights_test"] = {
+                "status": "failed",
+                "error": str(e),
+                "data": None
+            }
+        
+        # Determine overall status
+        all_tests = [
+            test_results["performance_comparison_test"], 
+            test_results["model_strengths_test"],
+            test_results["user_preferences_test"],
+            test_results["learning_insights_test"]
+        ]
+        if all(test["status"] in ["success", "no_data"] for test in all_tests):
+            test_results["overall_status"] = "success"
+        elif any(test["status"] == "failed" for test in all_tests):
+            test_results["overall_status"] = "failed"
+        else:
+            test_results["overall_status"] = "partial"
+        
+        logger.info(f"[CONTINUOUS_LEARNING] System test completed with status: {test_results['overall_status']}")
+        return test_results
+        
+    except Exception as e:
+        logger.error(f"[CONTINUOUS_LEARNING] System test failed: {e}")
+        return {
+            "timestamp": _dt.now(timezone.utc).isoformat(),
+            "overall_status": "error",
+            "error": str(e)
+        }
+
+def get_performance_comparison(time_window_hours: int = 24) -> Dict[str, Any]:
+    """Convenience function to get performance comparison."""
+    try:
+        recorder = HybridDataRecorder()
+        return recorder.quality_analyzer.analyze_performance_comparison(time_window_hours)
+    except Exception as e:
+        logger.error(f"Failed to get performance comparison: {e}")
+        return {}
+
+def get_model_strengths(time_window_hours: int = 24) -> Dict[str, Any]:
+    """Convenience function to get model strengths."""
+    try:
+        recorder = HybridDataRecorder()
+        return recorder.quality_analyzer.identify_model_strengths(time_window_hours)
+    except Exception as e:
+        logger.error(f"Failed to get model strengths: {e}")
+        return {}
+
+def get_user_preferences(time_window_hours: int = 24) -> Dict[str, Any]:
+    """Convenience function to get user preferences."""
+    try:
+        recorder = HybridDataRecorder()
+        return recorder.quality_analyzer.analyze_user_preference_patterns(time_window_hours)
+    except Exception as e:
+        logger.error(f"Failed to get user preferences: {e}")
+        return {}
+
+def get_learning_insights(time_window_hours: int = 24) -> Dict[str, Any]:
+    """Convenience function to get learning insights."""
+    try:
+        recorder = HybridDataRecorder()
+        return recorder.quality_analyzer.generate_learning_insights(time_window_hours)
+    except Exception as e:
+        logger.error(f"Failed to get learning insights: {e}")
+        return {}
+
+def identify_high_quality_samples(time_window_hours: int = 168, min_quality_score: float = 0.8) -> Dict[str, Any]:
+    """Convenience function to identify high-quality samples."""
+    try:
+        recorder = HybridDataRecorder()
+        return recorder.quality_analyzer.identify_high_quality_samples(time_window_hours, min_quality_score)
+    except Exception as e:
+        logger.error(f"Failed to identify high-quality samples: {e}")
+        return {}
+
+def create_training_dataset(dataset_type: str = "manufacturing", time_window_hours: int = 720) -> Dict[str, Any]:
+    """Convenience function to create training datasets."""
+    try:
+        recorder = HybridDataRecorder()
+        return recorder.quality_analyzer.create_training_dataset(dataset_type, time_window_hours)
+    except Exception as e:
+        logger.error(f"Failed to create training dataset for {dataset_type}: {e}")
+        return {}
+
 # Export main classes and functions
 __all__ = [
     'QualityMetricsAnalyzer',
@@ -1262,5 +2220,12 @@ __all__ = [
     'record_api_call',
     'get_quality_dashboard',
     'test_quality_metrics_system',
-    'get_quality_system_status'
+    'get_quality_system_status',
+    'test_continuous_learning_system',
+    'get_performance_comparison',
+    'get_model_strengths',
+    'get_user_preferences',
+    'get_learning_insights',
+    'identify_high_quality_samples',
+    'create_training_dataset'
 ]

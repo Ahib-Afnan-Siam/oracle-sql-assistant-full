@@ -189,12 +189,13 @@ LOCAL_CONFIDENCE_THRESHOLD = float(os.getenv("LOCAL_CONFIDENCE_THRESHOLD", "0.7"
 SKIP_API_THRESHOLD = float(os.getenv("SKIP_API_THRESHOLD", "0.85"))
 FORCE_HYBRID_THRESHOLD = float(os.getenv("FORCE_HYBRID_THRESHOLD", "0.3"))
 
-# Response Selection Weights
+# Response Selection Weights (Enhanced for manufacturing intelligence)
 RESPONSE_SELECTION_WEIGHTS = {
-    "technical_accuracy": float(os.getenv("WEIGHT_TECHNICAL_ACCURACY", "0.4")),
-    "business_logic": float(os.getenv("WEIGHT_BUSINESS_LOGIC", "0.3")),
-    "performance": float(os.getenv("WEIGHT_PERFORMANCE", "0.2")),
-    "confidence": float(os.getenv("WEIGHT_CONFIDENCE", "0.1"))
+    "technical_accuracy": float(os.getenv("WEIGHT_TECHNICAL_ACCURACY", "0.35")),
+    "business_logic": float(os.getenv("WEIGHT_BUSINESS_LOGIC", "0.35")),
+    "performance": float(os.getenv("WEIGHT_PERFORMANCE", "0.15")),
+    "confidence": float(os.getenv("WEIGHT_CONFIDENCE", "0.10")),
+    "manufacturing_domain": float(os.getenv("WEIGHT_MANUFACTURING_DOMAIN", "0.05"))
 }
 
 # Training Data Collection

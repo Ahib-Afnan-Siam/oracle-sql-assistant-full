@@ -97,22 +97,32 @@ class QueryClassifier:
             r'^\s*(what\s+is|who\s+is|show\s+me)\s+\w+\s*$'
         ]
         
-        # Complex analytics patterns
+        # Complex analytics patterns (enhanced for trend analysis)
         self.complex_patterns = [
             r'\b(trend|analysis|compare|correlation|prediction)\b',
             r'\b(average|median|variance|standard\s+deviation)\b',
             r'\b(group\s+by|order\s+by|having|window\s+function)\b',
-            r'\b(last\s+\d+\s+(months|years)|year\s+over\s+year)\b'
+            r'\b(last\s+\d+\s+(months|years|days|weeks)|year\s+over\s+year)\b',
+            r'\b(monthly|weekly|daily|quarterly)\b',
+            r'\b(over\s+time|time\s+series)\b',
+            r'\b(highest|lowest|top|bottom)\b',
+            r'\b(growth|decline|increase|decrease)\b',
+            r'\b(ranking|rank\s+by)\b',
+            r'\b(performance|productivity)\b'
         ]
 
-        # Entity extraction patterns
+        # Entity extraction patterns (enhanced for trend analysis)
         self.entity_patterns = {
             'companies': r'\b(CAL|Winner|BIP|Chorka\s+Apparel)\b',
             'floors': r'\b(?:Sewing|Cutting|Finishing).{0,20}(?:Floor|F\d+|\d+[A-Z]?)\b',
             'dates': r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}-[A-Z]{3}-\d{2,4}|[A-Z]{3}-\d{2,4})\b',
             'ctl_codes': r'\bCTL-\d{2}-\d{5,6}\b',
-            'metrics': r'\b(production|defect|efficiency|DHU|qty|quantity)\b'
+            'metrics': r'\b(production|defect|efficiency|DHU|qty|quantity|dhu|floor\s+ef)\b',
+            'ordering_directions': r'\b(asc|ascending|desc|descending)\b',
+            'aggregations': r'\b(avg|average|sum|total|count|max|min)\b',
+            'trend_indicators': r'\b(trend|analysis|compare|correlation|monthly|weekly|daily|over\s+time)\b'
         }
+
     def classify_query(self, query: str) -> QueryClassification:
         """
         Classify a user query and determine the best processing strategy.
@@ -227,6 +237,28 @@ class QueryClassifier:
             if op in query.lower():
                 complexity_factors += 0.1
         
+        # Multi-field queries
+        multi_field_indicators = ['vs', 'versus', 'compare', ' and ', '&', ' with ', 'vs.']
+        if any(ind in query.lower() for ind in multi_field_indicators):
+            complexity_factors += 0.25
+        
+        # Time-series analysis
+        time_series_indicators = ['monthly', 'weekly', 'daily', 'quarterly', 'over time', 'trend']
+        if any(ind in query.lower() for ind in time_series_indicators):
+            complexity_factors += 0.25
+        
+        # Trend analysis indicators
+        if entities.get('trend_indicators'):
+            complexity_factors += 0.2
+        
+        # Aggregation complexity
+        if len(entities.get('aggregations', [])) > 1:
+            complexity_factors += 0.15
+            
+        # Ordering complexity
+        if entities.get('ordering_directions'):
+            complexity_factors += 0.1
+        
         return min(complexity_factors, 1.0)  # Cap at 1.0
 
     def _determine_strategy(self, intent: QueryIntent, confidence: float, complexity: float) -> ModelSelectionStrategy:
@@ -247,6 +279,9 @@ class QueryClassifier:
         # HR queries can use parallel processing for better accuracy
         if intent == QueryIntent.HR_EMPLOYEE_QUERY and confidence > 0.5:
             return ModelSelectionStrategy.HYBRID_PARALLEL
+        
+        # Multi-field queries require hybrid processing
+        # This will be determined at query processing time based on content
         
         # Default to hybrid parallel for balanced performance
         return ModelSelectionStrategy.HYBRID_PARALLEL

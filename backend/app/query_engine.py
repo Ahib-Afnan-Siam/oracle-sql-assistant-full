@@ -326,10 +326,45 @@ def _to_enhanced_oracle_date_range(date_obj: datetime, format_type: str) -> Dict
         }
 
 def _extract_relative_dates(query: str) -> Optional[Dict[str, str]]:
-    """Handle relative date expressions like 'last month', 'last 7 days'."""
+    """Handle relative date expressions like 'last month', 'last 7 days', 'last day'."""
     
     query_lower = query.lower()
     today = datetime.now()
+    
+    # Handle "last day" - find the most recent date with data
+    if 'last day' in query_lower or 'yesterday' in query_lower:
+        # For "last day", we'll return a special marker that can be handled by the SQL generator
+        # to use (SELECT MAX(PROD_DATE) FROM T_PROD_DAILY)
+        return {
+            'start': 'LAST_DAY_MARKER',
+            'end': 'LAST_DAY_MARKER',
+            'type': 'last_day'
+        }
+    
+    # Last week (7 days)
+    if 'last week' in query_lower:
+        end_date = today
+        start_date = today - timedelta(days=7)
+        
+        return {
+            'start': f"TO_DATE('{start_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'end': f"TO_DATE('{end_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'type': 'week_range'
+        }
+    
+    # Last N days patterns
+    days_match = re.search(r'last\s+(\d+)\s+days?', query_lower)
+    if days_match:
+        days = int(days_match.group(1))
+        end_date = today
+        start_date = today - timedelta(days=days)
+        
+        return {
+            'start': f"TO_DATE('{start_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'end': f"TO_DATE('{end_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
+            'type': 'days_range',
+            'days': days
+        }
     
     # Last month
     if 'last month' in query_lower:
@@ -351,16 +386,29 @@ def _extract_relative_dates(query: str) -> Optional[Dict[str, str]]:
             'type': 'month_range'
         }
     
-    # Last 7 days
-    if 'last 7 days' in query_lower:
-        end_date = today
-        start_date = today - timedelta(days=7)
-        
-        return {
-            'start': f"TO_DATE('{start_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
-            'end': f"TO_DATE('{end_date.strftime('%d-%b-%Y')}', 'DD-MON-YYYY')",
-            'type': 'week_range'
-        }
+    return None
+
+def _build_date_filter_from_relative_expression(expression: str, date_column: str = 'PROD_DATE') -> Optional[str]:
+    """
+    Build an appropriate Oracle SQL WHERE clause for relative date expressions.
+    """
+    # Handle "last day" expressions
+    if 'last day' in expression.lower() or 'yesterday' in expression.lower():
+        return f"{date_column} = (SELECT MAX({date_column}) FROM T_PROD_DAILY)"
+    
+    # Handle "last week" expressions
+    if 'last week' in expression.lower():
+        return f"{date_column} BETWEEN TRUNC(SYSDATE) - 7 AND TRUNC(SYSDATE) - 1"
+    
+    # Handle "last N days" patterns
+    days_match = re.search(r'last\s+(\d+)\s+days?', expression.lower())
+    if days_match:
+        days = int(days_match.group(1))
+        return f"{date_column} BETWEEN TRUNC(SYSDATE) - {days} AND TRUNC(SYSDATE) - 1"
+    
+    # Handle "last month"
+    if 'last month' in expression.lower():
+        return f"{date_column} BETWEEN TRUNC(SYSDATE, 'MM') - INTERVAL '1' MONTH AND TRUNC(SYSDATE, 'MM') - INTERVAL '1' DAY"
     
     return None
 
@@ -876,7 +924,7 @@ def determine_display_mode(user_query: str, rows: list) -> str:
         # Otherwise, show summary
         return "summary"
     
-    return "table"
+    return "both"
 
 # --- generic-ness detector used by wide projection & widener ------------------
 _GENERIC_MAX_TOKENS = 5
@@ -1258,7 +1306,6 @@ def build_sql_from_plan(plan: Dict[str, Any], selected_db: str, user_query: str)
     limit = plan.get("limit", None)
 
     asked_window = _user_requested_time_window(user_query)
-
     # Optional multi-table support (strict planner/validator governs correctness)
     tables_in_plan: List[str] = plan.get("tables") or []
     joins = plan.get("joins") or []

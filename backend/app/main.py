@@ -1,4 +1,35 @@
 # app/main.py
+"""
+Oracle SQL Assistant - Hybrid AI System
+
+This is the main application entry point for the Oracle SQL Assistant with hybrid AI processing.
+The system combines local Ollama models with cloud API models (OpenRouter) for optimal SQL generation.
+
+Phase 6: Continuous Learning Loop (Day 15+)
+
+New API Endpoints for Continuous Learning:
+- GET /learning/performance-comparison: Compare local vs API model performance by query type
+- GET /learning/model-strengths: Identify model strengths by domain/query type
+- GET /learning/user-preferences: Analyze user preference patterns for different models
+- GET /learning/insights: Get comprehensive learning insights from pattern analysis
+- GET /learning/test-system: Test the continuous learning system end-to-end
+- GET /learning/test-processor: Test the continuous learning system through the hybrid processor
+
+New API Endpoints for Training Data Preparation (Step 6.2):
+- GET /training-data/high-quality-samples: Identify high-quality samples for training data preparation
+- GET /training-data/datasets/{type}: Create training datasets for different domains
+- GET /training-data/processor/high-quality-samples: Identify high-quality samples through the hybrid processor
+- GET /training-data/processor/datasets/{type}: Create training datasets through the hybrid processor
+
+These endpoints provide insights into:
+1. Performance Comparison: Local vs API accuracy by query type, response time analysis, user preference patterns
+2. Model Strength Identification: DeepSeek strengths (production, TNA, Oracle), Llama strengths (HR, business logic), local model improvement areas
+3. Training Data Preparation: High-quality sample identification and training dataset creation
+
+Training Data Preparation Features:
+- High-quality sample identification (API responses that outperformed local, successful query-response pairs, domain-specific improvements needed)
+- Training dataset creation (Manufacturing query patterns, Oracle SQL best practices, Business logic examples)
+"""
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
@@ -159,7 +190,7 @@ async def log_requests(request: Request, call_next):
 # ---------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -620,6 +651,547 @@ async def get_user_satisfaction(time_window: int = 24):
             content={"error": f"Failed to get user satisfaction metrics: {str(e)}"}
         )
 
+@app.get("/quality-metrics/test-system")
+async def test_quality_metrics_system_endpoint(time_window: int = 1):
+    """
+    Test the quality metrics system end-to-end.
+    
+    Args:
+        time_window: Time window in hours for testing (default: 1)
+        
+    Returns:
+        Test results and diagnostics
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    try:
+        # Test with a short time window to minimize load
+        test_results = test_quality_metrics_system(time_window)
+        
+        return {
+            "status": "success",
+            "data": test_results,
+            "metadata": {
+                "endpoint": "quality-metrics-test-system",
+                "version": "1.0",
+                "generated_at": _dt.now().isoformat(),
+                "time_window_hours": time_window
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to test quality metrics system")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to test quality metrics system: {str(e)}"}
+        )
+
+@app.get("/training-data/test")
+async def test_training_data_collection():
+    """
+    Test the training data collection system.
+    
+    Returns:
+        Test results and system status
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Training data collection system not available"}
+        )
+    
+    try:
+        # Test the training data collection system
+        from app.hybrid_processor import HybridProcessor
+        processor = HybridProcessor()
+        test_results = processor.test_training_data_collection()
+        
+        return {
+            "status": "success",
+            "data": test_results,
+            "metadata": {
+                "endpoint": "training-data-test",
+                "version": "1.0",
+                "generated_at": test_results.get("timestamp")
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to test training data collection system")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to test training data collection system: {str(e)}"}
+        )
+
+@app.get("/training-data/status")
+async def get_training_data_status():
+    """
+    Get current status of the training data collection system.
+    
+    Returns:
+        System status information
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Training data collection system not available"}
+        )
+    
+    try:
+        # Get the training data collection system status
+        from app.hybrid_processor import HybridProcessor
+        processor = HybridProcessor()
+        status_info = processor.get_training_data_status()
+        
+        return {
+            "status": "success",
+            "data": status_info,
+            "metadata": {
+                "endpoint": "training-data-status",
+                "version": "1.0",
+                "generated_at": _dt.now().isoformat()
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to get training data collection status")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get training data collection status: {str(e)}"}
+        )
+
+# ------------------------------ Phase 6: Continuous Learning Loop ------------------------------
+
+@app.get("/learning/performance-comparison")
+async def get_performance_comparison(time_window: int = 24):
+    """
+    Phase 6: Get performance comparison between local and API models.
+    
+    Args:
+        time_window: Time window in hours for analysis (default: 24)
+        
+    Returns:
+        Performance comparison metrics by query type
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    try:
+        from app.hybrid_data_recorder import hybrid_data_recorder
+        performance_comparison = hybrid_data_recorder.quality_analyzer.analyze_performance_comparison(time_window)
+        
+        return {
+            "status": "success",
+            "data": performance_comparison,
+            "metadata": {
+                "endpoint": "performance-comparison",
+                "version": "1.0",
+                "generated_at": _dt.now().isoformat(),
+                "time_window_hours": time_window
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to get performance comparison")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get performance comparison: {str(e)}"}
+        )
+
+@app.get("/learning/model-strengths")
+async def get_model_strengths(time_window: int = 24):
+    """
+    Phase 6: Get model strengths by domain/query type.
+    
+    Args:
+        time_window: Time window in hours for analysis (default: 24)
+        
+    Returns:
+        Model strengths by domain/query type
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    try:
+        from app.hybrid_data_recorder import hybrid_data_recorder
+        model_strengths = hybrid_data_recorder.quality_analyzer.identify_model_strengths(time_window)
+        
+        return {
+            "status": "success",
+            "data": model_strengths,
+            "metadata": {
+                "endpoint": "model-strengths",
+                "version": "1.0",
+                "generated_at": _dt.now().isoformat(),
+                "time_window_hours": time_window
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to get model strengths")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get model strengths: {str(e)}"}
+        )
+
+@app.get("/learning/user-preferences")
+async def get_user_preferences(time_window: int = 24):
+    """
+    Phase 6: Get user preference patterns for different models.
+    
+    Args:
+        time_window: Time window in hours for analysis (default: 24)
+        
+    Returns:
+        User preference patterns analysis
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    try:
+        from app.hybrid_data_recorder import hybrid_data_recorder
+        preference_patterns = hybrid_data_recorder.quality_analyzer.analyze_user_preference_patterns(time_window)
+        
+        return {
+            "status": "success",
+            "data": preference_patterns,
+            "metadata": {
+                "endpoint": "user-preferences",
+                "version": "1.0",
+                "generated_at": _dt.now().isoformat(),
+                "time_window_hours": time_window
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to get user preferences")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get user preferences: {str(e)}"}
+        )
+
+@app.get("/learning/insights")
+async def get_learning_insights(time_window: int = 24):
+    """
+    Phase 6: Get comprehensive learning insights from pattern analysis.
+    
+    Args:
+        time_window: Time window in hours for analysis (default: 24)
+        
+    Returns:
+        Comprehensive learning insights
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    try:
+        from app.hybrid_data_recorder import hybrid_data_recorder
+        insights = hybrid_data_recorder.quality_analyzer.generate_learning_insights(time_window)
+        
+        return {
+            "status": "success",
+            "data": insights,
+            "metadata": {
+                "endpoint": "learning-insights",
+                "version": "1.0",
+                "generated_at": _dt.now().isoformat(),
+                "time_window_hours": time_window
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to get learning insights")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get learning insights: {str(e)}"}
+        )
+
+@app.get("/learning/test-system")
+async def test_learning_system(time_window: int = 24):
+    """
+    Phase 6: Test the continuous learning system end-to-end.
+    
+    Args:
+        time_window: Time window in hours for testing (default: 24)
+        
+    Returns:
+        Test results and diagnostics for continuous learning system
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    try:
+        from app.hybrid_data_recorder import test_continuous_learning_system
+        test_results = test_continuous_learning_system(time_window)
+        
+        return {
+            "status": "success",
+            "data": test_results,
+            "metadata": {
+                "endpoint": "learning-test-system",
+                "version": "1.0",
+                "generated_at": test_results.get("timestamp"),
+                "time_window_hours": time_window
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to test continuous learning system")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to test continuous learning system: {str(e)}"}
+        )
+
+@app.get("/learning/test-processor")
+async def test_learning_processor(time_window: int = 24):
+    """
+    Phase 6: Test the continuous learning system through the hybrid processor.
+    
+    Args:
+        time_window: Time window in hours for testing (default: 24)
+        
+    Returns:
+        Test results and diagnostics for continuous learning system via processor
+    """
+    try:
+        from app.hybrid_processor import HybridProcessor
+        processor = HybridProcessor()
+        test_results = processor.test_continuous_learning_system(time_window)
+        
+        return {
+            "status": "success",
+            "data": test_results,
+            "metadata": {
+                "endpoint": "learning-test-processor",
+                "version": "1.0",
+                "generated_at": test_results.get("data", {}).get("timestamp") if test_results.get("data") else None,
+                "time_window_hours": time_window
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to test continuous learning system via processor")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to test continuous learning system via processor: {str(e)}"}
+        )
+
+# ------------------------------ Phase 6.2: Training Data Preparation ------------------------------
+
+@app.get("/training-data/high-quality-samples")
+async def get_high_quality_samples(time_window: int = 168, min_quality: float = 0.8):
+    """
+    Step 6.2: Identify high-quality samples for training data preparation.
+    
+    Args:
+        time_window: Time window in hours for analysis (default: 168 hours/1 week)
+        min_quality: Minimum quality score threshold for high-quality samples (default: 0.8)
+        
+    Returns:
+        High-quality samples categorized by type
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    try:
+        from app.hybrid_data_recorder import hybrid_data_recorder
+        samples = hybrid_data_recorder.quality_analyzer.identify_high_quality_samples(time_window, min_quality)
+        
+        return {
+            "status": "success",
+            "data": samples,
+            "metadata": {
+                "endpoint": "high-quality-samples",
+                "version": "1.0",
+                "generated_at": samples.get("timestamp"),
+                "time_window_hours": time_window,
+                "min_quality_score": min_quality
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to identify high-quality samples")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to identify high-quality samples: {str(e)}"}
+        )
+
+@app.get("/training-data/datasets/{dataset_type}")
+async def get_training_dataset(dataset_type: str, time_window: int = 720):
+    """
+    Step 6.2: Create training datasets for different domains.
+    
+    Args:
+        dataset_type: Type of dataset to create ('manufacturing', 'oracle_sql', 'business_logic')
+        time_window: Time window in hours for analysis (default: 720 hours/30 days)
+        
+    Returns:
+        Training dataset for the specified type
+    """
+    if not QUALITY_METRICS_AVAILABLE:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Quality metrics system not available"}
+        )
+    
+    supported_types = ["manufacturing", "oracle_sql", "business_logic"]
+    if dataset_type not in supported_types:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Unsupported dataset type: {dataset_type}",
+                "supported_types": supported_types
+            }
+        )
+    
+    try:
+        from app.hybrid_data_recorder import hybrid_data_recorder
+        dataset = hybrid_data_recorder.quality_analyzer.create_training_dataset(dataset_type, time_window)
+        
+        if "error" in dataset:
+            return JSONResponse(
+                status_code=400,
+                content=dataset
+            )
+        
+        return {
+            "status": "success",
+            "data": dataset,
+            "metadata": {
+                "endpoint": f"training-dataset-{dataset_type}",
+                "version": "1.0",
+                "generated_at": dataset.get("creation_timestamp"),
+                "time_window_hours": time_window,
+                "dataset_type": dataset_type
+            }
+        }
+        
+    except Exception as e:
+        logger.exception(f"Failed to create training dataset for {dataset_type}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to create training dataset for {dataset_type}: {str(e)}"}
+        )
+
+@app.get("/training-data/processor/high-quality-samples")
+async def get_processor_high_quality_samples(time_window: int = 168, min_quality: float = 0.8):
+    """
+    Step 6.2: Identify high-quality samples through the hybrid processor.
+    
+    Args:
+        time_window: Time window in hours for analysis (default: 168 hours/1 week)
+        min_quality: Minimum quality score threshold (default: 0.8)
+        
+    Returns:
+        High-quality samples categorized by type
+    """
+    try:
+        from app.hybrid_processor import HybridProcessor
+        processor = HybridProcessor()
+        samples = processor.get_high_quality_samples(time_window, min_quality)
+        
+        if samples.get("status") == "unavailable":
+            return JSONResponse(
+                status_code=503,
+                content={"error": "Training data collection system not available"}
+            )
+        
+        return {
+            "status": "success",
+            "data": samples.get("data", {}),
+            "metadata": {
+                "endpoint": "processor-high-quality-samples",
+                "version": "1.0",
+                "time_window_hours": time_window,
+                "min_quality_score": min_quality
+            }
+        }
+        
+    except Exception as e:
+        logger.exception("Failed to identify high-quality samples via processor")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to identify high-quality samples via processor: {str(e)}"}
+        )
+
+@app.get("/training-data/processor/datasets/{dataset_type}")
+async def get_processor_training_dataset(dataset_type: str, time_window: int = 720):
+    """
+    Step 6.2: Create training datasets through the hybrid processor.
+    
+    Args:
+        dataset_type: Type of dataset to create ('manufacturing', 'oracle_sql', 'business_logic')
+        time_window: Time window in hours for analysis (default: 720 hours/30 days)
+        
+    Returns:
+        Training dataset for the specified type
+    """
+    supported_types = ["manufacturing", "oracle_sql", "business_logic"]
+    if dataset_type not in supported_types:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Unsupported dataset type: {dataset_type}",
+                "supported_types": supported_types
+            }
+        )
+    
+    try:
+        from app.hybrid_processor import HybridProcessor
+        processor = HybridProcessor()
+        dataset = processor.create_training_dataset(dataset_type, time_window)
+        
+        if dataset.get("status") == "unavailable":
+            return JSONResponse(
+                status_code=503,
+                content={"error": "Training data collection system not available"}
+            )
+        
+        if dataset.get("status") == "error":
+            return JSONResponse(
+                status_code=500,
+                content={"error": dataset.get("message", "Unknown error")}
+            )
+        
+        return {
+            "status": "success",
+            "data": dataset.get("data", {}),
+            "metadata": {
+                "endpoint": f"processor-training-dataset-{dataset_type}",
+                "version": "1.0",
+                "time_window_hours": time_window,
+                "dataset_type": dataset_type
+            }
+        }
+        
+    except Exception as e:
+        logger.exception(f"Failed to create training dataset {dataset_type} via processor")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to create training dataset {dataset_type} via processor: {str(e)}"}
+        )
 # ---------------------------
 # GET /export/sql  and  GET /export/summary
 # ---------------------------

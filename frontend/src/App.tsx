@@ -9,10 +9,13 @@ function App() {
   const { messages } = useChat();
 
   return (
-    <div className="relative w-full h-full">
-      <div className="flex h-full w-full relative z-10">
+    <div className="relative w-full h-full overflow-hidden">
+      <div className="flex h-full w-full">
+        {/* Sidebar handles its own responsive behavior (desktop rail + mobile drawer) */}
         <Sidebar />
-        <div className="flex-1 flex flex-col bg-transparent bg-none">
+
+        {/* Main area */}
+        <div className="flex-1 flex flex-col bg-transparent">
           <div className="flex-1 flex flex-col overflow-y-auto">
             <AnimatePresence mode="wait">
               {messages.length === 0 ? (
