@@ -1024,7 +1024,6 @@ def _simulate_local_processing_enhanced(user_query: str, schema_context: str) ->
         logger.error(f"Local processing simulation failed: {e}")
         return "SELECT 'Local processing result' as RESPONSE FROM DUAL"
 
-
 # ------------------------------ Advanced response selector ------------------------------
 
 class AdvancedResponseSelector:
@@ -1422,17 +1421,26 @@ class AdvancedParallelProcessor:
                                      user_query: str,
                                      schema_context: str = "",
                                      local_confidence: float = 0.5,
+                                     query_type: str = "sql",  # Add query_type parameter
                                      # Phase 5: Add training data collection parameters
                                      turn_id: Optional[int] = None,
                                      session_id: Optional[str] = None,
                                      client_ip: Optional[str] = None,
                                      user_agent: Optional[str] = None,
-                                     classification_time_ms: float = 0.0) -> ProcessingResult:
+                                     classification_time_ms: float = 0.0,
+                                     # File analysis parameters
+                                     file_content: Optional[str] = None,
+                                     file_name: Optional[str] = None) -> ProcessingResult:
         """
         Advanced parallel processing with sophisticated response selection.
         """
         start_time = time.time()
         processing_result = None
+        
+        # Handle general queries - bypass SQL-specific processing
+        if query_type == "general":
+            # Fix: Add await since _process_general_query is an async function
+            return await self._process_general_query(user_query, schema_context, file_content, file_name)
         
         # ---- Helper: pick a safe reasoning list (never None / never undefined)
         def _pick_reasoning(*candidates):
@@ -2050,6 +2058,7 @@ class HybridProcessor(AdvancedParallelProcessor):
                           user_query: str, 
                           schema_context: str = "", 
                           local_confidence: float = 0.5,
+                          query_type: str = "sql",  # Add query_type parameter
                           # Phase 5: Add training data collection parameters
                           turn_id: Optional[int] = None,
                           session_id: Optional[str] = None,
@@ -2063,6 +2072,7 @@ class HybridProcessor(AdvancedParallelProcessor):
             user_query: The user's natural language query
             schema_context: Database schema context
             local_confidence: Confidence in local model response
+            query_type: Type of query - "sql" (default) or "general"
             turn_id: Reference to AI_TURN table for training data
             session_id: Session identifier for user pattern tracking
             client_ip: Client IP for user pattern tracking
@@ -2077,6 +2087,7 @@ class HybridProcessor(AdvancedParallelProcessor):
             user_query=user_query,
             schema_context=schema_context,
             local_confidence=local_confidence,
+            query_type=query_type,  # Pass query_type parameter
             turn_id=turn_id,
             session_id=session_id,
             client_ip=client_ip,
@@ -2472,3 +2483,247 @@ class HybridProcessor(AdvancedParallelProcessor):
         except Exception as e:
             self.logger.error(f"[TRAINING_DATA] Failed to record training data: {e}")
             return {}
+
+    def _process_general_query(self, user_query: str, schema_context: str = "", 
+                              file_content: Optional[str] = None, 
+                              file_name: Optional[str] = None) -> ProcessingResult:
+        """
+        Process general knowledge queries using API models without fallback to local models.
+        """
+        start_time = time.time()
+        
+        try:
+            # Use OpenRouter client for general knowledge queries
+            from .openrouter_client import get_openrouter_client
+            client = get_openrouter_client()
+            
+            # Check if this is a file analysis request
+            if file_content and file_name:
+                # File analysis mode - use multimodal capabilities
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Please analyze the following file and answer the question: {user_query}\n\nFile Name: {file_name}"
+                            },
+                            {
+                                "type": "text",
+                                "text": f"File Content:\n{file_content}"
+                            }
+                        ]
+                    }
+                ]
+            else:
+                # Regular general knowledge mode
+                messages = [
+                    {"role": "system", "content": schema_context},
+                    {"role": "user", "content": user_query}
+                ]
+            
+            # Use appropriate model for general queries
+            # Use the general model configuration from config
+            model_config = config.API_MODELS.get("general", {
+                "primary": "deepseek/deepseek-chat",
+                "secondary": "openchat/openchat-8b",
+                "fallback": "microsoft/WizardLM-2-8x22B"
+            })
+            
+            # For file analysis, use Gemini Flash 1.5 exclusively
+            if file_content and file_name:
+                model = "google/gemini-flash-1.5"
+            else:
+                model = model_config["primary"]
+            
+            # Make API call
+            response = client._make_request_sync({  # Use sync version to avoid async issues
+                "model": model,
+                "messages": messages,
+                "temperature": 0.3 if file_content and file_name else 0.7,  # Lower temperature for file analysis
+                "max_tokens": 2048 if file_content and file_name else 1024
+            })
+            
+            processing_time = time.time() - start_time
+            
+            if response.success and response.content:
+                return ProcessingResult(
+                    selected_response=response.content,
+                    local_response=None,
+                    api_response=response.content,
+                    processing_mode="file_analysis" if file_content and file_name else "general_query",
+                    selection_reasoning="Generated response for file analysis" if file_content and file_name else "Generated response for general knowledge query",
+                    local_confidence=0.0,
+                    api_confidence=0.95 if file_content and file_name else 0.9,  # Higher confidence for file analysis
+                    processing_time=processing_time,
+                    model_used=model,
+                    local_model_name=None,
+                    api_model_name=model,
+                    local_processing_time=None,
+                    api_processing_time=processing_time
+                )
+            else:
+                # For general mode, don't fallback to local model - return error instead
+                processing_time = time.time() - start_time
+                
+                return ProcessingResult(
+                    selected_response=f"Sorry, I couldn't process that general question. The API service is currently unavailable. Please try again later.",
+                    local_response=None,
+                    api_response=None,
+                    processing_mode="general_query_api_error",
+                    selection_reasoning="API service unavailable for general query",
+                    local_confidence=0.0,
+                    api_confidence=0.0,
+                    processing_time=processing_time,
+                    model_used="api_error",
+                    local_model_name=None,
+                    api_model_name=None,
+                    local_processing_time=None,
+                    api_processing_time=None
+                )
+                
+        except Exception as e:
+            self.logger.error(f"[HYBRID_PROCESSOR] General query processing failed: {e}")
+            processing_time = time.time() - start_time
+            
+            return ProcessingResult(
+                selected_response=f"Sorry, I couldn't process that general question: {str(e)}",
+                local_response=None,
+                api_response=None,
+                processing_mode="general_query_error",
+                selection_reasoning=f"Error during general query processing: {str(e)}",
+                local_confidence=0.0,
+                api_confidence=0.0,
+                processing_time=processing_time,
+                model_used="error",
+                local_model_name=None,
+                api_model_name=None,
+                local_processing_time=None,
+                api_processing_time=None
+            )
+
+    async def _process_general_query(self, user_query: str, schema_context: str, file_content: Optional[str] = None, file_name: Optional[str] = None) -> ProcessingResult:
+        """
+        Process general knowledge queries that don't require SQL generation.
+        
+        Args:
+            user_query: The user's general knowledge question
+            schema_context: Context/instructions for the AI model
+            file_content: Optional file content for file analysis
+            file_name: Optional file name for file analysis
+            
+        Returns:
+            ProcessingResult with the general knowledge response
+        """
+        start_time = time.time()
+        
+        try:
+            # Use OpenRouter client for general knowledge queries
+            from .openrouter_client import get_openrouter_client
+            client = get_openrouter_client()
+            
+            # Check if this is a file analysis request
+            if file_content and file_name:
+                # File analysis mode - use multimodal capabilities
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Please analyze the following file and answer the question: {user_query}\n\nFile Name: {file_name}"
+                            },
+                            {
+                                "type": "text",
+                                "text": f"File Content:\n{file_content}"
+                            }
+                        ]
+                    }
+                ]
+            else:
+                # Regular general knowledge mode
+                messages = [
+                    {"role": "system", "content": schema_context},
+                    {"role": "user", "content": user_query}
+                ]
+            
+            # Use appropriate model for general queries
+            # Use the general model configuration from config
+            model_config = config.API_MODELS.get("general", {
+                "primary": "deepseek/deepseek-chat",
+                "secondary": "openchat/openchat-8b",
+                "fallback": "microsoft/WizardLM-2-8x22B"
+            })
+            
+            # For file analysis, use Gemini Flash 1.5 exclusively
+            if file_content and file_name:
+                model = "google/gemini-flash-1.5"
+            else:
+                model = model_config["primary"]
+            
+            # Make API call
+            response = await client.chat_completion(
+                messages=messages,
+                model=model,
+                temperature=0.3 if file_content and file_name else 0.7,  # Lower temperature for file analysis
+                max_tokens=2048 if file_content and file_name else 1024
+            )
+            
+            processing_time = time.time() - start_time
+            
+            if response.success and response.content:
+                return ProcessingResult(
+                    selected_response=response.content,
+                    local_response=None,
+                    api_response=response.content,
+                    processing_mode="file_analysis" if file_content and file_name else "general_query",
+                    selection_reasoning="Generated response for file analysis" if file_content and file_name else "Generated response for general knowledge query",
+                    local_confidence=0.0,
+                    api_confidence=0.95 if file_content and file_name else 0.9,  # Higher confidence for file analysis
+                    processing_time=processing_time,
+                    model_used=model,
+                    local_model_name=None,
+                    api_model_name=model,
+                    local_processing_time=None,
+                    api_processing_time=processing_time
+                )
+            else:
+                # For general mode, don't fallback to local model - return error instead
+                # This ensures that general mode uses API models independently
+                processing_time = time.time() - start_time
+                
+                return ProcessingResult(
+                    selected_response=f"Sorry, I couldn't process that general question. The API service is currently unavailable or taking too long to respond. Please try again later.",
+                    local_response=None,
+                    api_response=None,
+                    processing_mode="general_query_api_error",
+                    selection_reasoning="API service unavailable or timeout for general query",
+                    local_confidence=0.0,
+                    api_confidence=0.0,
+                    processing_time=processing_time,
+                    model_used="api_error",
+                    local_model_name=None,
+                    api_model_name=None,
+                    local_processing_time=None,
+                    api_processing_time=None
+                )
+                
+        except Exception as e:
+            self.logger.error(f"[HYBRID_PROCESSOR] General query processing failed: {e}")
+            processing_time = time.time() - start_time
+            
+            return ProcessingResult(
+                selected_response=f"Sorry, I couldn't process that general question: {str(e)}",
+                local_response=None,
+                api_response=None,
+                processing_mode="general_query_error",
+                selection_reasoning=f"Error during general query processing: {str(e)}",
+                local_confidence=0.0,
+                api_confidence=0.0,
+                processing_time=processing_time,
+                model_used="error",
+                local_model_name=None,
+                api_model_name=None,
+                local_processing_time=None,
+                api_processing_time=None
+            )

@@ -30,7 +30,7 @@ Training Data Preparation Features:
 - High-quality sample identification (API responses that outperformed local, successful query-response pairs, domain-specific improvements needed)
 - Training dataset creation (Manufacturing query patterns, Oracle SQL best practices, Business logic examples)
 """
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pathlib import Path
@@ -135,7 +135,210 @@ def configure_logging():
     for name in ("app", "app.rag_engine", "app.query_engine", "app.ollama_llm", "app.db_connector"):
         logging.getLogger(name).setLevel(level)
 
+# Configure logging
 configure_logging()
+
+# File storage configuration
+FILE_STORAGE_PATH = Path("uploaded_files")
+FILE_STORAGE_PATH.mkdir(exist_ok=True)
+
+# Security configuration
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+ALLOWED_FILE_TYPES = {
+    'application/pdf': '.pdf',
+    'application/msword': '.doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+    'text/plain': '.txt',
+    'text/csv': '.csv',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/gif': '.gif'
+}
+
+# Rate limiting configuration
+FILE_UPLOAD_LIMIT_PER_USER = 10  # Max uploads per user per hour
+PROCESSING_RATE_LIMIT = 5  # Max file processing requests per user per minute
+API_QUOTA_LIMIT = 1000  # Max API calls per day
+
+# In-memory storage for rate limiting (in production, use Redis or database)
+user_upload_counts = {}  # user_id: count
+user_processing_counts = {}  # user_id: count
+api_usage_counts = {}  # date: count
+
+def _get_client_identifier(request: Request) -> str:
+    """
+    Get a unique identifier for the client.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Client identifier string
+    """
+    # Use client IP and User-Agent for identification
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    return f"{client_ip}:{user_agent}"
+
+def _check_rate_limits(client_id: str) -> Dict[str, bool]:
+    """
+    Check if client has exceeded rate limits.
+    
+    Args:
+        client_id: Client identifier
+        
+    Returns:
+        Dictionary with rate limit status
+    """
+    import time
+    current_time = time.time()
+    
+    # Check file upload limit (per hour)
+    upload_key = f"{client_id}:{int(current_time // 3600)}"
+    upload_count = user_upload_counts.get(upload_key, 0)
+    upload_limited = upload_count >= FILE_UPLOAD_LIMIT_PER_USER
+    
+    # Check processing rate limit (per minute)
+    processing_key = f"{client_id}:{int(current_time // 60)}"
+    processing_count = user_processing_counts.get(processing_key, 0)
+    processing_limited = processing_count >= PROCESSING_RATE_LIMIT
+    
+    # Check API quota (per day)
+    date_key = time.strftime("%Y-%m-%d", time.gmtime(current_time))
+    api_count = api_usage_counts.get(date_key, 0)
+    api_limited = api_count >= API_QUOTA_LIMIT
+    
+    return {
+        "upload_limited": upload_limited,
+        "processing_limited": processing_limited,
+        "api_limited": api_limited
+    }
+
+def _increment_rate_counters(client_id: str):
+    """
+    Increment rate limit counters for a client.
+    
+    Args:
+        client_id: Client identifier
+    """
+    import time
+    current_time = time.time()
+    
+    # Increment upload counter
+    upload_key = f"{client_id}:{int(current_time // 3600)}"
+    user_upload_counts[upload_key] = user_upload_counts.get(upload_key, 0) + 1
+    
+    # Increment processing counter
+    processing_key = f"{client_id}:{int(current_time // 60)}"
+    user_processing_counts[processing_key] = user_processing_counts.get(processing_key, 0) + 1
+    
+    # Increment API usage counter
+    date_key = time.strftime("%Y-%m-%d", time.gmtime(current_time))
+    api_usage_counts[date_key] = api_usage_counts.get(date_key, 0) + 1
+
+def _sanitize_filename(filename: str) -> str:
+    """
+    Sanitize filename to prevent directory traversal attacks.
+    
+    Args:
+        filename: Original filename
+        
+    Returns:
+        Sanitized filename
+    """
+    import re
+    import os
+    # Remove path traversal attempts
+    filename = re.sub(r'[^\w\-_\.]', '_', filename)
+    # Ensure filename doesn't start with dots or slashes
+    filename = filename.lstrip('.\/')
+    # Limit filename length
+    if len(filename) > 255:
+        name, ext = os.path.splitext(filename)
+        filename = name[:255-len(ext)] + ext
+    return filename
+
+def _validate_file_content(file_path: Path) -> bool:
+    """
+    Validate file content for security purposes.
+    
+    Args:
+        file_path: Path to the file to validate
+        
+    Returns:
+        True if file is safe, False otherwise
+    """
+    try:
+        # Check file size
+        if file_path.stat().st_size > MAX_FILE_SIZE:
+            return False
+            
+        # For text files, check for potentially dangerous content
+        text_extensions = {'.txt', '.csv'}
+        if file_path.suffix.lower() in text_extensions:
+            with open(file_path, 'rb') as f:
+                # Read first 4096 bytes to check for dangerous patterns
+                content = f.read(4096)
+                # Check for common attack patterns
+                dangerous_patterns = [
+                    b'exec', b'eval', b'import', b'os\.', b'subprocess', 
+                    b'popen', b'system', b'__import__', b'__file__',
+                    b'<script', b'javascript:', b'vbscript:', b'onload=',
+                    b'onerror=', b'onclick=', b'<iframe', b'<object'
+                ]
+                content_lower = content.lower()
+                for pattern in dangerous_patterns:
+                    if pattern in content_lower:
+                        logger.warning(f"Dangerous pattern '{pattern}' found in file {file_path}")
+                        return False
+                        
+        # For image files, basic format validation
+        image_extensions = {'.png', '.jpg', '.jpeg', '.gif'}
+        if file_path.suffix.lower() in image_extensions:
+            try:
+                from PIL import Image
+                with Image.open(file_path) as img:
+                    img.verify()  # Verify it's a valid image
+            except Exception:
+                logger.warning(f"Invalid image file: {file_path}")
+                return False
+                
+        # For PDF files, basic validation
+        if file_path.suffix.lower() == '.pdf':
+            try:
+                with open(file_path, 'rb') as f:
+                    header = f.read(4)
+                    if header != b'%PDF':
+                        logger.warning(f"Invalid PDF file header: {file_path}")
+                        return False
+            except Exception:
+                logger.warning(f"Cannot read PDF file: {file_path}")
+                return False
+                
+        return True
+    except Exception as e:
+        logger.error(f"Error validating file content {file_path}: {e}")
+        return False
+
+def _cleanup_expired_files():
+    """
+    Cleanup expired files from storage.
+    """
+    import time
+    try:
+        current_time = time.time()
+        # Files older than 24 hours will be deleted
+        expiry_time = 24 * 60 * 60
+        
+        for file_path in FILE_STORAGE_PATH.iterdir():
+            if file_path.is_file():
+                file_age = current_time - file_path.stat().st_mtime
+                if file_age > expiry_time:
+                    file_path.unlink()
+                    logger.info(f"Cleaned up expired file: {file_path}")
+    except Exception as e:
+        logger.error(f"Error during file cleanup: {e}")
 
 def generate_session_id(request: Request) -> Optional[str]:
     """
@@ -256,7 +459,11 @@ except ImportError:
 # ---------------------------
 class Question(BaseModel):
     question: str
-    selected_db: str = "source_db_1"
+    # Frontend now sends "" for General, "source_db_1" for SOS, "source_db_2" for Test DB.
+    # Keep optional & permissive for backward-compatibility with aliases.
+    selected_db: Optional[str] = ""
+    # New explicit mode values: "General" | "SOS" | "Test DB" (case-insensitive)
+    mode: str = "General"
 
 class FeedbackIn(BaseModel):
     turn_id: int
@@ -266,6 +473,21 @@ class FeedbackIn(BaseModel):
     summary_sample_id: Optional[int] = None
     comment: Optional[str] = None
     labeler_role: Optional[str] = "end_user"
+
+# File upload models
+class FileUploadResponse(BaseModel):
+    file_id: str
+    filename: str
+    size: int
+    content_type: str
+
+class FileAnalysisRequest(BaseModel):
+    file_id: str
+    question: str
+
+class FileAnalysisResponse(BaseModel):
+    status: str
+    summary: str
 
 # ---------------------------
 # Helpers
@@ -289,6 +511,45 @@ def get_valid_columns() -> list:
     Hook for column hints in Oracle errors, if you wire a live validator later.
     """
     return []
+
+def _normalize_mode(mode: Optional[str]) -> str:
+    """
+    Normalize inbound mode strings to one of: 'General', 'SOS', 'Test DB'
+    Accepts legacy/loose inputs like 'database', 'sos', 'test', 'test_db'.
+    """
+    if not mode:
+        return "General"
+    m = mode.strip().lower()
+    if m in ("general", "gen"):
+        return "General"
+    if m in ("sos", "source_db_1", "db1"):
+        return "SOS"
+    if m in ("test db", "test_db", "test", "source_db_2", "db2"):
+        return "Test DB"
+    if m in ("database", "db"):  # legacy "database" → treat as DB mode but require a db selection
+        # fallback: if no DB provided we’ll handle below, else keep selection
+        return "SOS" if os.getenv("DEFAULT_DB_MODE", "sos").lower() == "sos" else "Test DB"
+    return "General"
+
+def _normalize_selected_db(selected_db: Optional[str], mode: str) -> str:
+    """
+    Normalize DB aliases to canonical IDs or empty for General.
+    """
+    if mode == "General":
+        return ""
+    # If caller supplied an explicit DB, normalize it; else infer from mode
+    if not selected_db or not selected_db.strip():
+        return "source_db_1" if mode == "SOS" else "source_db_2"
+    s = selected_db.strip().lower()
+    if s in ("sos", "source_db_1", "db1"):
+        return "source_db_1"
+    if s in ("test", "test_db", "source_db_2", "db2"):
+        return "source_db_2"
+    # Allow already-canonical values to pass through
+    if selected_db in ("source_db_1", "source_db_2"):
+        return selected_db
+    # Unknown → leave empty to force General-like behavior (safe)
+    return ""
 
 # ---------------------------
 # Oracle exception handler (expanded map)
@@ -324,10 +585,17 @@ async def chat_api(question: Question, request: Request):
         if not question.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+        # Determine & normalize mode/DB
+        mode_in = question.mode
+        selected_db_in = question.selected_db
+        mode = _normalize_mode(mode_in)  # 'General' | 'SOS' | 'Test DB'
+        selected_db = _normalize_selected_db(selected_db_in, mode)  # "" | source_db_1 | source_db_2
+
         # === Call the RAG orchestrator with training data parameters ===
         output = await rag_answer(
             question.question, 
-            selected_db=question.selected_db,
+            selected_db=selected_db,
+            mode=mode,  # Pass the new mode parameter
             # Phase 5: Pass training data collection parameters for hybrid processing
             session_id=generate_session_id(request),
             client_ip=request.client.host if request and request.client else None,
@@ -395,7 +663,7 @@ async def chat_api(question: Question, request: Request):
                 }
 
                 turn_id = insert_turn(
-                    source_db_id=question.selected_db,
+                    source_db_id=selected_db,  # ← use effective DB after normalization
                     client_ip=request.client.host if request and request.client else None,
                     user_question=question.question,
                     schema_context_text=schema_text,
@@ -406,10 +674,8 @@ async def chat_api(question: Question, request: Request):
                 # Phase 5: Update hybrid processing call with training data parameters
                 if hybrid_meta and hybrid_meta.get("training_data_recorded") and COLLECT_TRAINING_DATA:
                     try:
-                        # Re-call hybrid processing with actual turn_id for complete training data collection
                         logger.info(f"[MAIN] Updating hybrid training data with turn_id {turn_id}")
-                        # Note: This is for future enhancement where we might want to update training data
-                        # with the actual turn_id after it's created
+                        # future enhancement hook
                     except Exception as e:
                         logger.warning(f"[MAIN] Failed to update hybrid training data: {e}")
 
@@ -1192,6 +1458,7 @@ async def get_processor_training_dataset(dataset_type: str, time_window: int = 7
             status_code=500,
             content={"error": f"Failed to create training dataset {dataset_type} via processor: {str(e)}"}
         )
+
 # ---------------------------
 # GET /export/sql  and  GET /export/summary
 # ---------------------------
@@ -1259,3 +1526,296 @@ async def export_summary():
     except Exception as e:
         logging.getLogger(__name__).error(f"/export/summary failed: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": "export failed"})
+
+# ---------------------------
+# File Upload and Analysis Endpoints
+# ---------------------------
+
+@app.post("/upload-file", response_model=FileUploadResponse)
+async def upload_file(file: UploadFile = File(...), request: Request = None):
+    """
+    Upload a file for analysis.
+    
+    Args:
+        file: The file to upload
+        request: FastAPI Request object for rate limiting
+        
+    Returns:
+        File upload response with file metadata
+    """
+    try:
+        # Rate limiting check
+        if request:
+            client_id = _get_client_identifier(request)
+            rate_limits = _check_rate_limits(client_id)
+            
+            if rate_limits["upload_limited"]:
+                raise HTTPException(
+                    status_code=429,
+                    detail="File upload rate limit exceeded. Maximum 10 uploads per hour."
+                )
+        
+        # Validate file size (5MB limit)
+        contents = await file.read()
+        file_size = len(contents)
+        
+        if file_size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"File size exceeds 5MB limit. Current size: {file_size} bytes"
+            )
+        
+        # Validate file type
+        if file.content_type not in ALLOWED_FILE_TYPES:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"File type not supported. Supported types: {', '.join(ALLOWED_FILE_TYPES.keys())}"
+            )
+        
+        # Generate unique file ID
+        file_id = str(uuid.uuid4())
+        file_extension = ALLOWED_FILE_TYPES[file.content_type]
+        filename = _sanitize_filename(file.filename)
+        safe_filename = f"{file_id}{file_extension}"
+        file_path = FILE_STORAGE_PATH / safe_filename
+        
+        # Save file to disk
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        
+        # Validate file content for security
+        if not _validate_file_content(file_path):
+            # Remove the file if it's not safe
+            file_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=400, 
+                detail="File content validation failed. File may contain unsafe content."
+            )
+        
+        # Increment rate counter
+        if request:
+            client_id = _get_client_identifier(request)
+            _increment_rate_counters(client_id)
+        
+        # Cleanup expired files periodically
+        import random
+        if random.randint(1, 100) <= 5:  # 5% chance to trigger cleanup
+            _cleanup_expired_files()
+        
+        # Return file metadata
+        return FileUploadResponse(
+            file_id=file_id,
+            filename=filename,
+            size=file_size,
+            content_type=file.content_type
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to upload file")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to upload file: {str(e)}"
+        )
+
+@app.post("/analyze-file")
+async def analyze_file(request: FileAnalysisRequest, req: Request = None):
+    """
+    Analyze an uploaded file using Google Gemini Flash 1.5.
+    
+    Args:
+        request: File analysis request containing file ID and question
+        req: FastAPI Request object for rate limiting
+        
+    Returns:
+        File analysis response with summary from Gemini Flash 1.5
+    """
+    try:
+        # Rate limiting check
+        if req:
+            client_id = _get_client_identifier(req)
+            rate_limits = _check_rate_limits(client_id)
+            
+            if rate_limits["processing_limited"]:
+                raise HTTPException(
+                    status_code=429,
+                    detail="File processing rate limit exceeded. Maximum 5 processing requests per minute."
+                )
+            
+            # Check API quota
+            if rate_limits["api_limited"]:
+                raise HTTPException(
+                    status_code=429,
+                    detail="API quota limit exceeded. Please try again tomorrow."
+                )
+        
+        # Validate file exists
+        file_path = FILE_STORAGE_PATH / f"{request.file_id}"
+        if not file_path.exists():
+            # Try with extensions
+            found = False
+            for ext in ['.pdf', '.doc', '.docx', '.txt', '.csv', '.xlsx', '.png', '.jpg', '.jpeg', '.gif']:
+                file_path = FILE_STORAGE_PATH / f"{request.file_id}{ext}"
+                if file_path.exists():
+                    found = True
+                    break
+            
+            if not found:
+                raise HTTPException(status_code=404, detail="File not found")
+        
+        # Security check: Validate file content
+        if not _validate_file_content(file_path):
+            raise HTTPException(
+                status_code=400, 
+                detail="File content validation failed. File may contain unsafe content."
+            )
+        
+        # Use OpenRouter client to call Gemini Flash 1.5
+        from app.openrouter_client import OpenRouterClient, OpenRouterError
+        try:
+            client = OpenRouterClient()
+            # Use Gemini Flash 1.5 model specifically for file analysis
+            model = "google/gemini-flash-1.5"
+            
+            # Encode file for API transmission
+            file_data = client.encode_file_for_api(str(file_path))
+            if not file_data:
+                raise HTTPException(status_code=500, detail="Failed to encode file for analysis")
+            
+            # Create multimodal message
+            messages = client.create_multimodal_message(
+                text_content=f"Please analyze the following file and answer the question: {request.question}",
+                file_data=file_data
+            )
+            
+            # Add plugins configuration for PDF processing
+            plugins = [
+                {
+                    "id": "file-parser",
+                    "pdf": {
+                        "engine": "pdf-text"  # Use free text extraction for PDFs
+                    }
+                }
+            ]
+            
+            # Increment rate counters
+            if req:
+                client_id = _get_client_identifier(req)
+                _increment_rate_counters(client_id)
+            
+            response = await client.chat_completion(
+                messages=messages,
+                model=model,
+                temperature=0.3,
+                max_tokens=1000,
+                plugins=plugins
+            )
+            
+            if response.success:
+                return {
+                    "status": "success",
+                    "summary": response.content,
+                    "model_used": model
+                }
+            else:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Failed to analyze file with Gemini Flash 1.5: {response.error}"
+                )
+                
+        except OpenRouterError as e:
+            logger.exception("OpenRouter API error")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"OpenRouter API error: {str(e)}"
+            )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to analyze file")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to analyze file: {str(e)}"
+        )
+
+@app.get("/file-upload-status")
+async def get_file_upload_status(request: Request):
+    """
+    Get current file upload status and rate limits for the user.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        File upload status and rate limit information
+    """
+    try:
+        client_id = _get_client_identifier(request)
+        rate_limits = _check_rate_limits(client_id)
+        
+        import time
+        current_time = time.time()
+        
+        # Get current counts
+        upload_key = f"{client_id}:{int(current_time // 3600)}"
+        upload_count = user_upload_counts.get(upload_key, 0)
+        
+        processing_key = f"{client_id}:{int(current_time // 60)}"
+        processing_count = user_processing_counts.get(processing_key, 0)
+        
+        date_key = time.strftime("%Y-%m-%d", time.gmtime(current_time))
+        api_count = api_usage_counts.get(date_key, 0)
+        
+        return {
+            "status": "success",
+            "rate_limits": {
+                "upload": {
+                    "current": upload_count,
+                    "limit": FILE_UPLOAD_LIMIT_PER_USER,
+                    "remaining": max(0, FILE_UPLOAD_LIMIT_PER_USER - upload_count),
+                    "reset_time": "Next hour"
+                },
+                "processing": {
+                    "current": processing_count,
+                    "limit": PROCESSING_RATE_LIMIT,
+                    "remaining": max(0, PROCESSING_RATE_LIMIT - processing_count),
+                    "reset_time": "Next minute"
+                },
+                "api_quota": {
+                    "current": api_count,
+                    "limit": API_QUOTA_LIMIT,
+                    "remaining": max(0, API_QUOTA_LIMIT - api_count),
+                    "reset_time": "Tomorrow"
+                }
+            },
+            "limits_exceeded": rate_limits
+        }
+    except Exception as e:
+        logger.exception("Failed to get file upload status")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to get file upload status: {str(e)}"
+        )
+
+@app.post("/cleanup-expired-files")
+async def cleanup_expired_files():
+    """
+    Cleanup expired files from storage (administrative endpoint).
+    
+    Returns:
+        Cleanup result
+    """
+    try:
+        _cleanup_expired_files()
+        return {
+            "status": "success",
+            "message": "Expired files cleaned up successfully"
+        }
+    except Exception as e:
+        logger.exception("Failed to cleanup expired files")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to cleanup expired files: {str(e)}"
+        )

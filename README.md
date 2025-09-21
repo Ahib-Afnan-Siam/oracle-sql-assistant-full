@@ -1,4 +1,4 @@
-# Oracle SQL Assistant
+# Uttoron - Oracle SQL Assistant
 
 > A sophisticated natural-language-to-SQL system that lets users query **Oracle databases** with conversational input. It pairs advanced AI processing with a user-friendly interface to **generate, execute, and visualize** Oracle SQL from plain English.
 
@@ -13,6 +13,7 @@
   - [Training & Feedback System](#training--feedback-system)
 - [🏗️ Architecture](#-architecture)
 - [🧰 Technology Stack](#-technology-stack)
+- [🎨 Branding and Logos](#-branding-and-logos)
 - [🛠️ Installation](#-installation)
   - [Backend Setup](#backend-setup)
   - [Frontend Setup](#frontend-setup)
@@ -33,7 +34,7 @@
   - [Quality Metrics Endpoints](#quality-metrics-endpoints)
 - [🧩 Development](#-development)
   - [Backend Development (FastAPI)](#backend-development-fastapi)
-  - [Frontend Development (React--typescript)](#frontend-development-react--typescript)
+  - [Frontend Development (React/TypeScript)](#frontend-development-reacttypescript)
 - [✅ Testing](#-testing)
 - [🧰 Troubleshooting](#-troubleshooting)
   - [Common Issues](#common-issues)
@@ -45,7 +46,7 @@
 ---
 
 ## Overview
-This application converts English queries into **executable Oracle SQL**, runs them directly against your Oracle databases, and presents results in **tables or charts**—with rich error handling and schema-aware reasoning.
+Uttoron converts English queries into **executable Oracle SQL**, runs them directly against your Oracle databases, and presents results in **tables or charts**—with rich error handling and schema-aware reasoning.
 
 ---
 
@@ -75,7 +76,7 @@ This application converts English queries into **executable Oracle SQL**, runs t
 
 ## 🏗️ Architecture
 ```text
-oracle-sql-assistant/
+uttoron/
 ├── backend/                     # FastAPI backend application
 │   ├── app/                     # Main application code
 │   │   ├── rag_engine.py        # RAG orchestration and query processing
@@ -116,6 +117,29 @@ oracle-sql-assistant/
 - **Database:** Oracle access  
 - **Local Inference:** Ollama  
 - **Vector DB:** ChromaDB
+
+---
+
+## 🎨 Branding and Logos
+
+Uttoron uses the following logos for branding:
+
+### Main Logo
+- **File:** `frontend/public/Uttoron 1-01.png`
+- **Size:** 117.9KB
+- **Usage:** Primary branding in the application header and marketing materials
+
+### Alternative Logo
+- **File:** `frontend/public/Uttoron Loog-01.png`
+- **Size:** 164.8KB
+- **Usage:** Alternative branding option with different styling
+
+### Background Gradient
+- **File:** `frontend/public/gradient-bg.png`
+- **Size:** 1369.7KB
+- **Usage:** Background element for UI components with glassmorphism effects
+
+All logos are stored in the `frontend/public/` directory and are automatically served by the Vite development server. For production deployment, these assets should be included in the build output.
 
 ---
 
@@ -231,9 +255,9 @@ OPENROUTER_API_KEY=your_openrouter_api_key
 Start the FastAPI server:
 ```bash
 cd backend
-uvicorn app.main:app --port **** --reload
+uvicorn app.main:app --port 8000 --reload
 ```
-The backend will be available at **Your localhot and port**
+The backend will be available at **http://localhost:8000**
 
 ### Frontend
 Start the React development server:
@@ -241,23 +265,23 @@ Start the React development server:
 cd frontend
 npm run dev
 ```
-The frontend will be available at **Your localhot and port**
+The frontend will be available at **http://localhost:5173**
 
 ---
 
 ## 🚀 Usage
 
-1. Open the web interface at **Your localhot and port** 
+1. Open the web interface at **http://localhost:5173** 
 2. Type your natural-language query in the chat input  
 3. View the **generated SQL** and **execution results**  
 4. Provide **feedback** on the response quality  
 5. **Visualize** data using the built-in charting capabilities  
 
 ### 🧪 Example Queries
-- “Show me production data for **CAL sewing floor 2** from **last month**”
-- “What is the **defect rate** for **Winner** production in **June 2025**?”
-- “List all **employees** in the **HR** department with their **salaries**”
-- “Find the status of **TNA** task **CTL-25-12345**”
+- "Show me production data for **CAL sewing floor 2** from **last month**"
+- "What is the **defect rate** for **Winner** production in **June 2025**?"
+- "List all **employees** in the **HR** department with their **salaries**"
+- "Find the status of **TNA** task **CTL-25-12345**"
 
 ---
 

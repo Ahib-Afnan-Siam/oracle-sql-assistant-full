@@ -889,7 +889,7 @@ def extract_year_only_range(user_query: str) -> Optional[Dict[str, str]]:
 
 def determine_display_mode(user_query: str, rows: list) -> str:
     uq = (user_query or "").strip().lower()
-    want_table = bool(re.search(r'\b(show|list|display|table|tabular|rows|grid)\b', uq))
+    want_table = bool(re.search(r'\b(show|list|display|table|tabular|rows|grid|data)\b', uq))
     want_summary = bool(re.search(r'\b(summary|summarise|summarize|overview|report|insights?|analysis|analyze|describe|explain|update|status)\b', uq))
     
     # Check for specific data requests (should show table even if they start with what/when/where/who)
@@ -906,7 +906,8 @@ def determine_display_mode(user_query: str, rows: list) -> str:
     if want_summary and want_table:
         return "both"
     if want_table:
-        return "table"
+        # Always return "both" when user asks for table/data to ensure a short summary is included
+        return "both"
     if want_summary:
         return "summary"
     
@@ -914,13 +915,13 @@ def determine_display_mode(user_query: str, rows: list) -> str:
     if re.match(r'^\s*(who|what|which|when|where|why|how)\b', uq):
         # Show table for "who is" queries (employee lookups)
         if who_is_query:
-            return "table"
+            return "both"  # Changed from "table" to "both" to include summary
         # Show table for specific "what is" queries
         if what_is_specific:
-            return "table"
+            return "both"  # Changed from "table" to "both" to include summary
         # Show table if asking for specific data fields
         if specific_data_request:
-            return "table"
+            return "both"  # Changed from "table" to "both" to include summary
         # Otherwise, show summary
         return "summary"
     
@@ -1059,144 +1060,97 @@ def widen_results_if_needed(rows: list, original_sql: str, selected_db: str, dis
 # Descriptive summarizer (pure Python – stable)
 # ------------------------------------------------------------------------------
 def summarize_results(rows: list, user_query: str) -> str:
-    if len(rows) == 1 and isinstance(rows[0], dict) and len(rows[0]) == 1:
-        k, v = next(iter(rows[0].items()))
-        def _fmt(x): 
-            from decimal import Decimal
-            if x is None: return "—"
-            if isinstance(x, Decimal): x = float(x)
-            s = f"{x:,.2f}"; return s.rstrip("0").rstrip(".")
-        return f"{k.replace('_',' ').title()}: {_fmt(v)}"
+    """
+    Generate a very concise, plain-language summary (1–2 sentences) focused on the user's ask.
+    Avoid matrices, lists, totals, and unrelated KPIs.
+    """
+    from decimal import Decimal
+    import re
+
+    # No data / scalar single-value cases
     if not rows:
-        return "### Executive summary\n- No results found.\n\n### Key KPIs\n- —\n\n### Coverage & data quality\n- 0 rows returned"
+        return "No data found matching your criteria."
     if not isinstance(rows[0], dict):
-        return f"### Executive summary\n- {len(rows)} row(s) returned\n\n### Key KPIs\n- Non-tabular output"
+        return f"Found {len(rows)} records."
+    if len(rows) == 1 and len(rows[0]) == 1:
+        k, v = next(iter(rows[0].items()))
+        if isinstance(v, Decimal):
+            v = float(v)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            s = f"{v:,.2f}".rstrip("0").rstrip(".")
+        else:
+            s = str(v)
+        return f"{k.replace('_',' ').title()}: {s}"
+
+    # Helper to safely format one number
+    def fmt_num(x):
+        if x is None:
+            return "—"
+        if isinstance(x, Decimal):
+            x = float(x)
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            s = f"{x:,.2f}".rstrip("0").rstrip(".")
+            return s
+        return str(x)
 
     cols = list(rows[0].keys())
-    METRIC_HINT = re.compile(r'(amt|amount|total|price|sal|salary|value|qty|quantity|cost|revenue|sales|score|count|rate|percent|p|efficiency|output)$', re.I)
-    LABEL_HINT = re.compile(r'(name|title|desc|description|label)$', re.I)
-    ID_NAME_HINT = re.compile(r'(?:^|_)(id|code|no|num|number)$', re.I)
-    ISO_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}')
-    ORA_DATE = re.compile(r'^(\d{2})-([A-Za-z]{3})-(\d{2,4})')
-    # add these two just after your existing HINT regexes
-    KPI_EXTRA_RX  = re.compile(r'(qty|quantity|dhu|eff|rate|percent|pct|defect|rej|stain|dirty)', re.I)
-    RATE_LIKE_RX  = re.compile(r'(rate|pct|percent|dhu|eff)', re.I)
 
-    def is_num(v): return isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)
-    def is_date_like(v):
-        if isinstance(v, (datetime, date)): return True
-        if isinstance(v, str): return bool(ISO_DATE.match(v) or ORA_DATE.match(v))
-        return False
-    def fmt_num(x):
-        if x is None: return "—"
-        if isinstance(x, Decimal): x = float(x)
-        s = f"{x:,.2f}"; return s.rstrip("0").rstrip(".")
+    # If the user asked for an average explicitly (avg/average), compute ONLY that for the most
+    # relevant metric column and return one short sentence. Prefer columns containing 'EFF' or 'EFFICIENCY'.
+    uq = (user_query or "").lower()
+    asked_for_avg = bool(re.search(r"\b(avg|average)\b", uq))
 
-    numeric, dates, cats, label_cols = [], [], [], []
-    for c in cols:
-        vals = [r.get(c) for r in rows]
-        non_null = [v for v in vals if v not in (None, "")]
-        if not non_null:
-            continue
-        probe = next((v for v in non_null if v not in (None, "")), None)
-        if probe is None:
-            continue
-        if is_num(probe):
-            name_is_metric = bool(METRIC_HINT.search(c))
-            name_looks_id = bool(ID_NAME_HINT.search(c))
-            uniq_ratio = len(set(non_null)) / max(1, len(non_null))
-            if name_looks_id and not name_is_metric: 
-                continue
-            if uniq_ratio > 0.98 and not name_is_metric:
-                continue
-            numeric.append(c)
-        elif is_date_like(probe):
-            dates.append(c)
+    if asked_for_avg:
+        # Pick a metric column: prioritize efficiency-like columns, otherwise first numeric
+        metric_col = None
+        eff_candidates = [c for c in cols if re.search(r"eff|efficiency", c, re.I)]
+        if eff_candidates:
+            metric_col = eff_candidates[0]
         else:
-            uniq = len(set(non_null))
-            avg_len = sum(len(str(v)) for v in non_null[:500]) / min(500, len(non_null))
-            if LABEL_HINT.search(c):
-                label_cols.append(c)
-            if 1 < uniq <= min(20, max(5, int(0.7 * len(non_null)))) and avg_len <= 40:
-                cats.append(c)
+            # find first numeric-looking column
+            for c in cols:
+                for r in rows:
+                    v = r.get(c)
+                    if isinstance(v, (int, float, Decimal)) and not isinstance(v, bool):
+                        metric_col = c
+                        break
+                if metric_col:
+                    break
 
-    label = label_cols[0] if label_cols else (cats[0] if cats else (cols[0] if cols else None))
-    numeric.sort(key=lambda c: (not bool(METRIC_HINT.search(c)), c.lower()))
-    metrics = numeric[:2]; cats = cats[:2]; dates = dates[:1]
-    # NEW: capture all KPI-like numeric columns (falls back to first few numerics if none match)
-    all_numeric = [c for c in numeric if KPI_EXTRA_RX.search(c)] or numeric[:3]
-    primary_line = None; primary_metric_summary = None
-    if metrics:
-        c = metrics[0]
-        vals = [float(v) for v in (r.get(c) for r in rows) if isinstance(v, (int,float,Decimal))]
-        if vals:
-            vals.sort(); mn, mx = vals[0], vals[-1]
-            med = median(vals); avg = sum(vals)/len(vals)
-            p80 = vals[min(len(vals)-1, int(round(0.80*(len(vals)-1))))] if len(vals) > 1 else vals[0]
-            total = sum(vals)
-            primary_metric_summary = (c, mn, med, avg, p80, mx, total)
-            primary_line = f"{c}: total {fmt_num(total)}, avg {fmt_num(avg)}, median {fmt_num(med)}."
+        if metric_col:
+            vals = []
+            for r in rows:
+                v = r.get(metric_col)
+                if isinstance(v, Decimal):
+                    v = float(v)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    vals.append(float(v))
+            if vals:
+                avg_val = sum(vals) / len(vals)
+                avg_txt = fmt_num(avg_val)
+                # Try to recover a category label to optionally add lowest/highest name
+                label_col = None
+                for c in cols:
+                    if re.search(r"name|label|desc|description|floor|buyer|line", c, re.I):
+                        label_col = c; break
+                # Identify lows/highs only for context, not as a list
+                low_name = high_name = None
+                if label_col:
+                    try:
+                        low_row = min(rows, key=lambda r: (float(r.get(metric_col)) if isinstance(r.get(metric_col),(int,float,Decimal)) else float('inf')))
+                        high_row = max(rows, key=lambda r: (float(r.get(metric_col)) if isinstance(r.get(metric_col),(int,float,Decimal)) else float('-inf')))
+                        low_name = low_row.get(label_col)
+                        high_name = high_row.get(label_col)
+                    except Exception:
+                        pass
+                # Build one or two short sentences
+                base = f"Average {metric_col.replace('_',' ').title()} is {avg_txt}."
+                if low_name and high_name and str(low_name) != "inf" and str(high_name) != "-inf":
+                    return f"{base} Lowest: {low_name}; highest: {high_name}."
+                return base
 
-    exec_lines = [f"{len(rows):,} row(s), {len(cols)} column(s)."]
-    if label and metrics: exec_lines.insert(0, f"Key view by **{label}** with metric **{metrics[0]}**.")
-    if primary_line: exec_lines.append(primary_line)
-
-    kpi_bullets = []
-    if primary_metric_summary:
-        c, mn, med, avg, p80, mx, total = primary_metric_summary
-        kpi_bullets.append(f"- {c}: min {fmt_num(mn)}, p80 {fmt_num(p80)}, max {fmt_num(mx)}")
-        kpi_bullets.append(f"- {c}: total {fmt_num(total)}, average {fmt_num(avg)}, median {fmt_num(med)}")
-    # NEW: append totals (or averages for rate-like) for the rest of the KPI-like metrics
-    for c in all_numeric:
-        # skip the primary metric if it’s already summarized above
-        if metrics and c == metrics[0]:
-            continue
-        vals = [float(v) for v in (r.get(c) for r in rows) if is_num(v)]
-        if not vals:
-            continue
-        agg = (sum(vals) / len(vals)) if RATE_LIKE_RX.search(c) else sum(vals)
-        prefix = "Avg" if RATE_LIKE_RX.search(c) else "Total"
-        kpi_bullets.append(f"- {c}: {prefix} {fmt_num(agg)}")
-    ll_bullets = []
-    if cats and metrics:
-        from collections import defaultdict
-        cat = cats[0]; metric = metrics[0]
-        agg = defaultdict(lambda: {"n": 0, "s": 0.0})
-        for r in rows:
-            k = r.get(cat); v = r.get(metric)
-            if k in (None, "") or not isinstance(v, (int,float,Decimal)): 
-                continue
-            agg[k]["n"] += 1; agg[k]["s"] += float(v)
-        if agg:
-            ranked = sorted(agg.items(), key=lambda kv: kv[1]["s"], reverse=True)
-            top = ranked[:3]; bottom = ranked[-2:] if len(ranked) >= 2 else []
-            if top:    ll_bullets.append("- Top categories (total): " + "; ".join(f"{k} {fmt_num(v['s'])}" for k, v in top))
-            if bottom: ll_bullets.append("- Bottom categories (total): " + "; ".join(f"{k} {fmt_num(v['s'])}" for k, v in bottom))
-
-    cov_bullets = [f"- Rows: {len(rows):,}"]
-    if dates:
-        c = dates[0]
-        dts = []
-        for v in (r.get(c) for r in rows):
-            if isinstance(v, datetime): dts.append(v)
-            elif isinstance(v, date):  dts.append(datetime(v.year, v.month, v.day))
-        if dts:
-            early, late = min(dts), max(dts)
-            cov_bullets.append(f"- {c}: {early.date()} to {late.date()}")
-
-    notes = [
-        "- Figures are derived from the returned rows only.",
-        "- Ask for a time window or specific KPI for a focused breakdown.",
-    ]
-
-    out = []
-    out.append("### Executive summary"); out.append("- " + " ".join(exec_lines))
-    out.append("\n### Key KPIs"); out.extend(kpi_bullets or ["- No numeric KPIs detected"])
-    if ll_bullets: out.append("\n### Leaders & laggards"); out.extend(ll_bullets)
-    out.append("\n### Coverage & data quality"); out.extend(cov_bullets)
-    out.append("\n### Notes"); out.extend(notes)
-    return "\n".join(out).strip()
-
+    # Fallback: generic one-liner
+    return f"Found {len(rows)} records. Focus on the key metric requested and avoid unrelated totals."
 # ------------------------------------------------------------------------------
 # Plan → SQL (deterministic)
 # ------------------------------------------------------------------------------

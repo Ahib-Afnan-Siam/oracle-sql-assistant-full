@@ -1,13 +1,15 @@
 // src/components/ChatPanel.tsx
 import React, { useEffect, useState } from "react";
-import { useChat } from "./ChatContext";
+import { useChat, type Message } from "./ChatContext";
 import FeedbackBox from "./FeedbackBox";
 import MessageBubble from "./MessageBubble";
 import HybridFeedbackBox from "./HybridFeedbackBox";
 import DataVisualization from "./DataVisualization";
+import { BarChart, Table as TableIcon } from "lucide-react"; // Added icon imports
+import { motion, AnimatePresence } from "framer-motion"; // Added framer-motion import
 
 export default function ChatPanel() {
-  const { messages } = useChat();
+  const { messages, mode } = useChat();
 
   // ---- Visualization state ----
   const [showVisualization, setShowVisualization] = useState(false);
@@ -18,7 +20,12 @@ export default function ChatPanel() {
 
   // Detect visualization-ready assistant/bot messages
   useEffect(() => {
-    if (!messages || messages.length === 0) return;
+    // Only show visualization in database mode
+    if ((mode !== "SOS" && mode !== "Test DB") || !messages || messages.length === 0) {
+      setVisualizationData(null);
+      setShowVisualization(false);
+      return;
+    }
 
     const latestMessage = messages[messages.length - 1];
 
@@ -50,7 +57,7 @@ export default function ChatPanel() {
       setVisualizationData(null);
       setShowVisualization(false);
     }
-  }, [messages]);
+  }, [messages, mode]);
 
   // Phase 4.2: Find the last message with hybrid metadata for hybrid feedback
   const lastHybridMessage = [...messages]
@@ -78,32 +85,52 @@ export default function ChatPanel() {
   return (
     <div className="flex-1 flex flex-col">
       {/* Scrollable messages area */}
-      <div className="flex-1 overflow-auto">
+      <div className="flex-1 min-h-0 overflow-auto">
         {/* Centered column like the old version */}
-        <div className="mx-auto max-w-3xl w-full px-4 pt-6 pb-28 space-y-3">
+        <div className="mx-auto max-w-3xl w-full px-4 pt-6 pb-24 space-y-2">
           {messages.map((m) => (
             <MessageBubble key={(m as any).id} message={m} />
           ))}
 
-          {/* Visualization toggle and panel (if data available) */}
-          {visualizationData && (
+          {/* Visualization toggle and panel (if data available and in database mode) */}
+          {(mode === "SOS" || mode === "Test DB") && visualizationData && (
             <div className="mt-2">
               <div className="mb-2">
-                <button
+                <motion.button
+                  whileHover={{ scale: 1.03 }}
+                  whileTap={{ scale: 0.98 }}
                   onClick={() => setShowVisualization((s) => !s)}
-                  className="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm"
+                  className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 text-sm flex items-center gap-1 smooth-hover hover-lift"
                 >
-                  {showVisualization ? "Show Table" : "Show Chart"}
-                </button>
+                  {showVisualization ? (
+                    <>
+                      <TableIcon size={16} />
+                      Show Table
+                    </>
+                  ) : (
+                    <>
+                      <BarChart size={16} />
+                      Show Chart
+                    </>
+                  )}
+                </motion.button>
               </div>
 
-              {showVisualization ? (
-                <DataVisualization
-                  columns={visualizationData.columns}
-                  rows={visualizationData.rows}
-                  onBackToTable={() => setShowVisualization(false)}
-                />
-              ) : null}
+              <AnimatePresence mode="wait">
+                {showVisualization && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.3 }}
+                  >
+                    <DataVisualization
+                      columns={visualizationData.columns}
+                      rows={visualizationData.rows}
+                    />
+                  </motion.div>
+                )}
+              </AnimatePresence>
               {/* When showVisualization is false, we render nothing here,
                   allowing your existing MessageBubble table rendering to remain visible. */}
             </div>

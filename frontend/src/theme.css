@@ -1,0 +1,43 @@
+:root {
+  /* Primary purple theme colors */
+  --primary-purple-50: #f5f3ff;
+  --primary-purple-100: #ede9fe;
+  --primary-purple-200: #ddd6fe;
+  --primary-purple-300: #c4b5fd;
+  --primary-purple-400: #a78bfa;
+  --primary-purple-500: #8b5cf6;
+  --primary-purple-600: #7c3aed;
+  --primary-purple-700: #6d28d9;
+  --primary-purple-800: #5b21b6;
+  --primary-purple-900: #4c1d95;
+  
+  /* Primary color - the main purple used in the design */
+  --primary-color: var(--primary-purple-600); /* #7c3aed */
+  --primary-color-dark: var(--primary-purple-700); /* #6d28d9 */
+  --primary-color-light: var(--primary-purple-500); /* #8b5cf6 */
+  
+  /* Hover states */
+  --primary-hover: var(--primary-purple-700);
+  --primary-hover-dark: var(--primary-purple-800);
+  
+  /* Focus states */
+  --primary-focus: var(--primary-purple-300);
+  
+  /* Background and text for buttons */
+  --primary-btn-bg: var(--primary-color);
+  --primary-btn-text: white;
+  --primary-btn-hover-bg: var(--primary-hover);
+  
+  /* Border colors */
+  --primary-border: var(--primary-purple-300);
+  --primary-border-dark: var(--primary-purple-400);
+  
+  /* Animation timing */
+  --animation-duration-fast: 200ms;
+  --animation-duration-normal: 300ms;
+  --animation-duration-slow: 500ms;
+  
+  /* Easing functions */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out-quad: cubic-bezier(0.45, 0, 0.55, 1);
+}

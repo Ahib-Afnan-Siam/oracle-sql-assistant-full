@@ -252,7 +252,21 @@ def fallback_sql(user_query: str) -> str:
                 AND A_DATE >= TO_DATE('{last_month.strftime('%Y-%m-%d')}', 'YYYY-MM-DD')
             """.strip()
     
-    # Default fallback
+    # Default fallback - use a more useful query for efficiency data
+    if "efficiency" in user_query_lower and "company" in user_query_lower:
+        # Calculate last month date
+        today = datetime.now()
+        last_month = today - timedelta(days=30)
+        
+        return f"""
+            SELECT FLOOR_NAME, AVG(FLOOR_EF) AS AVERAGE_EFFICIENCY
+            FROM T_PROD_DAILY
+            WHERE PROD_DATE >= TO_DATE('{last_month.strftime('%Y-%m-%d')}', 'YYYY-MM-DD')
+            GROUP BY FLOOR_NAME
+            ORDER BY AVERAGE_EFFICIENCY ASC
+        """.strip()
+    
+    # If no specific pattern matches, use a safe default
     return "SELECT 1 FROM DUAL"
 
 

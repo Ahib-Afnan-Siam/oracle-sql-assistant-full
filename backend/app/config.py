@@ -128,7 +128,6 @@ OLLAMA_SQL_NUM_PREDICT = int(os.getenv("OLLAMA_SQL_NUM_PREDICT", "512"))
 OLLAMA_SQL_NUM_CTX = int(os.getenv("OLLAMA_SQL_NUM_CTX", "4096"))
 OLLAMA_SQL_SEED = int(os.getenv("OLLAMA_SQL_SEED", "7"))
 
-# ...existing imports...
 # app/config.py
 SUMMARY_ENGINE = (os.getenv("SUMMARY_ENGINE") or "py").strip().lower()
 SUMMARY_MAX_ROWS = int(os.getenv("SUMMARY_MAX_ROWS", 120))
@@ -158,31 +157,31 @@ HYBRID_MODE = os.getenv("HYBRID_MODE", "parallel")  # "parallel" or "fallback"
 # API Models Configuration (Primary, Secondary, Fallback)
 API_MODELS = {
     "production": {
-        "primary": os.getenv("API_MODEL_PRODUCTION_PRIMARY", "deepseek/deepseek-chat"),
-        "secondary": os.getenv("API_MODEL_PRODUCTION_SECONDARY", "meta-llama/llama-3.1-8b-instruct"),
-        "fallback": os.getenv("API_MODEL_PRODUCTION_FALLBACK", "google/gemini-flash-1.5")
+        "primary": os.getenv("API_MODEL_PRODUCTION_PRIMARY", "deepseek/deepseek-chat-v3.1:free"),
+        "secondary": os.getenv("API_MODEL_PRODUCTION_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
+        "fallback": os.getenv("API_MODEL_PRODUCTION_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
     },
     "hr": {
-        "primary": os.getenv("API_MODEL_HR_PRIMARY", "meta-llama/llama-3.1-8b-instruct"),
-        "secondary": os.getenv("API_MODEL_HR_SECONDARY", "deepseek/deepseek-chat"),
-        "fallback": os.getenv("API_MODEL_HR_FALLBACK", "google/gemini-flash-1.5")
+        "primary": os.getenv("API_MODEL_HR_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
+        "secondary": os.getenv("API_MODEL_HR_SECONDARY", "deepseek/deepseek-chat-v3.1:free"),
+        "fallback": os.getenv("API_MODEL_HR_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
     },
     "tna": {
-        "primary": os.getenv("API_MODEL_TNA_PRIMARY", "deepseek/deepseek-chat"),
-        "secondary": os.getenv("API_MODEL_TNA_SECONDARY", "meta-llama/llama-3.1-8b-instruct"),
-        "fallback": os.getenv("API_MODEL_TNA_FALLBACK", "google/gemini-flash-1.5")
+        "primary": os.getenv("API_MODEL_TNA_PRIMARY", "deepseek/deepseek-chat-v3.1:free"),
+        "secondary": os.getenv("API_MODEL_TNA_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
+        "fallback": os.getenv("API_MODEL_TNA_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
     },
     "general": {
-        "primary": os.getenv("API_MODEL_GENERAL_PRIMARY", "deepseek/deepseek-chat"),
-        "secondary": os.getenv("API_MODEL_GENERAL_SECONDARY", "meta-llama/llama-3.1-8b-instruct"),
-        "fallback": os.getenv("API_MODEL_GENERAL_FALLBACK", "google/gemini-flash-1.5")
+        "primary": os.getenv("API_MODEL_GENERAL_PRIMARY", "deepseek/deepseek-chat-v3.1:free"),
+        "secondary": os.getenv("API_MODEL_GENERAL_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
+        "fallback": os.getenv("API_MODEL_GENERAL_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
     }
 }
 
 # API Request Configuration
-API_REQUEST_TIMEOUT = int(os.getenv("API_REQUEST_TIMEOUT", "45"))
-API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "3"))
-API_RETRY_DELAY = float(os.getenv("API_RETRY_DELAY", "1.0"))
+API_REQUEST_TIMEOUT = int(os.getenv("API_REQUEST_TIMEOUT", "60"))
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "2"))
+API_RETRY_DELAY = float(os.getenv("API_RETRY_DELAY", "2.0"))
 
 # Hybrid System Thresholds
 LOCAL_CONFIDENCE_THRESHOLD = float(os.getenv("LOCAL_CONFIDENCE_THRESHOLD", "0.7"))

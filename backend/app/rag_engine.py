@@ -16,6 +16,10 @@ from app.query_engine import _get_table_colmeta
 from functools import lru_cache
 from app.summarizer import summarize_results_async
 
+# Add debug logging
+logger = logging.getLogger(__name__)
+logger.info("Loading RAG engine with new summarizer integration")
+
 # Reuse the deterministic SQL toolbox + summarizer you already have
 from app.query_engine import (
     build_sql_from_plan,
@@ -46,6 +50,10 @@ from app.query_engine import (
 )
 
 from app.summarizer import summarize_with_mistral, _fallback_summarization
+
+# Add this import to ensure we're using the API-based summarizer
+from app.summarizer import summarize_results
+
 
 from app.query_classifier import has_visualization_intent
 
@@ -1246,8 +1254,11 @@ async def _try_hybrid_processing(
                         
                         # Process results using existing RAG pipeline
                         display_mode = determine_display_mode(user_query, rows)
-                        rows_for_summary = widen_results_if_needed(rows, fallback_sql, "source_db_1", display_mode, user_query)
-                        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+                        rows_for_summary = widen_results_if_needed(rows, sql, "source_db_1", display_mode, user_query)
+                        python_summary = summarize_results(
+                            rows_for_summary,
+                            user_query,
+                        ) if display_mode in ["summary", "both"] else ""
                         
                         # Generate natural language summary if needed
                         summary = ""
@@ -1379,7 +1390,11 @@ async def _try_hybrid_processing(
         # Process results using existing RAG pipeline
         display_mode = determine_display_mode(user_query, rows)
         rows_for_summary = widen_results_if_needed(rows, sql, "source_db_1", display_mode, user_query)
-        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+        python_summary = summarize_results(
+            rows_for_summary,
+            user_query,
+            sql,
+        ) if display_mode in ["summary", "both"] else ""
 
         # Generate natural language summary if needed
         summary = ""
@@ -2492,7 +2507,11 @@ def _enhanced_employee_lookup(user_query: str, selected_db: str, enhanced_analys
         rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
         
         # Use enhanced summarizer for employee lookup
-        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+        python_summary = summarize_results(
+            rows_for_summary,
+            user_query,
+            sql
+        ) if display_mode in ["summary", "both"] else ""
         try:
             from decimal import Decimal
             summary = summarize_with_mistral(
@@ -2641,7 +2660,11 @@ def _enhanced_tna_task_lookup(user_query: str, selected_db: str, enhanced_analys
             rows = run_sql(sql, selected_db)
             display_mode = determine_display_mode(user_query, rows)
             rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
-            python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary","both"] else ""
+            python_summary = summarize_results(
+                rows_for_summary,
+                user_query,
+                sql,
+            ) if display_mode in ["summary","both"] else ""
             try:
                 from decimal import Decimal
                 # Import SUMMARY_ENGINE to avoid "not defined" error
@@ -2725,8 +2748,10 @@ def _enhanced_tna_task_lookup(user_query: str, selected_db: str, enhanced_analys
         rows = run_sql(sql, selected_db)
         display_mode = determine_display_mode(user_query, rows)
         rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
-
-        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+        python_summary = summarize_results(
+            rows_for_summary,
+            user_query,
+        ) if display_mode in ["summary", "both"] else ""
         
         try:
             # Import SUMMARY_ENGINE to avoid "not defined" error
@@ -2822,7 +2847,10 @@ def _entity_lookup_path(user_query: str, selected_db: str,
                 rows = run_sql(sql, selected_db)
                 display_mode = determine_display_mode(user_query, rows)
                 rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
-                py_sum = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+                py_sum = summarize_results(
+                    rows_for_summary,
+                    user_query,
+                ) if display_mode in ["summary", "both"] else ""
                 if display_mode in ["summary", "both"]:
                     summary = (
                         summarize_with_mistral(
@@ -2837,7 +2865,21 @@ def _entity_lookup_path(user_query: str, selected_db: str,
                     )
                 else:
                     summary = ""
-                
+                if trend_intent:
+                    # Prefer the trend-focused summary we just generated
+                    summary = python_summary
+                else:
+                    # Use the API-based summarizer for all cases
+                    summary = (
+                        summarize_results(
+                            rows,
+                            user_query,
+                            sql,
+                        )
+                        if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"]
+                        else python_summary
+                    )
+
                 return {
                     "status": "success",
                     "summary": summary,
@@ -2898,7 +2940,10 @@ def _entity_lookup_path(user_query: str, selected_db: str,
         rows = run_sql(sql, selected_db)
         display_mode = determine_display_mode(user_query, rows)
         rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
-        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+        python_summary = summarize_results(
+            rows_for_summary,
+            user_query,
+        ) if display_mode in ["summary", "both"] else ""
         if display_mode in ["summary", "both"]:
             summary = (
                 summarize_with_mistral(
@@ -2966,7 +3011,10 @@ def _generic_browse_fallback(user_query: str, selected_db: str, options: Dict[st
         rows = run_sql(sql, selected_db)
         display_mode = determine_display_mode(user_query, rows)
         rows_for_summary = widen_results_if_needed(rows, sql, selected_db, display_mode, user_query)
-        python_summary = summarize_results(rows_for_summary, user_query) if display_mode in ["summary", "both"] else ""
+        python_summary = summarize_results(
+            rows_for_summary,
+            user_query,
+        ) if display_mode in ["summary", "both"] else ""
         try:
             from decimal import Decimal
             summary = summarize_with_mistral(
@@ -3017,8 +3065,8 @@ def generate_natural_language_summary(
         # Format data for the prompt
         data_summary = f"Dataset with {len(rows)} records and {len(columns)} columns:\n"
         
-        # Format sample records
-        sample_size = min(3, len(rows))
+        # Format sample records - show more data for better analysis
+        sample_size = min(8, len(rows))  # Increased from 3 to 8
         sample_data = []
         for i in range(sample_size):
             row_data = []
@@ -3036,6 +3084,10 @@ def generate_natural_language_summary(
             
         data_summary += "\n".join(sample_data)
         
+        # For larger datasets, also mention that there are more records
+        if len(rows) > sample_size:
+            data_summary += f"\n... (showing first {sample_size} of {len(rows)} total records)"
+        
         # Create the prompt
         prompt = f"""You are an intelligent data analyst for a manufacturing company. Your task is to provide a clear, natural language response to the user's question based on the query results.
 
@@ -3047,6 +3099,8 @@ Data Results:
 SQL Used: {sql or "N/A"}
 
 Please provide a response that directly answers the user's question in natural, conversational language. Focus on the most relevant information and metrics. Avoid technical database terminology unless necessary. Do not start with phrases like "Based on the data" or "The results show".
+
+Important: The dataset contains {len(rows)} total records. While only a sample is shown above for context, your analysis should consider the complete dataset when providing insights and trends.
 """
         
         # Use the OpenRouter client directly, no asyncio
@@ -3089,6 +3143,7 @@ Please provide a response that directly answers the user's question in natural, 
 async def answer(
     user_query: str,
     selected_db: str,
+    mode: str = "General",  # Add mode parameter with default value
     session_id: Optional[str] = None,
     client_ip: Optional[str] = None,
     user_agent: Optional[str] = None,
@@ -3099,6 +3154,7 @@ async def answer(
     Args:
         user_query: The user's natural language query
         selected_db: Database to query against
+        mode: Processing mode - "General", "SOS", or "Test DB"
         session_id: Session identifier for training data collection
         client_ip: Client IP address for training data collection
         user_agent: User agent string for training data collection
@@ -3106,6 +3162,76 @@ async def answer(
     Returns:
         Dictionary with query results and metadata
     """
+    # Handle General mode queries (non-database queries)
+    if mode == "General":
+        # For general queries, use the hybrid processor's general query handling
+        try:
+            if HYBRID_PROCESSING_AVAILABLE:
+                from app.hybrid_processor import HybridProcessor
+                processor = HybridProcessor()
+                
+                # Process as a general knowledge query
+                processing_result = await processor._process_general_query(
+                    user_query=user_query,
+                    schema_context="",  # No schema context needed for general queries
+                )
+                
+                # Check if we got a valid response
+                if processing_result and processing_result.selected_response:
+                    # Check if this is an error response
+                    if processing_result.processing_mode in ["general_query_api_error", "general_query_error"]:
+                        # Return error response
+                        return {
+                            "status": "error",
+                            "message": processing_result.selected_response,
+                            "sql": None,
+                            "schema_context": [],
+                            "schema_context_ids": [],
+                        }
+                    
+                    # Return successful response
+                    return {
+                        "status": "success",
+                        "summary": processing_result.selected_response,
+                        "sql": None,
+                        "display_mode": "summary",
+                        "results": {
+                            "columns": [],
+                            "rows": [],
+                            "row_count": 0,
+                        },
+                        "schema_context": [],
+                        "schema_context_ids": [],
+                        "hybrid_metadata": {
+                            "processing_mode": processing_result.processing_mode,
+                            "selection_reasoning": processing_result.selection_reasoning,
+                            "model_used": processing_result.model_used,
+                            "processing_time": processing_result.processing_time,
+                            "local_confidence": processing_result.local_confidence,
+                            "api_confidence": processing_result.api_confidence,
+                        }
+                    }
+            
+            # For general mode, if hybrid processing is not available, return an error
+            # rather than falling back to local model
+            return {
+                "status": "error",
+                "message": "General mode is not available. Hybrid processing system is not enabled or configured properly.",
+                "sql": None,
+                "schema_context": [],
+                "schema_context_ids": [],
+            }
+        except Exception as e:
+            logger.error(f"[RAG] General query processing failed: {e}")
+            return {
+                "status": "error",
+                "message": f"General query processing failed: {str(e)}",
+                "sql": None,
+                "schema_context": [],
+                "schema_context_ids": [],
+            }
+    
+    # For database modes (SOS, Test DB), continue with existing database processing
     uq = user_query.strip()
     if not uq:
         return {"status": "error", "message": "Empty query."}
@@ -3153,6 +3279,7 @@ async def answer(
             )
             if display_mode in ["summary", "both"] or trend_intent:
                 columns_for_summary = list(rows[0].keys()) if rows else []
+                # Use the API-based summarizer instead of the basic one
                 python_summary = await summarize_results_async(
                     results={"rows": rows_for_summary},
                     user_query=user_query,
@@ -3169,13 +3296,12 @@ async def answer(
                     # Prefer the trend-focused summary we just generated
                     summary = python_summary
                 else:
+                    # Use the API-based summarizer for all cases
                     summary = (
-                        summarize_with_mistral(
-                            user_query=user_query,
-                            columns=list(rows[0].keys()) if rows else [],
-                            rows=rows,
-                            backend_summary=python_summary,
-                            sql=sql,
+                        summarize_results(
+                            rows,
+                            user_query,
+                            sql,
                         )
                         if SUMMARY_ENGINE == "llm" and display_mode in ["summary", "both"]
                         else python_summary

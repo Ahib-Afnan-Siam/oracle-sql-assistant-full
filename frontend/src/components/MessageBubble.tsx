@@ -1,24 +1,25 @@
 // src/components/MessageBubble.tsx
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Bot, User, Copy, RotateCcw, Check } from "lucide-react";
+import { Bot, User, Copy, RotateCcw, Check, Paperclip } from "lucide-react";
 import DataTable from "./DataTable";
 import { useChat } from "./ChatContext";
 import HybridMetadataDisplay from "./HybridMetadataDisplay";
+import clsx from "clsx";
+import { motion, AnimatePresence } from "framer-motion";
 
 type OracleError = {
-  error: string;
-  message?: string;
   code?: string;
-  valid_columns?: string[];
+  error?: string;
+  message?: string;
   sql?: string;
   missing_tables?: string[];
+  valid_columns?: string[];
   suggestion?: string;
   suggestions?: string[];
 };
 
-// Phase 4.2: Enhanced message type with hybrid metadata
 type HybridMetadata = {
   processing_mode?: string;
   model_used?: string;
@@ -28,19 +29,28 @@ type HybridMetadata = {
   api_confidence?: number;
 };
 
+type TableData = (string | number | null)[][];
+
+type MessageFile = {
+  name: string;
+  size: number;
+  type: string;
+  content?: string; // base64 encoded content for images
+};
+
 type Message = {
   sender: "user" | "bot";
-  content: string | (string | number | null)[][] | OracleError;
+  content: string | TableData | OracleError;
   id: string;
-  type: "user" | "status" | "summary" | "table" | "error";
-  // Phase 4.2: Add hybrid metadata and response time to message type
+  type: "user" | "status" | "summary" | "table" | "error" | "file";
   hybrid_metadata?: HybridMetadata;
   response_time?: number;
+  file?: MessageFile;
 };
 
 interface Props {
   message: Message;
-}
+};
 
 const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
   const errorData: OracleError =
@@ -115,14 +125,11 @@ const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
 };
 
 const MessageBubble: React.FC<Props> = ({ message }) => {
-  const { sender, content, type, id } = message;
-  const { processMessage, selectedDB, messages } = useChat();
+  const { sender, content, type, id, file } = message;
+  const { processMessage, selectedDB, mode, messages } = useChat();
 
-  // typing effect for summary only
   const [displayed, setDisplayed] = useState("");
   const [idx, setIdx] = useState(0);
-
-  // Copy functionality
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -141,22 +148,18 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
     return () => clearTimeout(t);
   }, [idx, content, type]);
 
-  // Copy function
   const handleCopy = async () => {
     try {
       let textToCopy = "";
-
       if (typeof content === "string") {
         textToCopy = content;
       } else if (Array.isArray(content)) {
-        // For table data, create a formatted text representation
         const [headers, ...rows] = content;
         textToCopy = `${headers.join("\t")}\n${rows.map((row) => row.join("\t")).join("\n")}`;
       } else if (typeof content === "object" && content && ("error" in content || "message" in content)) {
         const errorData = content as OracleError;
         textToCopy = errorData.message || errorData.error || "Error occurred";
       }
-
       await navigator.clipboard.writeText(textToCopy);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -165,180 +168,203 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
     }
   };
 
-  // Retry function - finds the last user message and resends it
   const handleRetry = () => {
-    // Find the user message that triggered this bot response
     const currentIndex = messages.findIndex((m) => m.id === id);
     let userMessage = "";
-
-    // Look backwards from current message to find the last user message
     for (let i = currentIndex - 1; i >= 0; i--) {
       if (messages[i].sender === "user" && typeof messages[i].content === "string") {
         userMessage = messages[i].content as string;
         break;
       }
     }
-
-    if (userMessage) {
-      processMessage(userMessage, selectedDB);
-    }
+    if (userMessage) processMessage(userMessage, selectedDB, mode);
   };
 
-  // Don't show action buttons for user messages, status messages, or during typing
-  const showActionButtons =
-    sender === "bot" &&
-    type !== "status" &&
-    !(type === "summary" && typeof content === "string" && idx < content.length);
+  // Show action buttons for all bot messages except status messages
+  // For summary messages, show buttons only when typing is complete
+  const showActionButtons = 
+    sender === "bot" && 
+    type !== "status" && 
+    (type !== "summary" || typeof content !== "string" || idx >= content.length);
 
-  // user bubbles now inline-block so they only take necessary width
   const bubbleStyle: Record<Message["type"], string> = {
-    user: "bg-purple-600 text-white inline-block",
-    bot: "bg-white text-gray-900 border border-gray-300 shadow-sm",
+    user: "bg-primary-purple-600 text-white",
     status: "bg-yellow-50 text-gray-600 italic status-blink",
     table: "bg-white text-gray-900 border border-gray-200 shadow",
     summary: "bg-gray-100 text-gray-800",
     error: "bg-red-50 border-red-200",
+    file: "bg-blue-50 text-gray-800 border border-blue-200",
+  };
+
+// Wider rules for tables; narrower for text bubbles
+const bubbleMaxWidth =
+  type === "table"
+    ? "w-full max-w-[1200px] sm:max-w-[95%]" // wide but bounded
+    : "max-w-full sm:max-w-[90%] md:max-w-[80%] lg:max-w-[70%]";
+
+const tableMaxWidthStyle =
+  message.type === "table"
+    ? { maxWidth: "min(1200px, calc(100vw - 4rem))" }
+    : undefined;
+
+  // Enhanced visual distinction between user and bot messages
+  const getUserBubbleStyle = () => {
+    return clsx(
+      "rounded-3xl px-4 py-3 shadow-md break-words",
+      "bg-gradient-to-r from-primary-purple-600 to-primary-purple-700 text-white",
+      "flex flex-col",
+      type === "table" && "overflow-hidden"
+    );
+  };
+
+  const getBotBubbleStyle = () => {
+    return clsx(
+      "rounded-2xl px-4 py-3 shadow-sm break-words",
+      bubbleStyle[type],
+      "flex flex-col",
+      type === "table" && "overflow-hidden"
+    );
   };
 
   const renderContent = () => {
-    // thinking / status
+    if (type === "file") {
+      return (
+        <div className="flex items-center gap-2">
+          <Paperclip size={16} className="text-blue-500" />
+          <div>
+            <div className="font-medium">{file?.name}</div>
+            {file && (
+              <div className="text-xs text-blue-100">
+                {(file.size / 1024).toFixed(1)} KB
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     if (type === "status") {
       return <div className="text-sm">{String(content)}</div>;
     }
 
-    // markdown / text
-    if (typeof content === "string") {
-      if (content.includes("ORA-")) return <OracleErrorDisplay error={content} />;
-      const text = type === "summary" ? displayed : content;
-      return (
-        <ReactMarkdown
-          children={text}
-          remarkPlugins={[remarkGfm]}
-          components={{
-            table: (props) => (
-              <div className="overflow-x-auto">
-                <table className="table-auto border-collapse w-full" {...props} />
-              </div>
-            ),
-            thead: (props) => <thead className="bg-gray-200" {...props} />,
-            th: (props) => <th className="border px-2 py-1 font-semibold text-sm" {...props} />,
-            td: (props) => <td className="border px-2 py-1 text-sm">{props.children ?? "—"}</td>,
-            ol: (props) => <ol className="list-decimal pl-5 my-2" {...props} />,
-            ul: (props) => <ul className="list-disc pl-5 my-2" {...props} />,
-            li: (props) => <li className="mb-1" {...props} />,
-            p: (props) => <p className="my-2" {...props} />,
-            strong: (props) => <strong className="font-semibold" {...props} />,
-            em: (props) => <em className="italic" {...props} />,
-            code: (props) => <code className="bg-gray-100 px-1 rounded font-mono text-sm" {...props} />,
-          }}
-        />
-      );
-    }
-
-    // 2D array → rich table
-    if (Array.isArray(content)) {
-      return <DataTable data={content as (string | number | null)[][]} />;
-    }
-
-    // error object
-    if (typeof content === "object" && content && ("error" in content || "message" in content)) {
+    if (type === "error") {
       return <OracleErrorDisplay error={content as OracleError} />;
     }
 
-    return null;
+    if (type === "table") {
+      // In general mode, we shouldn't have table data, but just in case
+      if (mode === "General") {
+        return (
+          <div className="text-sm text-gray-700">
+            Unexpected table data in general mode. This might be an error.
+          </div>
+        );
+      }
+      return <DataTable data={content as TableData} />;
+    }
+
+    if (type === "summary") {
+      const text = displayed;
+      return (
+        <div className="prose prose-sm max-w-none">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {text}
+          </ReactMarkdown>
+        </div>
+      );
+    }
+
+    // For general mode responses that are strings (not tables or errors)
+    if (typeof content === "string") {
+      return (
+        <div className="prose prose-sm max-w-none">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {content}
+          </ReactMarkdown>
+        </div>
+      );
+    }
+
+    // Fallback for any other content
+    return <div className="text-sm">{String(content)}</div>;
   };
 
-  // widen table bubbles; make user bubbles a bit wider than bot bubbles
-  const widthClass =
-    type === "table"
-      ? "max-w-[95%]"
-      : sender === "user"
-      ? "max-w-[85%] md:max-w-[75%]"
-      : "max-w-[78%] md:max-w-[70%]";
-
   return (
-    <div className={`w-full flex ${sender === "user" ? "justify-end" : "justify-start"}`}>
-      {/* gap reduced further to gap-0.5 and container widened to 95% */}
-      <div className={`group flex items-start gap-0.5 ${sender === "user" ? "flex-row-reverse" : ""} max-w-[95%]`}>
-        {/* avatar */}
-        <div className="pt-1 flex items-center justify-center w-8 h-8 rounded-full bg-gray-200 shadow-sm shrink-0">
-          {sender === "user" ? (
-            <User size={16} className="text-purple-600" />
-          ) : (
-            <Bot size={16} className="text-gray-600" />
+    <div
+      className={clsx(
+        "flex",
+        sender === "user" ? "justify-end" : "justify-start"
+      )}
+    >
+      <div
+        className={clsx(
+          "flex gap-3 max-w-full",
+          bubbleMaxWidth,
+          type === "table" && "mx-auto",          // center wide table bubbles
+          sender === "user" ? "flex-row-reverse" : "flex-row"
+        )}
+      >
+        {/* Avatar */}
+        <div
+          className={clsx(
+            "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-white",
+            sender === "user" 
+              ? "bg-gradient-to-r from-primary-purple-500 to-primary-purple-600" 
+              : "bg-gradient-to-r from-primary-purple-700 to-primary-purple-800"
           )}
+        >
+          {sender === "user" ? <User size={18} /> : <Bot size={18} />}
         </div>
 
-        {/* For messages without action buttons, use simple bubble structure */}
-        {!showActionButtons ? (
-          <div className="flex flex-col gap-1 w-full">
-            {/* Adjusted padding: slightly more for user, compact for bot */}
-            <div className={`rounded-2xl ${sender === "user" ? "px-4" : "px-3"} py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
-              {renderContent()}
-              {type === "summary" && typeof content === "string" && idx < content.length && (
-                <span className="animate-pulse">|</span>
-              )}
+        {/* Bubble */}
+        <div
+          className={sender === "user" ? getUserBubbleStyle() : getBotBubbleStyle()}
+          style={tableMaxWidthStyle}
+        >
+          {renderContent()}
+
+          {/* Hybrid metadata display - only for bot messages with metadata */}
+          {sender === "bot" && (message as any).hybrid_metadata && (
+            <HybridMetadataDisplay metadata={(message as any).hybrid_metadata} />
+          )}
+
+          {/* Response time display */}
+          {(message as any).response_time && (
+            <div className="text-xs text-gray-500 mt-2">
+              Response time: {(message as any).response_time}ms
             </div>
+          )}
 
-            {/* Phase 4.2: Show hybrid metadata for bot messages (compact version) */}
-            {sender === "bot" && message.hybrid_metadata && type !== "status" && (
-              <div className={`${widthClass}`}>
-                <HybridMetadataDisplay
-                  metadata={message.hybrid_metadata}
-                  responseTime={message.response_time}
-                  compact={true}
-                />
-              </div>
-            )}
-          </div>
-        ) : (
-          /* For messages with action buttons, use flex column structure */
-          <div className="flex flex-col gap-1 w-full">
-            {/* Adjusted padding: slightly more for user, compact for bot */}
-            <div className={`rounded-2xl ${sender === "user" ? "px-4" : "px-3"} py-2 text-sm ${widthClass} ${bubbleStyle[type]}`}>
-              {renderContent()}
-              {type === "summary" && typeof content === "string" && idx < content.length && (
-                <span className="animate-pulse">|</span>
-              )}
-            </div>
-
-            {/* Phase 4.2: Show hybrid metadata for bot messages (full version) */}
-            {message.hybrid_metadata && (
-              <div className={`${widthClass} ml-2`}>
-                <HybridMetadataDisplay
-                  metadata={message.hybrid_metadata}
-                  responseTime={message.response_time}
-                  compact={false}
-                />
-              </div>
-            )}
-
-            {/* Action buttons for bot messages */}
-            <div className="flex items-center gap-1 ml-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-              {/* Copy button */}
-              <button
-                onClick={handleCopy}
-                className="p-1.5 rounded-lg hover:bg-gray-100 transition-colors duration-200 flex items-center gap-1"
-                title="Copy response"
+          {/* Action buttons (copy/retry) - only for bot messages */}
+          <AnimatePresence>
+            {showActionButtons && (
+              <motion.div 
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 10 }}
+                transition={{ duration: 0.2 }}
+                className="flex gap-1 mt-2 self-end"
               >
-                {copied ? (
-                  <Check size={14} className="text-green-600" />
-                ) : (
-                  <Copy size={14} className="text-gray-500 hover:text-gray-700" />
-                )}
-              </button>
-
-              {/* Retry button */}
-              <button
-                onClick={handleRetry}
-                className="p-1.5 rounded-lg hover:bg-gray-100 transition-colors duration-200 flex items-center gap-1"
-                title="Try again"
-              >
-                <RotateCcw size={14} className="text-gray-500 hover:text-gray-700" />
-              </button>
-            </div>
-          </div>
-        )}
+                <button
+                  onClick={handleCopy}
+                  className="p-1.5 rounded-full action-button hover-scale-strong focus:outline-none focus:ring-2 focus:ring-purple-500 button-press"
+                  title="Copy message"
+                  aria-label="Copy message"
+                >
+                  {copied ? <Check size={16} className="action-button-icon" /> : <Copy size={16} className="action-button-icon" />}
+                </button>
+                <button
+                  onClick={handleRetry}
+                  className="p-1.5 rounded-full action-button hover-scale-strong focus:outline-none focus:ring-2 focus:ring-purple-500 button-press"
+                  title="Retry message"
+                  aria-label="Retry message"
+                >
+                  <RotateCcw size={16} className="action-button-icon" />
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
     </div>
   );

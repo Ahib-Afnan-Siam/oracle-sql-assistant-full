@@ -69,6 +69,7 @@ async def test_hybrid_processor():
                 user_query=test_case['query'],
                 schema_context=test_case['schema_context'],
                 local_confidence=test_case['local_confidence']
+                # query_type defaults to "sql" for database queries
             )
             
             # Display results
@@ -153,7 +154,7 @@ async def test_parallel_processing_performance():
     
     # Process all queries concurrently
     tasks = [
-        processor.process_query_advanced(query, schema_context, 0.6)
+        processor.process_query_advanced(query, schema_context, 0.6)  # query_type defaults to "sql"
         for query in queries
     ]
     
@@ -288,15 +289,12 @@ async def test_response_selection_algorithm():
         
         try:
             metrics = sql_validator.validate_sql(test_case['sql'], test_case['query_context'])
-
-# ... existing code ...
             print(f"      📊 SQL Validity: {metrics.sql_validity_score:.2f}")
             print(f"      🏗️  Schema Compliance: {metrics.schema_compliance_score:.2f}")
             print(f"      💼 Business Logic: {metrics.business_logic_score:.2f}")
             print(f"      ⚡ Performance: {metrics.performance_score:.2f}")
             print(f"      🎯 Overall Score: {metrics.overall_score:.2f}")
             print(f"      💭 Reasoning: {', '.join(str(r) for r in metrics.reasoning[:3])}")
-# ... existing code ...
             
         except Exception as e:
             print(f"      ❌ Validation failed: {str(e)}")

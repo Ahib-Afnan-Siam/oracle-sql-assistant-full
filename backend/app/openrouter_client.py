@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import json
+import requests
 from typing import Dict, Any, Optional, List, Union
 from datetime import datetime as _dt
 from dataclasses import dataclass, field
@@ -453,136 +454,191 @@ VALIDATION CHECKLIST:
             error="All models failed to generate SQL",
             metadata={"all_models_failed": True, "models_tried": models_to_try}
         )
-
-    def _make_request_sync(self, payload):
-        """Synchronous version of _make_request for direct use without asyncio."""
+    
+    @staticmethod
+    def create_multimodal_message(
+        text_content: str,
+        file_data: Optional[Dict[str, str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Create a multimodal message for API transmission.
+        
+        Args:
+            text_content: Text content for the message
+            file_data: Optional file data (filename and base64 encoded content)
+            
+        Returns:
+            List of message dictionaries formatted for multimodal API calls
+        """
+        message_content = [{"type": "text", "text": text_content}]
+        
+        if file_data:
+            message_content.append({
+                "type": "file",
+                "file": file_data
+            })
+        
+        return [
+            {
+                "role": "user",
+                "content": message_content
+            }
+        ]
+    
+    @staticmethod
+    def encode_file_for_api(file_path: str) -> Optional[Dict[str, str]]:
+        """
+        Encode a file for API transmission using base64 encoding.
+        
+        Args:
+            file_path: Path to the file to encode
+            
+        Returns:
+            Dictionary with filename and base64 encoded file data, or None if failed
+        """
+        import base64
+        import os
+        
+        try:
+            if not os.path.exists(file_path):
+                return None
+                
+            # Determine MIME type based on file extension
+            mime_types = {
+                '.pdf': 'application/pdf',
+                '.doc': 'application/msword',
+                '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                '.txt': 'text/plain',
+                '.csv': 'text/csv',
+                '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                '.png': 'image/png',
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.gif': 'image/gif'
+            }
+            
+            file_extension = os.path.splitext(file_path)[1].lower()
+            mime_type = mime_types.get(file_extension, 'application/octet-stream')
+            
+            # Read and encode file
+            with open(file_path, "rb") as f:
+                file_content = f.read()
+                file_base64 = base64.b64encode(file_content).decode('utf-8')
+                
+            # Create data URL
+            data_url = f"data:{mime_type};base64,{file_base64}"
+            
+            return {
+                "filename": os.path.basename(file_path),
+                "file_data": data_url
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to encode file {file_path}: {e}")
+            return None
+    
+    def _make_request_sync(
+        self,
+        payload: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None
+    ) -> OpenRouterResponse:
+        """
+        Make synchronous HTTP request to OpenRouter API.
+        Used for file processing and other synchronous operations.
+        
+        Args:
+            payload: Request payload
+            headers: Optional headers (uses default if not provided)
+            
+        Returns:
+            OpenRouterResponse object with result
+        """
         import requests
-        import json
-        import time
+        
+        if headers is None:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8090",
+                "X-Title": "Oracle SQL Assistant - Hybrid AI System"
+            }
         
         start_time = time.time()
-        last_error = None
         
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://oracle-sql-assistant"
-        }
-        
-        for attempt in range(self.max_retries + 1):
-            try:
-                # Rate limiting
-                current_time = time.time()
-                time_since_last = current_time - self.last_request_time
-                if time_since_last < self.min_request_interval:
-                    time.sleep(self.min_request_interval - time_since_last)
-                
-                # Make the request
-                response = requests.post(
-                    self.base_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout
-                )
-                
-                self.last_request_time = time.time()
-                self.request_count += 1
-                response_time = time.time() - start_time
-                
-                if response.status_code == 200:
-                    try:
-                        data = response.json()
-                        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        usage = data.get("usage", {})
-                        
-                        return OpenRouterResponse(
-                            content=content.strip(),
-                            model=payload.get("model", "unknown"),
-                            usage=usage,
-                            response_time=response_time,
-                            success=True,
-                            status_code=response.status_code,
-                            metadata={
-                                "attempt": attempt + 1, 
-                                "total_requests": self.request_count,
-                                "raw_response": data
-                            }
-                        )
-                    except json.JSONDecodeError as e:
-                        last_error = f"Invalid JSON response: {str(e)}"
-                        logger.warning(f"JSON decode error (attempt {attempt + 1}): {last_error}")
-                
-                elif response.status_code == 429:  # Rate limited
-                    last_error = f"Rate limited (HTTP 429): {response.text}"
-                    if attempt < self.max_retries:
-                        wait_time = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                        logger.warning(f"Rate limited, waiting {wait_time}s before retry")
-                        time.sleep(wait_time)
-                        continue
-                
-                elif response.status_code == 401:  # Unauthorized
-                    last_error = f"Authentication failed (HTTP 401): {response.text}"
-                    logger.error(f"API key authentication failed: {last_error}")
-                    break  # Don't retry authentication errors
-                
-                elif response.status_code >= 500:  # Server errors
-                    last_error = f"Server error (HTTP {response.status_code}): {response.text}"
-                    if attempt < self.max_retries:
-                        wait_time = self.retry_delay * (attempt + 1)
-                        logger.warning(f"Server error, retrying in {wait_time}s")
-                        time.sleep(wait_time)
-                        continue
-                
-                else:  # Other client errors
-                    last_error = f"HTTP {response.status_code}: {response.text}"
-                    logger.warning(f"API error (attempt {attempt + 1}): {last_error}")
-                    if attempt < self.max_retries:
-                        time.sleep(self.retry_delay)
-                        continue
-                
-                # If we reach here, it's the final attempt or a non-retryable error
+        try:
+            response = requests.post(
+                self.base_url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout
+            )
+            
+            response_time = time.time() - start_time
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    usage = data.get("usage", {})
+                    
+                    return OpenRouterResponse(
+                        content=content.strip(),
+                        model=payload.get("model", "unknown"),
+                        usage=usage,
+                        response_time=response_time,
+                        success=True,
+                        status_code=response.status_code,
+                        metadata={"raw_response": data}
+                    )
+                except Exception as e:
+                    return OpenRouterResponse(
+                        content="",
+                        model=payload.get("model", "unknown"),
+                        usage={},
+                        response_time=response_time,
+                        success=False,
+                        error=f"JSON decode error: {str(e)}",
+                        status_code=response.status_code
+                    )
+            else:
                 return OpenRouterResponse(
                     content="",
                     model=payload.get("model", "unknown"),
                     usage={},
-                    response_time=time.time() - start_time,
+                    response_time=response_time,
                     success=False,
-                    error=last_error,
-                    status_code=response.status_code,
-                    metadata={"attempt": attempt + 1, "final_attempt": True}
+                    error=f"HTTP {response.status_code}: {response.text}",
+                    status_code=response.status_code
                 )
-                    
-            except requests.exceptions.Timeout:
-                last_error = f"Request timeout after {self.timeout}s"
-                if attempt < self.max_retries:
-                    logger.warning(f"Timeout (attempt {attempt + 1}), retrying...")
-                    time.sleep(self.retry_delay)
-                    continue
-                    
-            except requests.exceptions.RequestException as e:
-                last_error = f"Connection error: {str(e)}"
-                if attempt < self.max_retries:
-                    logger.warning(f"Connection error (attempt {attempt + 1}): {last_error}")
-                    time.sleep(self.retry_delay)
-                    continue
-                    
-            except Exception as e:
-                last_error = f"Unexpected error: {str(e)}"
-                logger.exception(f"Unexpected error (attempt {attempt + 1})")
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_delay)
-                    continue
-        
-        # All retries exhausted
-        return OpenRouterResponse(
-            content="",
-            model=payload.get("model", "unknown"),
-            usage={},
-            response_time=time.time() - start_time,
-            success=False,
-            error=last_error or "All retry attempts failed",
-            metadata={"attempts_exhausted": True, "total_attempts": self.max_retries + 1}
-        )
+                
+        except requests.Timeout:
+            return OpenRouterResponse(
+                content="",
+                model=payload.get("model", "unknown"),
+                usage={},
+                response_time=time.time() - start_time,
+                success=False,
+                error=f"Request timeout after {self.timeout}s"
+            )
+        except requests.RequestException as e:
+            return OpenRouterResponse(
+                content="",
+                model=payload.get("model", "unknown"),
+                usage={},
+                response_time=time.time() - start_time,
+                success=False,
+                error=f"Request error: {str(e)}"
+            )
+        except Exception as e:
+            return OpenRouterResponse(
+                content="",
+                model=payload.get("model", "unknown"),
+                usage={},
+                response_time=time.time() - start_time,
+                success=False,
+                error=f"Unexpected error: {str(e)}"
+            )
+
 # Global client instance (singleton pattern)
 _openrouter_client: Optional[OpenRouterClient] = None
 

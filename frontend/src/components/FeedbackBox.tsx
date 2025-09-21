@@ -1,12 +1,13 @@
 // src/components/FeedbackBox.tsx
 import { useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import { useChat } from "./ChatContext";
 
 const FeedbackBox = () => {
   const { lastIds } = useChat();
   const turnId = lastIds?.turn_id;
   const sqlSampleId = lastIds?.sql_sample_id ?? null;
-  const summarySampleId = lastIds?.summary_sample_id ?? null;
+  const summarySampleId = lastIds?.sql_summary_id ?? null;
 
   const [submitted, setSubmitted] = useState(false);
   const [mode, setMode] = useState<"idle" | "improve">("idle");
@@ -69,88 +70,93 @@ const FeedbackBox = () => {
 
   // 🔹 Early exits
   if (!turnId) return null;
-  if (submitted) return null; // Vanish after submit
 
   return (
     <div className="flex justify-center mt-4">
-      <div className="bg-white/90 px-6 py-4 rounded-xl border border-gray-200 shadow text-sm text-gray-800 max-w-md w-full text-center">
-        <>
-          <p className="font-medium mb-3">Was this response helpful?</p>
-
-          <div className="flex justify-center gap-3">
-            <button
-              onClick={() => handleQuick("good")}
-              disabled={posting || !turnId}
-              className={`px-3 py-1 rounded-full bg-green-100 hover:bg-green-200 text-green-800 text-xs font-semibold transition ${
-                posting || !turnId ? "opacity-60 cursor-not-allowed" : ""
-              }`}
-              title={
-                !turnId
-                  ? "Please wait for the response to finish"
-                  : "Submit good feedback"
-              }
-            >
-              👍 Good
-            </button>
-
-            <button
-              onClick={() => handleQuick("wrong")}
-              disabled={posting || !turnId}
-              className={`px-3 py-1 rounded-full bg-red-100 hover:bg-red-200 text-red-800 text-xs font-semibold transition ${
-                posting || !turnId ? "opacity-60 cursor-not-allowed" : ""
-              }`}
-              title={
-                !turnId
-                  ? "Please wait for the response to finish"
-                  : "Submit wrong feedback"
-              }
-            >
-              👎 Wrong
-            </button>
-
-            <button
-              onClick={handleImproveClick}
-              disabled={posting || !turnId}
-              className={`px-3 py-1 rounded-full bg-yellow-100 hover:bg-yellow-200 text-yellow-800 text-xs font-semibold transition ${
-                posting || !turnId ? "opacity-60 cursor-not-allowed" : ""
-              }`}
-              title={
-                !turnId
-                  ? "Please wait for the response to finish"
-                  : "Suggest improvements"
-              }
-            >
-              🛠 Needs update
-            </button>
-          </div>
-
-          {mode === "improve" && (
-            <div className="mt-3 text-left">
-              <textarea
-                value={comment}
-                onChange={(e) => setComment(e.target.value)}
-                placeholder="What should be improved?"
-                className="w-full border rounded p-2 text-sm"
-                rows={3}
-                disabled={posting}
-              />
-              <div className="mt-2 flex justify-end">
-                <button
-                  onClick={handleImproveSubmit}
-                  disabled={posting || !comment.trim()}
-                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
-                    posting || !comment.trim()
-                      ? "bg-gray-200 text-gray-500 cursor-not-allowed"
-                      : "bg-[#3b0764] text-white"
-                  }`}
-                >
-                  {posting ? "Submitting..." : "Submit"}
-                </button>
-              </div>
+      <AnimatePresence>
+        {submitted ? (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            transition={{ duration: 0.2 }}
+            className="bg-green-50 border border-green-200 rounded-lg p-3"
+          >
+            <div className="flex items-center gap-2 text-green-700">
+              <span className="text-sm font-medium">Thank you for your feedback!</span>
             </div>
-          )}
-        </>
-      </div>
+          </motion.div>
+        ) : (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ duration: 0.3 }}
+            className="bg-white/90 px-6 py-4 rounded-xl border border-gray-200 shadow text-sm text-gray-800 max-w-md w-full text-center"
+          >
+            <p className="font-medium mb-3">Was this response helpful?</p>
+
+            <div className="flex justify-center gap-3">
+              <button
+                onClick={() => handleQuick("good")}
+                disabled={posting || !turnId}
+                className={`px-3 py-1 rounded-full bg-green-100 hover:bg-green-200 text-green-800 text-xs font-semibold transition ${posting || !turnId ? "opacity-60 cursor-not-allowed" : ""} smooth-hover hover-lift button-press`}
+                title={!turnId ? "Please wait for the response to finish" : "Submit good feedback"}
+              >
+                👍 Good
+              </button>
+
+              <button
+                onClick={() => handleQuick("wrong")}
+                disabled={posting || !turnId}
+                className={`px-3 py-1 rounded-full bg-red-100 hover:bg-red-200 text-red-800 text-xs font-semibold transition ${posting || !turnId ? "opacity-60 cursor-not-allowed" : ""} smooth-hover hover-lift button-press`}
+                title={!turnId ? "Please wait for the response to finish" : "Submit wrong feedback"}
+              >
+                👎 Wrong
+              </button>
+
+              <button
+                onClick={handleImproveClick}
+                disabled={posting || !turnId}
+                className={`px-3 py-1 rounded-full bg-yellow-100 hover:bg-yellow-200 text-yellow-800 text-xs font-semibold transition ${posting || !turnId ? "opacity-60 cursor-not-allowed" : ""} smooth-hover hover-lift button-press`}
+                title={!turnId ? "Please wait for the response to finish" : "Suggest improvements"}
+              >
+                🛠 Needs update
+              </button>
+            </div>
+
+            <AnimatePresence>
+              {mode === "improve" && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="mt-3 text-left"
+                >
+                  <textarea
+                    value={comment}
+                    onChange={(e) => setComment(e.target.value)}
+                    placeholder="What should be improved?"
+                    className="w-full border rounded p-2 text-sm transition-smooth"
+                    rows={3}
+                    disabled={posting}
+                  />
+                  <div className="mt-2 flex justify-end">
+                    <button
+                      onClick={handleImproveSubmit}
+                      disabled={posting || !comment.trim()}
+                      className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${posting || !comment.trim() ? "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-purple-600 text-white hover:bg-purple-700 smooth-hover hover-lift"} button-press`}
+                    >
+                      {posting ? "Submitting..." : "Submit"}
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
