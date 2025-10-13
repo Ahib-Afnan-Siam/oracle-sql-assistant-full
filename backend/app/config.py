@@ -102,6 +102,15 @@ SUMMARIZATION_CONFIG = {
     "fallback_to_local": os.getenv("SUMMARIZATION_FALLBACK_TO_LOCAL", "true").lower() == "true"
 }
 
+# Database Query Configuration
+DATABASE_CONFIG = {
+    "query_timeout_ms": int(os.getenv("DATABASE_QUERY_TIMEOUT_MS", "5000")),  # Reduced to 5 seconds for faster failure
+    "connection_timeout_ms": int(os.getenv("DATABASE_CONNECTION_TIMEOUT_MS", "3000")),  # Reduced to 3 seconds
+    "retry_attempts": int(os.getenv("DATABASE_RETRY_ATTEMPTS", "1")),  # Reduced to 1 retry for faster failure
+    "retry_delay_ms": int(os.getenv("DATABASE_RETRY_DELAY_MS", "500")),  # Reduced to 0.5 seconds
+    "network_timeout_ms": int(os.getenv("DATABASE_NETWORK_TIMEOUT_MS", "3000"))  # Reduced to 3 seconds
+}
+
 # Flattened variables for easier import
 OLLAMA_SQL_URL = OLLAMA_SQL["url"]
 OLLAMA_SQL_MODEL = OLLAMA_SQL["model"]
@@ -157,24 +166,24 @@ HYBRID_MODE = os.getenv("HYBRID_MODE", "parallel")  # "parallel" or "fallback"
 # API Models Configuration (Primary, Secondary, Fallback)
 API_MODELS = {
     "production": {
-        "primary": os.getenv("API_MODEL_PRODUCTION_PRIMARY", "deepseek/deepseek-chat-v3.1:free"),
+        "primary": os.getenv("API_MODEL_PRODUCTION_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
         "secondary": os.getenv("API_MODEL_PRODUCTION_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "fallback": os.getenv("API_MODEL_PRODUCTION_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
+        "fallback": os.getenv("API_MODEL_PRODUCTION_FALLBACK", "google/gemini-flash-1.5:free")
     },
     "hr": {
         "primary": os.getenv("API_MODEL_HR_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "secondary": os.getenv("API_MODEL_HR_SECONDARY", "deepseek/deepseek-chat-v3.1:free"),
-        "fallback": os.getenv("API_MODEL_HR_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
+        "secondary": os.getenv("API_MODEL_HR_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
+        "fallback": os.getenv("API_MODEL_HR_FALLBACK", "google/gemini-flash-1.5:free")
     },
     "tna": {
-        "primary": os.getenv("API_MODEL_TNA_PRIMARY", "deepseek/deepseek-chat-v3.1:free"),
+        "primary": os.getenv("API_MODEL_TNA_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
         "secondary": os.getenv("API_MODEL_TNA_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "fallback": os.getenv("API_MODEL_TNA_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
+        "fallback": os.getenv("API_MODEL_TNA_FALLBACK", "google/gemini-flash-1.5:free")
     },
     "general": {
-        "primary": os.getenv("API_MODEL_GENERAL_PRIMARY", "deepseek/deepseek-chat-v3.1:free"),
+        "primary": os.getenv("API_MODEL_GENERAL_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
         "secondary": os.getenv("API_MODEL_GENERAL_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "fallback": os.getenv("API_MODEL_GENERAL_FALLBACK", "google/gemini-flash-2.0-flash-experimental:free")
+        "fallback": os.getenv("API_MODEL_GENERAL_FALLBACK", "google/gemini-flash-1.5:free")
     }
 }
 

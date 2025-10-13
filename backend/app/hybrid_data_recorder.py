@@ -68,7 +68,7 @@ Key Features:
 - Performance benchmarking between local and API models
 - Domain-specific model strength identification
 - User preference tracking and analysis
-- Actionable insights generation for system optimization
+- Actionable insights generation
 - API endpoints for accessing learning insights
 - High-quality sample identification for model fine-tuning
 - Training dataset creation for different domains
@@ -107,8 +107,9 @@ import traceback
 
 from .feedback_store import _json_dumps, _insert_with_returning
 from .db_connector import connect_feedback
-from .hybrid_processor import ProcessingResult, ResponseMetrics
-from .query_classifier import QueryClassification
+# Use local imports to avoid circular imports
+from app.SOS.hybrid_processor import ProcessingResult, ResponseMetrics
+from app.SOS.query_classifier import QueryClassification
 
 logger = logging.getLogger(__name__)
 
@@ -1062,6 +1063,19 @@ class QualityMetricsAnalyzer:
 
 class HybridDataRecorder:
     """Enhanced data recorder for hybrid AI system training data collection."""
+
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.quality_analyzer = QualityMetricsAnalyzer()
+        
+        # Test database connection and table existence
+        self._test_database_connection()
+logger = logging.getLogger(__name__)
+# Set logger level to WARNING to reduce verbosity
+logger.setLevel(logging.WARNING)
+
+# Hybrid Data Recorder - Training Data Collection System
+class HybridDataRecorder:
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -1086,7 +1100,9 @@ class HybridDataRecorder:
                 for table in training_tables:
                     try:
                         cur.execute(f"SELECT COUNT(*) FROM {table}")
-                        count = cur.fetchone()[0]
+                        count_result = cur.fetchone()[0]
+                        # Handle case where cx_Oracle returns float instead of int for COUNT
+                        count = int(float(count_result)) if count_result is not None else 0
                         self.logger.info(f"[TRAINING_DATA] Table {table} exists with {count} records")
                     except Exception as e:
                         self.logger.error(f"[TRAINING_DATA] Table {table} not accessible: {e}")
@@ -1096,7 +1112,7 @@ class HybridDataRecorder:
                         
         except Exception as e:
             self.logger.error(f"[TRAINING_DATA] Database connection test failed: {e}")
-    
+
     def _validate_quality_metrics_schema(self, cursor):
         """Validate that required columns exist for quality metrics."""
         try:
@@ -1171,7 +1187,7 @@ class HybridDataRecorder:
                     }
                 )
                 conn.commit()
-                self.logger.info(f"Recorded hybrid context {context_id} for turn {turn_id}")
+                self.logger.debug(f"Recorded hybrid context {context_id} for turn {turn_id}")
                 return context_id
                 
         except Exception as e:
@@ -1253,7 +1269,7 @@ class HybridDataRecorder:
                     }
                 )
                 conn.commit()
-                self.logger.info(f"Recorded {model_type} model response {response_id} for turn {turn_id}")
+                self.logger.debug(f"Recorded {model_type} model response {response_id} for turn {turn_id}")
                 return response_id
                 
         except Exception as e:
@@ -1320,7 +1336,7 @@ class HybridDataRecorder:
                     }
                 )
                 conn.commit()
-                self.logger.info(f"Recorded response metrics {metrics_id} for response {model_response_id}")
+                self.logger.debug(f"Recorded response metrics {metrics_id} for response {model_response_id}")
                 return metrics_id
                 
         except Exception as e:
@@ -1417,7 +1433,7 @@ class HybridDataRecorder:
                     }
                 )
                 conn.commit()
-                self.logger.info(f"Recorded selection decision {decision_id} for turn {turn_id}")
+                self.logger.debug(f"Recorded selection decision {decision_id} for turn {turn_id}")
                 return decision_id
                 
         except Exception as e:
@@ -1926,7 +1942,7 @@ class HybridDataRecorder:
                 except Exception as e:
                     self.logger.warning(f"Failed to record API usage: {e}")
             
-            self.logger.info(f"Successfully recorded complete hybrid turn {turn_id} with {sum(1 for v in recorded_ids.values() if isinstance(v, int) and v > 0)} records")
+            self.logger.debug(f"Successfully recorded complete hybrid turn {turn_id} with {sum(1 for v in recorded_ids.values() if isinstance(v, int) and v > 0)} records")
             return recorded_ids
             
         except Exception as e:

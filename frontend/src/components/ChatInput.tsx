@@ -154,25 +154,25 @@ export default function ChatInput() {
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           className={`flex flex-col w-full chat-input-container rounded-xl p-2 shadow-md transition-all duration-200
-            ${isDragging && mode === "General" ? "ring-2 ring-blue-400 bg-blue-50/80" : ""}
+            ${isDragging && mode === "General" ? "ring-2 ring-blue-400 bg-blue-50/80 dark:bg-blue-900/30" : ""}
             ${isTyping ? "opacity-90" : ""}`}
         >
           {/* File chip row (above input) - Enhanced styling */}
           {selectedFile && mode === "General" && (
-            <div className="flex items-center justify-between file-chip bg-blue-100/60 backdrop-blur-sm rounded-lg px-3 py-2 mb-2 border border-blue-200/50">
+            <div className="flex items-center justify-between file-chip bg-blue-100/60 backdrop-blur-sm rounded-lg px-3 py-2 mb-2 border border-blue-200/50 dark:bg-blue-900/30 dark:border-blue-800/50">
               <div className="flex items-center min-w-0">
-                <Paperclip className="h-4 w-4 text-blue-600 mr-2 flex-shrink-0" />
-                <span className="text-sm text-gray-800 font-medium truncate">
+                <Paperclip className="h-4 w-4 text-blue-600 mr-2 flex-shrink-0 dark:text-blue-400" />
+                <span className="text-sm text-gray-800 font-medium truncate dark:text-gray-200">
                   {selectedFile.name}
                 </span>
-                <span className="text-xs text-gray-600 ml-2 flex-shrink-0">
+                <span className="text-xs text-gray-600 ml-2 flex-shrink-0 dark:text-gray-400">
                   ({(selectedFile.size / 1024).toFixed(1)} KB)
                 </span>
               </div>
               <button
                 type="button"
                 onClick={removeFile}
-                className="text-gray-500 hover:text-red-500 text-sm font-semibold ml-3 transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-purple-500 rounded-full p-1 smooth-hover hover-lift"
+                className="text-gray-500 hover:text-red-500 text-sm font-semibold ml-3 transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-purple-500 rounded-full p-1 smooth-hover hover-lift dark:text-gray-400 dark:hover:text-red-400"
                 aria-label="Remove file"
                 title="Remove file"
               >
@@ -192,8 +192,8 @@ export default function ChatInput() {
               title={mode === "General" ? "Attach file" : "Attachments available in General mode"}
               className={`p-2 rounded-full transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-purple-500 chat-input-button
                 ${isTyping || mode !== "General"
-                  ? "text-gray-400 cursor-not-allowed"
-                  : "text-gray-600 hover:bg-purple-100 hover:text-purple-600 smooth-hover hover-scale"}`}
+                  ? "text-gray-400 cursor-not-allowed dark:text-gray-600"
+                  : "text-gray-600 hover:bg-purple-100 hover:text-purple-600 smooth-hover hover-scale dark:text-gray-400 dark:hover:bg-purple-900/50 dark:hover:text-purple-400"}`}
             >
               <Paperclip className="h-5 w-5" />
             </button>
@@ -223,17 +223,17 @@ export default function ChatInput() {
                 }
                 className={`w-full px-3 py-2.5 pr-14 rounded-lg border text-sm placeholder-gray-500 focus:outline-none transition-all duration-200 resize-none overflow-y-auto focus:ring-2 focus:ring-purple-500
                   ${isTyping
-                    ? "bg-gray-50 cursor-not-allowed opacity-70"
-                    : "bg-white/70 border-gray-300 focus:border-purple-500 shadow-inner"}`}
+                    ? "bg-gray-50 cursor-not-allowed opacity-70 dark:bg-gray-700"
+                    : "bg-white/70 border-gray-300 focus:border-purple-500 shadow-inner dark:bg-gray-800/70 dark:border-gray-600 dark:text-gray-100 dark:placeholder-gray-400"}`}
                 rows={1}
               />
               {/* Enhanced character counter - always visible but subtle */}
-              <div className="absolute bottom-1.5 right-2 text-xs text-gray-400">
-                <span className={input.length > 1800 ? "text-red-500 font-medium" : ""}>
+              <div className="absolute bottom-1.5 right-2 text-xs text-gray-400 dark:text-gray-500">
+                <span className={input.length > 1800 ? "text-red-500 font-medium dark:text-red-400" : ""}>
                   {input.length}
                 </span>
-                <span className="text-gray-300">/</span>
-                <span className="text-gray-500">2000</span>
+                <span className="text-gray-300 dark:text-gray-600">/</span>
+                <span className="text-gray-500 dark:text-gray-400">2000</span>
               </div>
             </div>
 

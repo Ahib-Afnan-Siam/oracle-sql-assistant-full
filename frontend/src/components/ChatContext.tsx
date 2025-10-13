@@ -171,7 +171,7 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
         bodyPayload.selected_db = "";
       }
 
-      const res = await fetch("http://127.0.0.1:8090/chat", {
+      const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(bodyPayload),
@@ -279,11 +279,29 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
         payload?.results?.columns
       ) {
         const columns: string[] = payload.results.columns || [];
-        const rows: any[][] = payload.results.rows || [];
+        const rows: any[] = payload.results.rows || [];
+        
+        // Convert array of objects to array of arrays if needed
+        let tableRows: (string | number | null)[][] = [];
+        if (rows.length > 0) {
+          // Check if rows are objects (from backend) or already arrays
+          if (typeof rows[0] === 'object' && rows[0] !== null && !Array.isArray(rows[0])) {
+            // Convert objects to arrays using column order
+            tableRows = rows.map(row => 
+              columns.map(col => 
+                row[col] !== undefined ? row[col] : null
+              )
+            );
+          } else {
+            // Rows are already arrays
+            tableRows = rows as (string | number | null)[][];
+          }
+        }
+        
         if (columns.length) {
           addMessage({
             sender: "bot",
-            content: [columns, ...(rows || [])],
+            content: [columns, ...tableRows],
             id: generateId(),
             type: "table",
             // Phase 4.2: Add hybrid metadata to table messages too
@@ -384,7 +402,7 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
       const formData = new FormData();
       formData.append('file', file);
       
-      const uploadResponse = await fetch("http://127.0.0.1:8090/upload-file", {
+      const uploadResponse = await fetch("/api/upload-file", {
         method: "POST",
         body: formData,
         signal: controller.signal,
@@ -402,7 +420,7 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
         question: q
       };
 
-      const analyzeResponse = await fetch("http://127.0.0.1:8090/analyze-file", {
+      const analyzeResponse = await fetch("/api/analyze-file", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(analyzePayload),

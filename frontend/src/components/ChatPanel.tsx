@@ -83,13 +83,31 @@ export default function ChatPanel() {
   };
 
   return (
-    <div className="flex-1 flex flex-col">
-      {/* Scrollable messages area */}
-      <div className="flex-1 min-h-0 overflow-auto">
+    <div className="flex-1 flex flex-col h-full">
+      {/* Scrollable messages area - Fixed scrolling behavior */}
+      <div className="flex-1 min-h-0 overflow-y-auto">
         {/* Centered column like the old version */}
-        <div className="mx-auto max-w-3xl w-full px-4 pt-6 pb-24 space-y-2">
-          {messages.map((m) => (
-            <MessageBubble key={(m as any).id} message={m} />
+        <div className="mx-auto max-w-3xl w-full px-4 pt-6 space-y-2">
+          {messages.map((m, index) => (
+            <React.Fragment key={(m as any).id}>
+              <MessageBubble message={m} />
+              
+              {/* Show feedback boxes only after bot messages */}
+              {m.sender === "bot" && (
+                <div className="px-4 space-y-2">
+                  {/* Phase 4.2: Hybrid AI feedback for the last hybrid response */}
+                  {lastHybridMessage && (lastHybridMessage as any).id === (m as any).id && (
+                    <HybridFeedbackBox
+                      hybridMetadata={(lastHybridMessage as any).hybrid_metadata}
+                      onFeedback={handleHybridFeedback}
+                    />
+                  )}
+                  
+                  {/* Standard feedback box for bot messages */}
+                  <FeedbackBox messageId={(m as any).id} />
+                </div>
+              )}
+            </React.Fragment>
           ))}
 
           {/* Visualization toggle and panel (if data available and in database mode) */}
@@ -100,7 +118,7 @@ export default function ChatPanel() {
                   whileHover={{ scale: 1.03 }}
                   whileTap={{ scale: 0.98 }}
                   onClick={() => setShowVisualization((s) => !s)}
-                  className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 text-sm flex items-center gap-1 smooth-hover hover-lift"
+                  className="px-3 py-1 bg-purple-600 text-white rounded hover:bg-purple-700 text-sm flex items-center gap-1 smooth-hover hover-lift dark:bg-purple-700 dark:hover:bg-purple-800"
                 >
                   {showVisualization ? (
                     <>
@@ -137,22 +155,8 @@ export default function ChatPanel() {
           )}
 
           {/* tiny spacer so the last bubble never sticks to the edge */}
-          <div className="h-2" />
+          <div className="h-24" />
         </div>
-      </div>
-
-      {/* Feedback sits above the input, centered with the same width */}
-      <div className="mx-auto max-w-3xl w-full px-4 space-y-2">
-        {/* Phase 4.2: Hybrid AI feedback for the last hybrid response */}
-        {lastHybridMessage && (
-          <HybridFeedbackBox
-            hybridMetadata={(lastHybridMessage as any).hybrid_metadata}
-            onFeedback={handleHybridFeedback}
-          />
-        )}
-
-        {/* Standard feedback box */}
-        <FeedbackBox />
       </div>
     </div>
   );

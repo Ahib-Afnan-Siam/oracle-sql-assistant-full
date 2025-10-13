@@ -37,6 +37,7 @@ const HybridFeedbackBox: React.FC<Props> = ({ hybridMetadata, onFeedback }) => {
     confidenceAccurate: true,
   });
   const [submitted, setSubmitted] = useState(false);
+  const [feedbackGiven, setFeedbackGiven] = useState(false); // New state to track if feedback was given
 
   const handleSubmit = () => {
     if (!rating) return;
@@ -49,14 +50,27 @@ const HybridFeedbackBox: React.FC<Props> = ({ hybridMetadata, onFeedback }) => {
     });
     
     setSubmitted(true);
+    setFeedbackGiven(true); // Mark that feedback was given
+    // Auto-hide after 2 seconds
     setTimeout(() => {
-      setIsExpanded(false);
       setSubmitted(false);
     }, 2000);
   };
 
-  if (!hybridMetadata) {
-    return null; // Only show for hybrid responses
+  // Handle quick feedback (excellent/poor buttons)
+  const handleQuickFeedback = (rating: "excellent" | "poor") => {
+    setRating(rating);
+    onFeedback({ rating });
+    setSubmitted(true);
+    setFeedbackGiven(true); // Mark that feedback was given
+    // Auto-hide after 2 seconds
+    setTimeout(() => {
+      setSubmitted(false);
+    }, 2000);
+  };
+
+  if (!hybridMetadata || feedbackGiven) {
+    return null; // Only show for hybrid responses and hide if feedback was given
   }
 
   return (
@@ -100,9 +114,7 @@ const HybridFeedbackBox: React.FC<Props> = ({ hybridMetadata, onFeedback }) => {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        setRating("excellent");
-                        onFeedback({ rating: "excellent" });
-                        setSubmitted(true);
+                        handleQuickFeedback("excellent");
                       }}
                       className="p-1 rounded hover:bg-amber-200 transition-colors smooth-hover hover-lift button-press"
                       title="Excellent"
@@ -227,7 +239,9 @@ const HybridFeedbackBox: React.FC<Props> = ({ hybridMetadata, onFeedback }) => {
                   {/* Submit Button */}
                   <div className="flex justify-end gap-2">
                     <button
-                      onClick={() => setIsExpanded(false)}
+                      onClick={() => {
+                        setIsExpanded(false);
+                      }}
                       className="px-3 py-1 text-xs text-gray-600 hover:text-gray-800 transition-colors transition-smooth smooth-hover hover-lift button-press"
                     >
                       Cancel

@@ -9,10 +9,62 @@ from contextlib import contextmanager
 from typing import List, Dict, Any, Tuple
 from app.config import FEEDBACK_DB_ID
 from threading import Lock
+import threading
+
+# Add connection pooling
+from cx_Oracle import SessionPool
 
 _SCHEMA_TTL_SEC = int(os.getenv("SCHEMA_TTL_SEC", "600"))  # 10 min default
 _SCHEMA_LAST_REFRESH: Dict[str, float] = {}                # per-DB last refresh
 _SCHEMA_LOCK = Lock()
+
+# Connection pool configuration
+_CONNECTION_POOLS: Dict[str, SessionPool] = {}
+_POOL_LOCK = Lock()
+_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
+_POOL_INCREMENT = int(os.getenv("DB_POOL_INCREMENT", "1"))
+
+def _get_connection_pool(db_key: str) -> SessionPool:
+    """Get or create a connection pool for a database."""
+    with _POOL_LOCK:
+        if db_key not in _CONNECTION_POOLS:
+            cfg = SOURCE_DBS_MAP.get(db_key)
+            if not cfg:
+                raise ValueError(f"Unknown database: {db_key}")
+            
+            dsn = cx_Oracle.makedsn(
+                cfg["host"], 
+                cfg["port"], 
+                service_name=cfg["service_name"]
+            )
+            
+            # Get timeout values from configuration
+            from app.config import DATABASE_CONFIG
+            connection_timeout_ms = DATABASE_CONFIG.get("connection_timeout_ms", 3000)
+            retry_attempts = DATABASE_CONFIG.get("retry_attempts", 1)
+            
+            # Create connection pool with timeout settings
+            pool = cx_Oracle.SessionPool(
+                user=cfg["user"],
+                password=cfg["password"],
+                dsn=dsn,
+                min=_POOL_MIN,
+                max=_POOL_MAX,
+                increment=_POOL_INCREMENT,
+                encoding="UTF-8",
+                nencoding="UTF-8",
+                threaded=True,
+                getmode=cx_Oracle.SPOOL_ATTRVAL_WAIT,
+                timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
+                wait_timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
+                max_lifetime_session=300,  # 5 minutes max lifetime
+            )
+            
+            _CONNECTION_POOLS[db_key] = pool
+            logger.debug(f"Created connection pool for {db_key} (min={_POOL_MIN}, max={_POOL_MAX}, timeout={connection_timeout_ms}ms)")
+        
+        return _CONNECTION_POOLS[db_key]
 
 def _maybe_refresh_schema_cache(db_key: str, validator: "SchemaValidator") -> None:
     """
@@ -23,9 +75,6 @@ def _maybe_refresh_schema_cache(db_key: str, validator: "SchemaValidator") -> No
         last = _SCHEMA_LAST_REFRESH.get(db_key, 0.0)
         # if the validator is "cold", force refresh regardless of TTL
         if (now - last) < _SCHEMA_TTL_SEC:
-            logging.getLogger(__name__).debug(
-                f"[SchemaCache] skip refresh for {db_key}; age={now-last:.1f}s < TTL"
-            )
             return
         validator.refresh_cache()
         _SCHEMA_LAST_REFRESH[db_key] = now
@@ -141,9 +190,11 @@ with open(os.path.join("config", "sources.json")) as f:
 # Create a mapping from DB ID to configuration
 SOURCE_DBS_MAP = {db["id"]: db for db in SOURCE_DBS}
 
-from app.config import VECTOR_DB
+from app.config import VECTOR_DB, DATABASE_CONFIG
 
 logger = logging.getLogger(__name__)
+# Set logger level to INFO to reduce verbosity
+logger.setLevel(logging.INFO)
 
 class SchemaValidator:
     def __init__(self, conn):
@@ -187,6 +238,10 @@ class SchemaValidator:
 DB_CONNECTIONS: Dict[str, cx_Oracle.Connection] = {}
 DB_VALIDATORS: Dict[str, SchemaValidator] = {}
 
+# Timeout handler for database connections (cross-platform)
+class DatabaseTimeoutError(Exception):
+    pass
+
 def initialize_connection(cfg: Dict[str, Any]) -> Tuple[cx_Oracle.Connection, SchemaValidator]:
     """Initialize a single database connection and validator"""
     dsn = cx_Oracle.makedsn(
@@ -194,78 +249,121 @@ def initialize_connection(cfg: Dict[str, Any]) -> Tuple[cx_Oracle.Connection, Sc
         cfg["port"], 
         service_name=cfg["service_name"]
     )
-    conn = cx_Oracle.connect(
-        user=cfg["user"],
-        password=cfg["password"],
-        dsn=dsn,
-        encoding="UTF-8",
-        nencoding="UTF-8",
-        threaded=True
-    )
-    
-    # Create validator
-    validator = SchemaValidator(conn)
-    validator.refresh_cache()
-    
-    return conn, validator
-
-
-@contextmanager
-def connect_to_source(db_key: str) -> Tuple[cx_Oracle.Connection, SchemaValidator]:
-    """
-    Context manager that connects to a source database using its ID
-    Returns a connection and validator tuple
-    """
-    cfg = SOURCE_DBS_MAP.get(db_key)
-    if not cfg:
-        raise ValueError(f"Unknown database: {db_key}")
-    
-    dsn = cx_Oracle.makedsn(
-        cfg["host"], 
-        cfg["port"], 
-        service_name=cfg["service_name"]
-    )
     conn = None
     try:
+        logger.debug(f"Attempting to connect to database at {cfg['host']}:{cfg['port']}/{cfg['service_name']}")
+        # Add connection timeout parameters using correct cx_Oracle parameter names
         conn = cx_Oracle.connect(
             user=cfg["user"],
             password=cfg["password"],
             dsn=dsn,
             encoding="UTF-8",
             nencoding="UTF-8",
-            threaded=True
+            threaded=True,
+            # Add timeout parameters
+            expire_time=0,  # Disable connection expiration
         )
+        logger.debug("Database connection established successfully")
         
-        # Create validator for this temporary connection
+        # Create validator
+        validator = SchemaValidator(conn)
+        validator.refresh_cache()
+        
+        return conn, validator
+    except cx_Oracle.Error as e:
+        logger.error(f"Failed to establish database connection: {e}")
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        raise
+
+@contextmanager
+def connect_to_source(db_key: str) -> Tuple[cx_Oracle.Connection, SchemaValidator]:
+    """
+    Context manager that connects to a source database using its ID
+    Returns a connection and validator tuple
+    Uses connection pooling for better performance.
+    """
+    cfg = SOURCE_DBS_MAP.get(db_key)
+    if not cfg:
+        raise ValueError(f"Unknown database: {db_key}")
+    
+    conn = None
+    try:
+        logger.debug(f"Attempting to connect to source database {db_key} at {cfg['host']}:{cfg['port']}/{cfg['service_name']}")
+        
+        # Use connection pool instead of creating new connections
+        pool = _get_connection_pool(db_key)
+        conn = pool.acquire()
+        
+        logger.debug(f"Acquired connection from pool for {db_key}")
+        
+        # Create validator for this connection
         validator = SchemaValidator(conn)
         _maybe_refresh_schema_cache(db_key, validator)
         
         yield conn, validator
     except cx_Oracle.Error as e:
-        logger.error("Database error during operation: %s", e)
+        logger.error(f"Database error during operation with source {db_key}: {e}")
+        if conn:
+            try:
+                pool.release(conn)
+            except:
+                pass
         raise
     finally:
         if conn:
-            conn.close()
+            try:
+                pool = _get_connection_pool(db_key)
+                pool.release(conn)
+                logger.debug(f"Released connection back to pool for {db_key}")
+            except Exception as close_error:
+                logger.warning(f"Error releasing connection to pool for {db_key}: {close_error}")
 
 @contextmanager
 def connect_vector():
     """Connect to vector database with PDB support"""
-    dsn = cx_Oracle.makedsn(
-        VECTOR_DB["host"],
-        VECTOR_DB["port"],
-        service_name=VECTOR_DB["service_name"]
-    )
+    # Use connection pooling for vector database as well
     conn = None
     try:
-        conn = cx_Oracle.connect(
-            user=VECTOR_DB["user"],
-            password=VECTOR_DB["password"],
-            dsn=dsn,
-            encoding="UTF-8",
-            nencoding="UTF-8",
-            threaded=True
+        dsn = cx_Oracle.makedsn(
+            VECTOR_DB["host"],
+            VECTOR_DB["port"],
+            service_name=VECTOR_DB["service_name"]
         )
+        
+        # Get timeout values from configuration
+        from app.config import DATABASE_CONFIG
+        connection_timeout_ms = DATABASE_CONFIG.get("connection_timeout_ms", 3000)
+        
+        # Create or get connection pool for vector database
+        vector_db_key = f"vector_{VECTOR_DB['host']}_{VECTOR_DB['port']}_{VECTOR_DB['service_name']}"
+        with _POOL_LOCK:
+            if vector_db_key not in _CONNECTION_POOLS:
+                pool = cx_Oracle.SessionPool(
+                    user=VECTOR_DB["user"],
+                    password=VECTOR_DB["password"],
+                    dsn=dsn,
+                    min=_POOL_MIN,
+                    max=_POOL_MAX,
+                    increment=_POOL_INCREMENT,
+                    encoding="UTF-8",
+                    nencoding="UTF-8",
+                    threaded=True,
+                    getmode=cx_Oracle.SPOOL_ATTRVAL_WAIT,
+                    timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
+                    wait_timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
+                    max_lifetime_session=300,  # 5 minutes max lifetime
+                )
+                _CONNECTION_POOLS[vector_db_key] = pool
+                logger.debug(f"Created connection pool for vector database (min={_POOL_MIN}, max={_POOL_MAX}, timeout={connection_timeout_ms}ms)")
+            
+            pool = _CONNECTION_POOLS[vector_db_key]
+        
+        conn = pool.acquire()
+        logger.debug("Acquired connection from pool for vector database")
 
         # Switch to PDB if specified
         if "pdb" in VECTOR_DB and VECTOR_DB["pdb"]:
@@ -275,10 +373,52 @@ def connect_vector():
         yield conn
     except cx_Oracle.Error as e:
         logger.error(f"Vector DB connection error: {e}")
+        if conn:
+            try:
+                pool.release(conn)
+            except:
+                pass
         raise
     finally:
         if conn:
-            conn.close()
+            try:
+                pool.release(conn)
+                logger.debug("Released connection back to pool for vector database")
+            except Exception as close_error:
+                logger.warning(f"Error releasing connection to pool for vector database: {close_error}")
+
+@contextmanager
+def connect_feedback():
+    """Connect to the Oracle DB that stores AI feedback/labels."""
+    cfg = SOURCE_DBS_MAP.get(FEEDBACK_DB_ID)
+    if not cfg:
+        raise ValueError(f"Unknown FEEDBACK_DB_ID: {FEEDBACK_DB_ID}")
+    
+    conn = None
+    try:
+        logger.debug(f"Attempting to connect to feedback database at {cfg['host']}:{cfg['port']}/{cfg['service_name']}")
+        
+        # Use connection pool for feedback database
+        pool = _get_connection_pool(FEEDBACK_DB_ID)
+        conn = pool.acquire()
+        
+        logger.debug("Acquired connection from pool for feedback database")
+        yield conn
+    except cx_Oracle.Error as e:
+        logger.error(f"Feedback DB connection error: {e}")
+        if conn:
+            try:
+                pool.release(conn)
+            except:
+                pass
+        raise
+    finally:
+        if conn:
+            try:
+                pool.release(conn)
+                logger.debug("Released connection back to pool for feedback database")
+            except Exception as close_error:
+                logger.warning(f"Error releasing connection to pool for feedback database: {close_error}")
 
 def refresh_all_schemas():
     """Refresh schema cache for all configured sources (on-demand, no long-lived connections)."""
@@ -291,25 +431,3 @@ def refresh_all_schemas():
         except Exception as e:
             logger.error(f"Failed to refresh schema for {db_key}: {e}")
 
-
-@contextmanager
-def connect_feedback():
-    """Connect to the Oracle DB that stores AI feedback/labels."""
-    cfg = SOURCE_DBS_MAP.get(FEEDBACK_DB_ID)
-    if not cfg:
-        raise ValueError(f"Unknown FEEDBACK_DB_ID: {FEEDBACK_DB_ID}")
-    dsn = cx_Oracle.makedsn(cfg["host"], cfg["port"], service_name=cfg["service_name"])
-    conn = None
-    try:
-        conn = cx_Oracle.connect(
-            user=cfg["user"],
-            password=cfg["password"],
-            dsn=dsn,
-            encoding="UTF-8",
-            nencoding="UTF-8",
-            threaded=True
-        )
-        yield conn
-    finally:
-        if conn:
-            conn.close()

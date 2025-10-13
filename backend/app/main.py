@@ -62,10 +62,11 @@ except Exception:
             pass
 
 # === Use the RAG orchestrator ===
-from app.rag_engine import answer as rag_answer
+from app.SOS.rag_engine import answer as sos_rag_answer
+from app.ERP_R12_Test_DB.rag_engine import answer as erp_rag_answer
 
 # Optional: vector search utility still useful for debugging endpoints if you add any later
-from app.vector_store_chroma import hybrid_schema_value_search  # noqa: F401 (kept for parity)
+from app.SOS.vector_store_chroma import hybrid_schema_value_search  # noqa: F401 (kept for parity)
 
 # Optional feedback DB exports
 from app.db_connector import connect_feedback
@@ -127,13 +128,30 @@ os.environ["ANONYMIZED_TELEMETRY"] = "False"
 logger = logging.getLogger(__name__)
 
 def configure_logging():
-    level_name = os.getenv("LOG_LEVEL", "DEBUG")  # default DEBUG while you’re tuning
+    level_name = os.getenv("LOG_LEVEL", "INFO")  # Changed default from DEBUG to INFO
     level = getattr(logging, level_name.upper(), logging.INFO)
     fmt = "%(asctime)s | %(levelname)-5s | %(name)s | %(message)s"
     logging.basicConfig(level=level, format=fmt)
     # crank up our package loggers explicitly
-    for name in ("app", "app.rag_engine", "app.query_engine", "app.ollama_llm", "app.db_connector"):
+    for name in ("app", "app.SOS.rag_engine", "app.SOS.query_engine", "app.ollama_llm", "app.db_connector"):
         logging.getLogger(name).setLevel(level)
+    
+    # Reduce verbosity of specific modules that generate excessive logs
+    logging.getLogger("sentence_transformers.SentenceTransformer").setLevel(logging.WARNING)
+    logging.getLogger("tqdm").setLevel(logging.WARNING)
+    
+    # Adjust logging levels to show important information while reducing noise
+    logging.getLogger("app.db_connector").setLevel(logging.INFO)  # Changed from WARNING back to INFO
+    logging.getLogger("app.SOS.hybrid_processor").setLevel(logging.INFO)  # Keep at INFO
+    logging.getLogger("app.SOS.openrouter_client").setLevel(logging.INFO)  # Keep at INFO
+    logging.getLogger("app.hybrid_data_recorder").setLevel(logging.INFO)  # Keep at INFO
+    
+    # Ensure RAG engine logs are visible
+    logging.getLogger("app.SOS.rag_engine").setLevel(logging.INFO)
+    logging.getLogger("app.SOS.query_engine").setLevel(logging.INFO)
+    
+    # Set root logger level to INFO to maintain overall visibility
+    logging.getLogger().setLevel(logging.INFO)
 
 # Configure logging
 configure_logging()
@@ -252,7 +270,7 @@ def _sanitize_filename(filename: str) -> str:
     # Remove path traversal attempts
     filename = re.sub(r'[^\w\-_\.]', '_', filename)
     # Ensure filename doesn't start with dots or slashes
-    filename = filename.lstrip('.\/')
+    filename = filename.lstrip('.\\/')
     # Limit filename length
     if len(filename) > 255:
         name, ext = os.path.splitext(filename)
@@ -282,7 +300,7 @@ def _validate_file_content(file_path: Path) -> bool:
                 content = f.read(4096)
                 # Check for common attack patterns
                 dangerous_patterns = [
-                    b'exec', b'eval', b'import', b'os\.', b'subprocess', 
+                    b'exec', b'eval', b'import', b'os\\.', b'subprocess', 
                     b'popen', b'system', b'__import__', b'__file__',
                     b'<script', b'javascript:', b'vbscript:', b'onload=',
                     b'onerror=', b'onclick=', b'<iframe', b'<object'
@@ -377,11 +395,11 @@ app = FastAPI(title="Oracle SQL Assistant (RAG-enabled)", version="2.0")
 async def log_requests(request: Request, call_next):
     logger = logging.getLogger("app.http")
     t0 = time.perf_counter()
-    logger.info("→ %s %s", request.method, request.url.path)
+    logger.debug("→ %s %s", request.method, request.url.path)
     try:
         resp = await call_next(request)
         ms = (time.perf_counter() - t0) * 1000
-        logger.info("← %s %s %s %.1fms", request.method, request.url.path, resp.status_code, ms)
+        logger.debug("← %s %s %s %.1fms", request.method, request.url.path, resp.status_code, ms)
         return resp
     except Exception:
         ms = (time.perf_counter() - t0) * 1000
@@ -459,10 +477,10 @@ except ImportError:
 # ---------------------------
 class Question(BaseModel):
     question: str
-    # Frontend now sends "" for General, "source_db_1" for SOS, "source_db_2" for Test DB.
+    # Frontend now sends "" for General, "source_db_1" for SOS.
     # Keep optional & permissive for backward-compatibility with aliases.
     selected_db: Optional[str] = ""
-    # New explicit mode values: "General" | "SOS" | "Test DB" (case-insensitive)
+    # New explicit mode values: "General" | "SOS" (case-insensitive)
     mode: str = "General"
 
 class FeedbackIn(BaseModel):
@@ -514,8 +532,8 @@ def get_valid_columns() -> list:
 
 def _normalize_mode(mode: Optional[str]) -> str:
     """
-    Normalize inbound mode strings to one of: 'General', 'SOS', 'Test DB'
-    Accepts legacy/loose inputs like 'database', 'sos', 'test', 'test_db'.
+    Normalize inbound mode strings to one of: 'General', 'SOS', 'ERP'
+    Accepts legacy/loose inputs.
     """
     if not mode:
         return "General"
@@ -524,26 +542,25 @@ def _normalize_mode(mode: Optional[str]) -> str:
         return "General"
     if m in ("sos", "source_db_1", "db1"):
         return "SOS"
-    if m in ("test db", "test_db", "test", "source_db_2", "db2"):
-        return "Test DB"
-    if m in ("database", "db"):  # legacy "database" → treat as DB mode but require a db selection
-        # fallback: if no DB provided we’ll handle below, else keep selection
-        return "SOS" if os.getenv("DEFAULT_DB_MODE", "sos").lower() == "sos" else "Test DB"
+    if m in ("erp", "source_db_2", "db2", "r12", "test db", "test_db"):
+        return "ERP"
     return "General"
 
 def _normalize_selected_db(selected_db: Optional[str], mode: str) -> str:
     """
-    Normalize DB aliases to canonical IDs or empty for General.
+    Normalize DB aliases to canonical IDs.
     """
     if mode == "General":
         return ""
+    if mode == "ERP":
+        return "source_db_2"
     # If caller supplied an explicit DB, normalize it; else infer from mode
     if not selected_db or not selected_db.strip():
-        return "source_db_1" if mode == "SOS" else "source_db_2"
+        return "source_db_1"  # Default to SOS
     s = selected_db.strip().lower()
     if s in ("sos", "source_db_1", "db1"):
         return "source_db_1"
-    if s in ("test", "test_db", "source_db_2", "db2"):
+    if s in ("erp", "source_db_2", "db2", "r12", "test db", "test_db"):
         return "source_db_2"
     # Allow already-canonical values to pass through
     if selected_db in ("source_db_1", "source_db_2"):
@@ -585,22 +602,48 @@ async def chat_api(question: Question, request: Request):
         if not question.question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+        # Log the user query
+        logger.info(f"[MAIN] Received user query: {question.question}")
+
         # Determine & normalize mode/DB
         mode_in = question.mode
         selected_db_in = question.selected_db
-        mode = _normalize_mode(mode_in)  # 'General' | 'SOS' | 'Test DB'
+        mode = _normalize_mode(mode_in)  # 'General' | 'SOS' | 'ERP'
         selected_db = _normalize_selected_db(selected_db_in, mode)  # "" | source_db_1 | source_db_2
 
-        # === Call the RAG orchestrator with training data parameters ===
-        output = await rag_answer(
-            question.question, 
-            selected_db=selected_db,
-            mode=mode,  # Pass the new mode parameter
-            # Phase 5: Pass training data collection parameters for hybrid processing
-            session_id=generate_session_id(request),
-            client_ip=request.client.host if request and request.client else None,
-            user_agent=request.headers.get('user-agent') if request and request.headers else None
-        )
+        # Log the processing details
+        logger.info(f"[MAIN] Processing query with mode={mode}, db={selected_db}")
+
+        # === Call the appropriate RAG orchestrator based on mode ===
+        if mode == "ERP":
+            output = await erp_rag_answer(
+                question.question, 
+                selected_db=selected_db,
+                mode=mode,
+                # Phase 5: Pass training data collection parameters for hybrid processing
+                session_id=generate_session_id(request),
+                client_ip=request.client.host if request and request.client else None,
+                user_agent=request.headers.get('user-agent') if request and request.headers else None
+            )
+        else:
+            # Use SOS RAG engine for General and SOS modes
+            output = await sos_rag_answer(
+                question.question, 
+                selected_db=selected_db,
+                mode=mode,  # Pass the new mode parameter
+                # Phase 5: Pass training data collection parameters for hybrid processing
+                session_id=generate_session_id(request),
+                client_ip=request.client.host if request and request.client else None,
+                user_agent=request.headers.get('user-agent') if request and request.headers else None
+            )
+
+        # Log the output
+        if output:
+            if "sql" in output and output["sql"]:
+                logger.info(f"[MAIN] Generated SQL: {output['sql'][:500]}...")
+            if "summary" in output and output["summary"]:
+                logger.info(f"[MAIN] Generated summary: {output['summary'][:200]}...")
+            logger.info(f"[MAIN] Query processing completed successfully")
 
         # Handle case where output is None
         if output is None:
@@ -972,7 +1015,7 @@ async def test_training_data_collection():
     
     try:
         # Test the training data collection system
-        from app.hybrid_processor import HybridProcessor
+        from app.SOS.hybrid_processor import HybridProcessor
         processor = HybridProcessor()
         test_results = processor.test_training_data_collection()
         
@@ -1009,7 +1052,7 @@ async def get_training_data_status():
     
     try:
         # Get the training data collection system status
-        from app.hybrid_processor import HybridProcessor
+        from app.SOS.hybrid_processor import HybridProcessor
         processor = HybridProcessor()
         status_info = processor.get_training_data_status()
         
@@ -1239,7 +1282,7 @@ async def test_learning_processor(time_window: int = 24):
         Test results and diagnostics for continuous learning system via processor
     """
     try:
-        from app.hybrid_processor import HybridProcessor
+        from app.SOS.hybrid_processor import HybridProcessor
         processor = HybridProcessor()
         test_results = processor.test_continuous_learning_system(time_window)
         
@@ -1374,7 +1417,7 @@ async def get_processor_high_quality_samples(time_window: int = 168, min_quality
         High-quality samples categorized by type
     """
     try:
-        from app.hybrid_processor import HybridProcessor
+        from app.SOS.hybrid_processor import HybridProcessor
         processor = HybridProcessor()
         samples = processor.get_high_quality_samples(time_window, min_quality)
         
@@ -1425,7 +1468,7 @@ async def get_processor_training_dataset(dataset_type: str, time_window: int = 7
         )
     
     try:
-        from app.hybrid_processor import HybridProcessor
+        from app.SOS.hybrid_processor import HybridProcessor
         processor = HybridProcessor()
         dataset = processor.create_training_dataset(dataset_type, time_window)
         
@@ -1672,7 +1715,7 @@ async def analyze_file(request: FileAnalysisRequest, req: Request = None):
             )
         
         # Use OpenRouter client to call Gemini Flash 1.5
-        from app.openrouter_client import OpenRouterClient, OpenRouterError
+        from .SOS.openrouter_client import OpenRouterClient, OpenRouterError
         try:
             client = OpenRouterClient()
             # Use Gemini Flash 1.5 model specifically for file analysis

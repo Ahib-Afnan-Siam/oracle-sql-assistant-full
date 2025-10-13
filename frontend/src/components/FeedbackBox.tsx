@@ -3,7 +3,7 @@ import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useChat } from "./ChatContext";
 
-const FeedbackBox = () => {
+const FeedbackBox = ({ messageId }: { messageId?: string }) => {
   const { lastIds } = useChat();
   const turnId = lastIds?.turn_id;
   const sqlSampleId = lastIds?.sql_sample_id ?? null;
@@ -13,6 +13,7 @@ const FeedbackBox = () => {
   const [mode, setMode] = useState<"idle" | "improve">("idle");
   const [comment, setComment] = useState("");
   const [posting, setPosting] = useState(false);
+  const [feedbackGiven, setFeedbackGiven] = useState(false); // New state to track if feedback was given
 
   // Auto-select task_type without changing your UI
   const pickTaskType = (): "summary" | "sql" | "overall" => {
@@ -41,15 +42,30 @@ const FeedbackBox = () => {
 
     setPosting(true);
     try {
-      await fetch("http://localhost:8090/feedback", {
+      const response = await fetch("http://localhost:8090/feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
       setSubmitted(true);
+      setFeedbackGiven(true); // Mark that feedback was given
+      // Auto-hide after 2 seconds
+      setTimeout(() => {
+        setSubmitted(false);
+      }, 2000);
     } catch (e) {
       console.error("Feedback submit failed:", e);
       setSubmitted(true);
+      setFeedbackGiven(true); // Mark that feedback was given even on error
+      // Show error message for a bit longer
+      setTimeout(() => {
+        setSubmitted(false);
+      }, 3000);
     } finally {
       setPosting(false);
     }
@@ -69,10 +85,10 @@ const FeedbackBox = () => {
   };
 
   // 🔹 Early exits
-  if (!turnId) return null;
+  if (!turnId || feedbackGiven) return null; // Don't show anything if feedback was given
 
   return (
-    <div className="flex justify-center mt-4">
+    <div className="flex justify-center">
       <AnimatePresence>
         {submitted ? (
           <motion.div
@@ -142,7 +158,17 @@ const FeedbackBox = () => {
                     rows={3}
                     disabled={posting}
                   />
-                  <div className="mt-2 flex justify-end">
+                  <div className="mt-2 flex justify-end gap-2">
+                    <button
+                      onClick={() => {
+                        setMode("idle");
+                        setComment("");
+                      }}
+                      disabled={posting}
+                      className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${posting ? "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-gray-200 text-gray-700 hover:bg-gray-300 smooth-hover hover-lift"} button-press`}
+                    >
+                      Cancel
+                    </button>
                     <button
                       onClick={handleImproveSubmit}
                       disabled={posting || !comment.trim()}

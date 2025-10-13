@@ -10,16 +10,27 @@ export type ChartSnapshot = { title?: string; dataUrl: string; widthPx?: number;
 // CSV (you already have this in DataTable, but keep a shared version)
 // -------------------------------------------------------------
 export function toCSV(rows: Table2D): string {
+  // Add safety check to ensure rows is an array and each row is an array
+  if (!Array.isArray(rows)) {
+    console.error('toCSV: rows is not an array', rows);
+    return '';
+  }
+  
   return rows
-    .map((r) =>
-      r
+    .map((r, index) => {
+      // Add safety check for each row
+      if (!Array.isArray(r)) {
+        console.error(`toCSV: row at index ${index} is not an array`, r);
+        return ''; // Return empty string for invalid rows
+      }
+      return r
         .map((v) => {
           const s = v === null || v === undefined ? "" : String(v);
           if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
           return s;
         })
-        .join(","),
-    )
+        .join(",");
+    })
     .join("\n");
 }
 

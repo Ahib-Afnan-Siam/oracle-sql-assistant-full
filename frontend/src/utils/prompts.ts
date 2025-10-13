@@ -14,8 +14,8 @@ const PROMPTS: Record<DBKey, string[]> = {
     "Show the floor-wise efficiency trend for last month",
   ],
   source_db_2: [
-    "Give me report on orders audit",
-    "Show me the summary of import payments",
+    //"Give me report on orders audit",
+    //"Show me the summary of import payments",
   ],
 };
 

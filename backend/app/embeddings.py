@@ -3,8 +3,40 @@ import numpy as np
 from typing import List, Sequence
 import logging
 from sentence_transformers import SentenceTransformer
+import logging
+import os
+from functools import partialmethod
+
+# Disable tqdm progress bars
+from tqdm import tqdm
+tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)
 
 logger = logging.getLogger(__name__)
+
+# Global model cache
+_model_cache = {}
+
+def get_embedding(text: str) -> list:
+    """Generate embedding for a text string."""
+    model = get_embedding_model()
+    embedding = model.encode([text], show_progress_bar=False)  # Disable progress bar
+    return embedding[0].tolist()
+
+def encode_texts_batch(texts: list[str], batch_size: int = 32) -> list[list]:
+    """Generate embeddings for a batch of texts."""
+    if not texts:
+        return []
+    model = get_embedding_model()
+    embeddings = model.encode(texts, batch_size=batch_size, show_progress_bar=False)  # Disable progress bar
+    return embeddings.tolist()
+
+def get_embedding_model():
+    """Get or create embedding model instance."""
+    model_name = "BAAI/bge-small-en"
+    if model_name not in _model_cache:
+        logger.info(f"[EMBEDDINGS] Initializing model: {model_name}")
+        _model_cache[model_name] = SentenceTransformer(model_name, trust_remote_code=True)
+    return _model_cache[model_name]
 
 # ✅ Match Oracle VECTOR(384, FLOAT32, DENSE)
 EMBEDDING_DIMENSIONS = 384

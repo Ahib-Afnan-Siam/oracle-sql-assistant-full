@@ -2,8 +2,36 @@
 import { useChat } from "./ChatContext";
 import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
-import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { PanelLeftClose, PanelLeftOpen, Info } from "lucide-react";
 import { getPrompts } from "../utils/prompts";
+
+// Define mode information with descriptions and colors
+const MODE_INFO = {
+  "SOS": {
+    icon: "🧠",
+    description: "Standard business queries for SOS data",
+    color: "bg-blue-500",
+    bgColor: "bg-blue-500/20",
+    borderColor: "border-blue-500",
+    hoverColor: "hover:bg-blue-500"
+  },
+  "General": {
+    icon: "🌐",
+    description: "General knowledge and non-database questions",
+    color: "bg-green-500",
+    bgColor: "bg-green-500/20",
+    borderColor: "border-green-500",
+    hoverColor: "hover:bg-green-500"
+  },
+  "Test DB": {
+    icon: "🏢",
+    description: "ERP R12 system queries for testing",
+    color: "bg-purple-500",
+    bgColor: "bg-purple-500/20",
+    borderColor: "border-purple-500",
+    hoverColor: "hover:bg-purple-500"
+  }
+};
 
 export default function Sidebar() {
   const {
@@ -19,6 +47,8 @@ export default function Sidebar() {
   const [isMobile, setIsMobile] = useState(false);
   const [isOpen, setIsOpen] = useState(true);
   const [isModeDropdownOpen, setIsModeDropdownOpen] = useState(false);
+  const [modeUsage, setModeUsage] = useState<Record<string, number>>({});
+  const [showModeInfo, setShowModeInfo] = useState<string | null>(null);
 
   // Responsive open/close
   useEffect(() => {
@@ -40,6 +70,33 @@ export default function Sidebar() {
     };
   }, [isMobile, isOpen]);
 
+  // Load mode usage from localStorage on component mount
+  useEffect(() => {
+    const savedUsage = localStorage.getItem('modeUsage');
+    if (savedUsage) {
+      try {
+        setModeUsage(JSON.parse(savedUsage));
+      } catch (e) {
+        console.warn('Failed to parse mode usage data', e);
+      }
+    }
+  }, []);
+
+  // Update mode usage when mode changes
+  useEffect(() => {
+    if (mode) {
+      setModeUsage(prev => {
+        const newUsage = {
+          ...prev,
+          [mode]: (prev[mode] || 0) + 1
+        };
+        // Save to localStorage
+        localStorage.setItem('modeUsage', JSON.stringify(newUsage));
+        return newUsage;
+      });
+    }
+  }, [mode]);
+
   const toggleSidebar = () => setIsOpen((s) => !s);
 
   // Mode switch - updated parameter order
@@ -56,8 +113,15 @@ export default function Sidebar() {
     mode === "SOS" ? "source_db_1" : mode === "Test DB" ? "source_db_2" : "general";
   const prompts = useMemo(() => getPrompts(promptsKey) ?? [], [promptsKey]);
 
+  // Get most used mode
+  const mostUsedMode = useMemo(() => {
+    const entries = Object.entries(modeUsage);
+    if (entries.length === 0) return null;
+    return entries.reduce((a, b) => a[1] > b[1] ? a : b)[0];
+  }, [modeUsage]);
+
   const railBase =
-    "h-[100dvh] min-h-0 bg-white/20 backdrop-blur-sm border-r border-white/30 flex flex-col";
+    "h-[100dvh] min-h-0 bg-white/20 backdrop-blur-sm border-r border-white/30 flex flex-col dark:bg-gray-800/20 dark:border-gray-700/30";
 
   return (
     <>
@@ -65,49 +129,127 @@ export default function Sidebar() {
       {isModeDropdownOpen && (
         <div className="fixed inset-0 z-50 flex justify-end">
           <div 
-            className="absolute inset-0 bg-black/20 backdrop-blur-sm transition-opacity duration-200 ease-in-out"
+            className="absolute inset-0 bg-black/20 backdrop-blur-sm transition-opacity duration-200 ease-in-out dark:bg-black/40"
             onClick={() => setIsModeDropdownOpen(false)}
           />
-          <div className="relative h-full w-full sm:w-80 bg-white/90 backdrop-blur-xl border-l border-white/40 shadow-2xl z-50 transform transition-transform duration-300 ease-out-expo slide-in-right">
+          <div className="relative h-full w-full sm:w-80 bg-white/90 backdrop-blur-xl border-l border-white/40 shadow-2xl z-50 transform transition-transform duration-300 ease-out-expo slide-in-right dark:bg-gray-800/90 dark:border-gray-700/40">
             <div className="p-4 sm:p-6">
-              <h2 className="text-lg sm:text-xl font-bold text-gray-800 mb-4 sm:mb-6 animate-fadeIn-subtle">Select Mode</h2>
+              <h2 className="text-lg sm:text-xl font-bold text-gray-800 mb-4 sm:mb-6 animate-fadeIn-subtle dark:text-gray-100">Select Mode</h2>
               <div className="space-y-3">
                 {/* SOS is now the first option */}
                 <button
                   onClick={() => handleModeSelect("SOS")}
                   className={clsx(
-                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-1-subtle smooth-hover hover-lift",
+                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-1-subtle smooth-hover hover-lift relative",
                     mode === "SOS"
                       ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
-                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md"
+                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
                   )}
+                  onMouseEnter={() => setShowModeInfo("SOS")}
+                  onMouseLeave={() => setShowModeInfo(null)}
                 >
                   <span className="mr-3 text-xl">🧠</span>
-                  <span className="text-left">SOS</span>
+                  <div className="flex flex-col items-start">
+                    <div className="flex items-center">
+                      <span className="text-left">SOS</span>
+                      {mostUsedMode === "SOS" && (
+                        <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
+                          Most Used
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-xs text-left mt-1 opacity-80">
+                      {MODE_INFO.SOS.description}
+                    </span>
+                  </div>
+                  <Info className="ml-auto h-4 w-4 opacity-50" />
+                  {showModeInfo === "SOS" && (
+                    <div className="absolute left-full ml-2 top-0 w-64 p-3 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10">
+                      <div className="font-semibold mb-1">SOS Mode</div>
+                      <p className="text-sm text-gray-600 dark:text-gray-300">
+                        {MODE_INFO.SOS.description}
+                      </p>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                        Best for: Operational data queries, business metrics, performance analysis
+                      </div>
+                    </div>
+                  )}
                 </button>
                 <button
                   onClick={() => handleModeSelect("General")}
                   className={clsx(
-                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-2-subtle smooth-hover hover-lift",
+                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-2-subtle smooth-hover hover-lift relative",
                     mode === "General"
                       ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
-                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md"
+                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
                   )}
+                  onMouseEnter={() => setShowModeInfo("General")}
+                  onMouseLeave={() => setShowModeInfo(null)}
                 >
                   <span className="mr-3 text-xl">🌐</span>
-                  <span className="text-left">General</span>
+                  <div className="flex flex-col items-start">
+                    <div className="flex items-center">
+                      <span className="text-left">General</span>
+                      {mostUsedMode === "General" && (
+                        <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
+                          Most Used
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-xs text-left mt-1 opacity-80">
+                      {MODE_INFO.General.description}
+                    </span>
+                  </div>
+                  <Info className="ml-auto h-4 w-4 opacity-50" />
+                  {showModeInfo === "General" && (
+                    <div className="absolute left-full ml-2 top-0 w-64 p-3 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10">
+                      <div className="font-semibold mb-1">General Mode</div>
+                      <p className="text-sm text-gray-600 dark:text-gray-300">
+                        {MODE_INFO.General.description}
+                      </p>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                        Best for: General knowledge questions, explanations, non-database queries
+                      </div>
+                    </div>
+                  )}
                 </button>
                 <button
                   onClick={() => handleModeSelect("Test DB")}
                   className={clsx(
-                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-3-subtle smooth-hover hover-lift",
+                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-3-subtle smooth-hover hover-lift relative",
                     mode === "Test DB"
                       ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
-                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md"
+                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
                   )}
+                  onMouseEnter={() => setShowModeInfo("Test DB")}
+                  onMouseLeave={() => setShowModeInfo(null)}
                 >
                   <span className="mr-3 text-xl">🏢</span>
-                  <span className="text-left">Test DB</span>
+                  <div className="flex flex-col items-start">
+                    <div className="flex items-center">
+                      <span className="text-left">Test DB</span>
+                      {mostUsedMode === "Test DB" && (
+                        <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
+                          Most Used
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-xs text-left mt-1 opacity-80">
+                      {MODE_INFO["Test DB"].description}
+                    </span>
+                  </div>
+                  <Info className="ml-auto h-4 w-4 opacity-50" />
+                  {showModeInfo === "Test DB" && (
+                    <div className="absolute left-full ml-2 top-0 w-64 p-3 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10">
+                      <div className="font-semibold mb-1">Test DB Mode</div>
+                      <p className="text-sm text-gray-600 dark:text-gray-300">
+                        {MODE_INFO["Test DB"].description}
+                      </p>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                        Best for: ERP system testing, specific database schema queries
+                      </div>
+                    </div>
+                  )}
                 </button>
               </div>
             </div>
@@ -119,7 +261,7 @@ export default function Sidebar() {
         <button
           aria-hidden
           onClick={() => setIsOpen(false)}
-          className="fixed inset-0 z-40 bg-black/20 backdrop-blur-sm transition-opacity duration-300"
+          className="fixed inset-0 z-40 bg-black/20 backdrop-blur-sm transition-opacity duration-300 dark:bg-black/40"
         />
       )}
 
@@ -139,7 +281,7 @@ export default function Sidebar() {
         )}
       >
         {/* Header bar: logo + toggle button, positioned at the top */}
-        <div className="flex items-center justify-between h-16 px-4 bg-white/80 backdrop-blur border-b border-white/40">
+        <div className="flex items-center justify-between h-16 px-4 bg-white/80 backdrop-blur border-b border-white/40 dark:bg-gray-800/80 dark:border-gray-700/40">
           <button
             onClick={clearMessages}
             disabled={isTyping}
@@ -163,7 +305,7 @@ export default function Sidebar() {
               "inline-flex h-10 w-10 items-center justify-center rounded-full",
               "border border-white/60 bg-white/95 text-gray-700 shadow",
               "transition-all duration-300 hover:shadow-lg hover:bg-primary-purple-600 hover:text-white",
-              "focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-primary-purple-600/40 button-press"
+              "focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-primary-purple-600/40 button-press dark:border-gray-700/60 dark:bg-gray-800/95 dark:text-gray-300 dark:hover:bg-primary-purple-600 dark:hover:text-white"
             )}
           >
             {isOpen ? (
@@ -174,11 +316,11 @@ export default function Sidebar() {
           </button>
         </div>
 
-        {/* Content */}
+        {/* Content - Fixed scrolling behavior */}
         <div
           className={clsx(
             !isMobile && !isOpen && "hidden",
-            "flex flex-col flex-1 min-h-0 px-4 transition-smooth"
+            "flex flex-col flex-1 min-h-0 px-4 transition-smooth h-full"
           )}
         >
           {/* New chat - moved up since logo is now in header */}
@@ -189,14 +331,15 @@ export default function Sidebar() {
               "mt-4 w-full py-2 rounded-xl text-sm font-semibold border shadow transition-all duration-300",
               "bg-white/60 text-gray-800 border-white/40",
               "hover:bg-primary-purple-600 hover:text-white hover:shadow-lg smooth-hover hover-lift button-press",
+              "dark:bg-gray-700/60 dark:text-gray-100 dark:border-gray-600/40 dark:hover:bg-primary-purple-600",
               isTyping && "opacity-60 cursor-not-allowed"
             )}
           >
             New chat
           </button>
 
-          {/* Chat Menu */}`
-          <div className="mt-4 text-sm font-semibold text-gray-600 transition-smooth">Chat Menu</div>
+          {/* Chat Menu */}
+          <div className="mt-4 text-sm font-semibold text-gray-600 transition-smooth dark:text-gray-300">Chat Menu</div>
           <div className="mt-2 flex-1 min-h-0 overflow-y-auto pr-1 space-y-2 pb-3 transition-smooth">
             {prompts.map((text, index) => (
               <button
@@ -209,7 +352,8 @@ export default function Sidebar() {
                   "text-xs md:text-[13px] leading-snug",
                   "hover:bg-primary-purple-600 hover:text-white hover:shadow-lg hover:translate-x-0.5 smooth-hover hover-lift button-press",
                   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-purple-600/50",
-                  "staggered-animation animate",
+                  "staggered-animation animate dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600",
+                  "dark:focus-visible:ring-primary-purple-400/50",
                   isTyping && "opacity-60 cursor-not-allowed"
                 )}
                 style={{ animationDelay: `${index * 0.05}s` }}
@@ -222,13 +366,18 @@ export default function Sidebar() {
 
         {/* Mode selector - simplified to a single button that opens the dropdown */}
         <div className={clsx(!isMobile && !isOpen && "hidden", "px-4 pb-4 pt-3 transition-smooth")}>
-          <div className="text-sm font-semibold text-gray-600 mb-2 transition-smooth">Mode</div>
+          <div className="text-sm font-semibold text-gray-600 mb-2 transition-smooth dark:text-gray-300">Mode</div>
           <button
             onClick={() => setIsModeDropdownOpen(true)}
             className={clsx(
               "w-full py-4 rounded-lg text-base font-semibold border shadow transition-all duration-300 flex items-center justify-between px-4 transform transition-transform hover:scale-[1.01]",
               "bg-white/60 text-gray-800 border-white/40",
-              "hover:bg-primary-purple-600 hover:text-white hover:shadow-md smooth-hover hover-lift button-press"
+              "hover:bg-primary-purple-600 hover:text-white hover:shadow-md smooth-hover hover-lift button-press",
+              "dark:bg-gray-700/60 dark:text-gray-100 dark:border-gray-600/40 dark:hover:bg-primary-purple-600",
+              // Add active mode indicator
+              mode === "SOS" && "border-blue-500",
+              mode === "General" && "border-green-500",
+              mode === "Test DB" && "border-purple-500"
             )}
           >
             <span className="flex items-center">
@@ -236,6 +385,11 @@ export default function Sidebar() {
               {mode === "General" && "🌐"}
               {mode === "Test DB" && "🏢"}
               <span className="ml-2">{mode}</span>
+              {mostUsedMode === mode && (
+                <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
+                  Most Used
+                </span>
+              )}
             </span>
             <span 
               className={clsx(
@@ -246,10 +400,14 @@ export default function Sidebar() {
               ▼
             </span>
           </button>
+          {/* Mode description */}
+          <div className="mt-2 text-xs text-gray-600 dark:text-gray-400 px-2">
+            {MODE_INFO[mode].description}
+          </div>
         </div>
       </aside>
 
-      {/* Floating open button when closed */}
+      {/* Floating open button when closed - Fixed positioning */}
       {!isOpen && (
         <button
           onClick={toggleSidebar}
@@ -258,7 +416,8 @@ export default function Sidebar() {
           className={clsx(
             "fixed left-3 top-4 z-[60] inline-flex h-12 w-12 items-center justify-center rounded-full",
             "border border-white/60 bg-white/95 text-gray-700 shadow-lg transition-all duration-200 ease-out hover:shadow-xl",
-            "hover:bg-primary-purple-600 hover:text-white animate-float-subtle button-press hover-scale-strong"
+            "hover:bg-primary-purple-600 hover:text-white animate-float-subtle button-press hover-scale-strong",
+            "dark:border-gray-700/60 dark:bg-gray-800/95 dark:text-gray-300 dark:hover:bg-primary-purple-600 dark:hover:text-white"
           )}
         >
           <PanelLeftOpen className="h-6 w-6" strokeWidth={2.25} />

@@ -11,7 +11,9 @@ oracledb>=2.0.0
 chromadb>=0.5.13
 tqdm>=4.66.0
 tabulate>=0.9.0
-cx_Oracle==8.3.0            # needed because query_engine.py imports cx_Oracle
+Pillow>=9.0.0               # for image processing in file uploads
+cx_Oracle>=8.3.0            # needed because query_engine.py imports cx_Oracle
 aiohttp>=3.9.0              # for async HTTP requests to OpenRouter
+aiofiles>=0.8.0             # for async file operations
 # Deleted:asyncio>=3.4.3              # for parallel processing (usually built-in)
 # Deleted:sqlite3                     # for training data storage (usually built-in)

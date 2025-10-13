@@ -8,7 +8,8 @@ from typing import Optional, Dict, Any
 from app.db_connector import connect_feedback
 
 logger = logging.getLogger(__name__)
-
+# Set logger level to WARNING to reduce verbosity
+logger.setLevel(logging.WARNING)
 
 def _json_dumps(obj: Any, default_empty="{}") -> str:
     """Compact JSON for CLOB columns. Always returns a string."""
@@ -44,10 +45,10 @@ def _make_number_var(cursor):
     except Exception:
         pass
 
-    # Last resort (should rarely happen). Some drivers accept Python float for NUMBER.
+    # Last resort (should rarely happen). Some drivers accept Python int for NUMBER.
     # If this still fails, the caller will log the exception.
-    logger.warning("[feedback] Could not resolve Oracle NUMBER type; falling back to float.")
-    return cursor.var(float)
+    logger.warning("[feedback] Could not resolve Oracle NUMBER type; falling back to int.")
+    return cursor.var(int)
 
 
 def _insert_with_returning(cursor, sql: str, binds: Dict[str, Any]) -> int:
@@ -67,7 +68,17 @@ def _insert_with_returning(cursor, sql: str, binds: Dict[str, Any]) -> int:
     if isinstance(val, (list, tuple)):
         val = val[0] if val else None
 
-    return int(val) if val is not None else 0
+    # Handle both int and float values, converting to int
+    if val is not None:
+        if isinstance(val, (int, float)):
+            return int(val)
+        else:
+            # Try to convert string or other types to int
+            try:
+                return int(float(val))
+            except (ValueError, TypeError):
+                return 0
+    return 0
 
 
 

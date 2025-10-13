@@ -59,20 +59,20 @@ const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
   const hasAnyText = !!(errorData.message || errorData.error);
 
   return (
-    <div className="bg-red-50 p-3 rounded-lg border border-red-200">
-      <div className="font-bold text-red-800 flex items-start gap-2">
+    <div className="bg-red-50 p-3 rounded-lg border border-red-200 dark:bg-red-900/30 dark:border-red-800/50 dark:text-gray-100">
+      <div className="font-bold text-red-800 flex items-start gap-2 dark:text-red-200">
         <span>⚠️</span>
         <span>{hasAnyText ? (errorData.message || errorData.error) : "Unknown error"}</span>
       </div>
 
-      {errorData.code && <div className="text-xs text-red-700 mt-1">Code: {errorData.code}</div>}
+      {errorData.code && <div className="text-xs text-red-700 mt-1 dark:text-red-300">Code: {errorData.code}</div>}
 
       {errorData.missing_tables?.length ? (
         <div className="mt-2">
-          <p className="text-sm font-semibold text-gray-700">Missing tables:</p>
+          <p className="text-sm font-semibold text-gray-700 dark:text-gray-300">Missing tables:</p>
           <div className="flex flex-wrap gap-1 mt-1">
             {errorData.missing_tables.map((t) => (
-              <span key={t} className="bg-red-100 text-red-800 px-2 py-1 rounded text-xs">
+              <span key={t} className="bg-red-100 text-red-800 px-2 py-1 rounded text-xs dark:bg-red-800/30 dark:text-red-200">
                 {t}
               </span>
             ))}
@@ -81,19 +81,19 @@ const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
       ) : null}
 
       {errorData.sql ? (
-        <div className="mt-3 bg-gray-800 text-gray-100 p-2 rounded text-xs font-mono overflow-x-auto">
-          <div className="text-gray-400 text-xs mb-1">Generated SQL:</div>
+        <div className="mt-3 bg-gray-800 text-gray-100 p-2 rounded text-xs font-mono overflow-x-auto dark:bg-gray-700">
+          <div className="text-gray-400 text-xs mb-1 dark:text-gray-300">Generated SQL:</div>
           <code>{errorData.sql}</code>
         </div>
       ) : null}
 
       {errorData.valid_columns?.length ? (
         <div className="mt-3">
-          <p className="text-sm font-semibold text-gray-700">Available columns:</p>
-          <ul className="list-disc pl-5 text-sm text-gray-700 mt-1">
+          <p className="text-sm font-semibold text-gray-700 dark:text-gray-300">Available columns:</p>
+          <ul className="list-disc pl-5 text-sm text-gray-700 mt-1 dark:text-gray-300">
             {errorData.valid_columns.map((col) => (
               <li key={col} className="py-0.5">
-                <code className="bg-gray-100 px-1 rounded">{col}</code>
+                <code className="bg-gray-100 px-1 rounded dark:bg-gray-700 dark:text-gray-300">{col}</code>
               </li>
             ))}
           </ul>
@@ -102,8 +102,8 @@ const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
 
       {Array.isArray(errorData.suggestions) && errorData.suggestions.length ? (
         <div className="mt-3">
-          <p className="text-sm font-semibold text-gray-700">Suggestions:</p>
-          <ul className="list-disc pl-5 text-sm text-gray-700 mt-1">
+          <p className="text-sm font-semibold text-gray-700 dark:text-gray-300">Suggestions:</p>
+          <ul className="list-disc pl-5 text-sm text-gray-700 mt-1 dark:text-gray-300">
             {errorData.suggestions.map((s, i) => (
               <li key={i}>{s}</li>
             ))}
@@ -112,12 +112,12 @@ const OracleErrorDisplay = ({ error }: { error: string | OracleError }) => {
       ) : null}
 
       {errorData.suggestion ? (
-        <div className="mt-2 text-sm text-gray-700">
+        <div className="mt-2 text-sm text-gray-700 dark:text-gray-300">
           <span className="font-semibold">Suggestion:</span> {errorData.suggestion}
         </div>
       ) : null}
 
-      <div className="mt-3 text-xs text-gray-500">
+      <div className="mt-3 text-xs text-gray-500 dark:text-gray-400">
         Need help? Try rephrasing your question or check the column names.
       </div>
     </div>
@@ -189,11 +189,11 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
 
   const bubbleStyle: Record<Message["type"], string> = {
     user: "bg-primary-purple-600 text-white",
-    status: "bg-yellow-50 text-gray-600 italic status-blink",
-    table: "bg-white text-gray-900 border border-gray-200 shadow",
-    summary: "bg-gray-100 text-gray-800",
-    error: "bg-red-50 border-red-200",
-    file: "bg-blue-50 text-gray-800 border border-blue-200",
+    status: "bg-yellow-50 text-gray-600 italic status-blink dark:bg-yellow-900/30 dark:text-gray-100",
+    table: "bg-white text-gray-900 border border-gray-200 shadow dark:bg-gray-800 dark:text-gray-100 dark:border-gray-700",
+    summary: "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100",
+    error: "bg-red-50 border-red-200 dark:bg-red-900/20 dark:border-red-800/50 dark:text-gray-100",
+    file: "bg-blue-50 text-gray-800 border border-blue-200 dark:bg-blue-900/20 dark:text-gray-100 dark:border-blue-800/50",
   };
 
 // Wider rules for tables; narrower for text bubbles
@@ -230,11 +230,11 @@ const tableMaxWidthStyle =
     if (type === "file") {
       return (
         <div className="flex items-center gap-2">
-          <Paperclip size={16} className="text-blue-500" />
+          <Paperclip size={16} className="text-blue-500 dark:text-blue-400" />
           <div>
             <div className="font-medium">{file?.name}</div>
             {file && (
-              <div className="text-xs text-blue-100">
+              <div className="text-xs text-blue-100 dark:text-blue-300">
                 {(file.size / 1024).toFixed(1)} KB
               </div>
             )}
@@ -252,21 +252,15 @@ const tableMaxWidthStyle =
     }
 
     if (type === "table") {
-      // In general mode, we shouldn't have table data, but just in case
-      if (mode === "General") {
-        return (
-          <div className="text-sm text-gray-700">
-            Unexpected table data in general mode. This might be an error.
-          </div>
-        );
-      }
+      // Always show table data regardless of current mode
+      // The mode check was preventing table display when switching modes
       return <DataTable data={content as TableData} />;
     }
 
     if (type === "summary") {
       const text = displayed;
       return (
-        <div className="prose prose-sm max-w-none">
+        <div className="prose prose-sm max-w-none dark:prose-invert dark:text-gray-100">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>
             {text}
           </ReactMarkdown>
@@ -277,7 +271,7 @@ const tableMaxWidthStyle =
     // For general mode responses that are strings (not tables or errors)
     if (typeof content === "string") {
       return (
-        <div className="prose prose-sm max-w-none">
+        <div className="prose prose-sm max-w-none dark:prose-invert dark:text-gray-100">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>
             {content}
           </ReactMarkdown>
@@ -286,7 +280,7 @@ const tableMaxWidthStyle =
     }
 
     // Fallback for any other content
-    return <div className="text-sm">{String(content)}</div>;
+    return <div className="text-sm dark:text-gray-100">{String(content)}</div>;
   };
 
   return (
@@ -330,7 +324,7 @@ const tableMaxWidthStyle =
 
           {/* Response time display */}
           {(message as any).response_time && (
-            <div className="text-xs text-gray-500 mt-2">
+            <div className="text-xs text-gray-500 mt-2 dark:text-gray-400">
               Response time: {(message as any).response_time}ms
             </div>
           )}

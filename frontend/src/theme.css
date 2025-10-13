@@ -40,4 +40,47 @@
   /* Easing functions */
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in-out-quad: cubic-bezier(0.45, 0, 0.55, 1);
+  
+  /* Light mode specific colors */
+  --background-color: #ffffff;
+  --text-color: #374151;
+  --text-color-light: #6b7280;
+  --surface-color: #f9fafb;
+  --border-color: #e5e7eb;
+  --shadow-color: rgba(0, 0, 0, 0.1);
+  --background-image: url('/gradient-bg.png');
+}
+
+.dark {
+  /* Dark mode specific colors */
+  --background-color: #111827;
+  --text-color: #f3f4f6; /* Lighter text for better readability */
+  --text-color-light: #d1d5db;
+  --surface-color: #1f2937;
+  --border-color: #374151;
+  --shadow-color: rgba(0, 0, 0, 0.3);
+  /* Dark mode uses a solid dark background instead of an image */
+  --background-image: none;
+  
+  /* Adjust purple colors for better visibility in dark mode */
+  --primary-purple-50: #f5f3ff;
+  --primary-purple-100: #ede9fe;
+  --primary-purple-200: #ddd6fe;
+  --primary-purple-300: #c4b5fd;
+  --primary-purple-400: #a78bfa;
+  --primary-purple-500: #8b5cf6;
+  --primary-purple-600: #7c3aed;
+  --primary-purple-700: #6d28d9;
+  --primary-purple-800: #5b21b6;
+  --primary-purple-900: #4c1d95;
+}
+
+/* Ensure background covers entire viewport */
+body {
+  background-color: var(--background-color);
+  background-image: var(--background-image);
+  background-repeat: no-repeat;
+  background-size: cover;
+  background-position: center;
+  position: relative;
 }

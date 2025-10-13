@@ -1,0 +1,1 @@
+# ERP R12 module initialization

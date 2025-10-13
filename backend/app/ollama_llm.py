@@ -133,6 +133,12 @@ def ask_summary_model(prompt: str) -> str:
 def ask_analytical_model(prompt: str) -> str:
     return _ask_ollama_generic(OLLAMA_ANALYTICAL_URL, OLLAMA_ANALYTICAL_MODEL, OLLAMA_ANALYTICAL_TIMEOUT, prompt)
 
+# Async version for use in async contexts
+async def ask_analytical_model_async(prompt: str) -> str:
+    # Run the synchronous function in a thread pool to avoid blocking
+    import asyncio
+    return await asyncio.get_event_loop().run_in_executor(None, ask_analytical_model, prompt)
+
 def call_ollama(prompt: str, model: str) -> str:
     if model == OLLAMA_SQL_MODEL:
         return ask_sql_model(prompt)
@@ -153,6 +159,9 @@ def ask_deepseek_r1(prompt: str) -> str:
         )
         resp.raise_for_status()
         return (resp.json().get("response") or "").strip()
+    except requests.exceptions.Timeout:
+        logger.error(f"[R1] DeepSeek-R1 request timed out after {OLLAMA_R1_TIMEOUT} seconds")
+        return "⚠️ Request to DeepSeek-R1 timed out. Please try a simpler query."
     except Exception as e:
         logger.error(f"[R1] DeepSeek-R1 failed: {e}")
         return "⚠️ Failed to generate response with DeepSeek-R1."

@@ -14,7 +14,7 @@ export default function HomePrompts() {
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.3 }}
-        className="text-2xl font-semibold mb-2"
+        className="text-2xl font-semibold mb-2 dark:text-gray-100"
       >
         Ask our AI anything
       </motion.h2>
@@ -22,7 +22,7 @@ export default function HomePrompts() {
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.3, delay: 0.1 }}
-        className="text-sm text-gray-500 mb-6"
+        className="text-sm text-gray-500 mb-6 dark:text-gray-400"
       >
         🧠 Welcome! Curious about efficiency, performance, or trends? Just ask!
       </motion.p>
@@ -58,7 +58,7 @@ function PromptButton({
 }) {
   return (
     <button
-      className="px-4 py-2 rounded-full bg-transparent text-gray-800 border border-gray-300 text-sm transition duration-200 hover:bg-purple-600 hover:text-white hover:shadow-md disabled:opacity-50 smooth-hover hover-lift button-press"
+      className="px-4 py-2 rounded-full bg-transparent text-gray-800 border border-gray-300 text-sm transition duration-200 hover:bg-purple-600 hover:text-white hover:shadow-md disabled:opacity-50 smooth-hover hover-lift button-press dark:text-gray-200 dark:border-gray-600 dark:hover:bg-purple-600"
       onClick={() => onClick(text)}
       disabled={disabled}
     >

@@ -13,4 +13,6 @@ from app.main import app
 import uvicorn
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8092, log_level="debug")
+    # For production deployment, bind to all interfaces
+    # Set host to "0.0.0.0" to accept connections from any IP
+    uvicorn.run(app, host="0.0.0.0", port=8095, log_level="info")
