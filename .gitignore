@@ -56,6 +56,19 @@ backend/*.sqlite3
 backend/.env
 backend/.env.*
 
+# Database configuration files
+backend/config/sources.json
+
+# Environment files
+.env*
+!*.example
+backend/.env*
+
+# Log files
+*.log
+logs/
+log/
+
 # OS generated files
 .DS_Store
 .DS_Store?

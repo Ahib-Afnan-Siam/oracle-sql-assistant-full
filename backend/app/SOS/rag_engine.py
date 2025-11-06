@@ -3,7 +3,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 from datetime import datetime as _dt
 import os
 from decimal import Decimal
@@ -35,6 +35,9 @@ from .query_engine import (
     ensure_label_filter,
     extract_explicit_date_range,
     extract_relative_date_range,
+    extract_enhanced_date_range,
+    extract_single_day_range,
+    extract_month_token_range,
     # Entity-lookup fast path (importing "private" helpers is acceptable inside the app)
     _is_entity_lookup,
     _needle_from_question,
@@ -62,7 +65,7 @@ logging.basicConfig(level=logging.INFO)
 
 try:
     from .hybrid_processor import HybridProcessor
-    from app.config import HYBRID_ENABLED, OPENROUTER_ENABLED, COLLECT_TRAINING_DATA
+    from app.config import HYBRID_ENABLED, DEEPSEEK_ENABLED as OPENROUTER_ENABLED, COLLECT_TRAINING_DATA
     HYBRID_PROCESSING_AVAILABLE = HYBRID_ENABLED and OPENROUTER_ENABLED
     if HYBRID_PROCESSING_AVAILABLE:
         logger.info("[RAG] Hybrid AI processing system enabled")
@@ -79,7 +82,7 @@ try:
     # Import training data collection system if available
     if COLLECT_TRAINING_DATA:
         try:
-            from app.hybrid_data_recorder import hybrid_data_recorder
+            from app.ai_training_data_recorder import ai_training_data_recorder
             from .query_classifier import QueryClassifier
             logger.info("[RAG] Training data collection system enabled")
         except ImportError as e:
@@ -142,7 +145,7 @@ DYNAMIC_ENTITY_PATTERNS = {
 }
 
 INTENT_CLASSIFICATION_PATTERNS = {
-    'production_summary': {
+    'floor_production_summary': {
         'keywords': ['floor-wise', 'production', 'summary'],
         'variations': ['floor wise', 'floorwise', 'production summary'],
         'table_preference': ['T_PROD_DAILY', 'T_PROD']
@@ -159,7 +162,7 @@ INTENT_CLASSIFICATION_PATTERNS = {
     },
     'efficiency_query': {
         'keywords': ['efficiency', 'floor ef', 'dhu'],
-        'metrics': ['FLOOR_EF', 'DHU'],
+        'variations': ['efficiency', 'floor ef', 'dhu'],
         'table_preference': ['T_PROD_DAILY']
     },
     'tna_task_query': {
@@ -380,8 +383,8 @@ def _augment_plan_with_metrics(uq: str, plan: dict, options: dict) -> dict:
     
     # Handle relative dates
     if entities.get('relative_dates'):
-        # Import the date filter function from query_engine
-        from app.query_engine import _build_date_filter_from_relative_expression
+        # Use the local date filter function
+        # from app.query_engine import _build_date_filter_from_relative_expression
         
         # Get the date column for this table
         date_col = plan.get("date_col", "PROD_DATE")  # Default to PROD_DATE
@@ -500,7 +503,7 @@ def enhanced_intent_classification(user_query: str, entities: Dict) -> Dict[str,
                 score += 0.2
         
         # Entity alignment
-        if intent == 'production_summary' and entities.get('companies'):
+        if intent == 'floor_production_summary' and entities.get('companies'):
             score += 0.2
         elif intent == 'defect_analysis' and entities.get('aggregations'):
             score += 0.3
@@ -776,7 +779,7 @@ def smart_table_selection(user_query: str, entities: Dict, intent: str) -> List[
         return selected_tables  # Early return for CTL codes
     
     # Priority 2: Intent-based table selection
-    if intent == 'production_summary' or intent == 'defect_analysis':
+    if intent == 'floor_production_summary' or intent == 'defect_analysis':
         # Check for date specificity to choose between T_PROD and T_PROD_DAILY
         if any(date in entities.get('dates', []) for date in entities.get('dates', [])):
             if _DAILY_HINT_RX.search(user_query):
@@ -829,7 +832,7 @@ def dynamic_column_selection(tables: List[str], entities: Dict, intent: str) -> 
             columns.extend(['FLOOR_NAME', 'PROD_DATE'])
             
             # Intent-specific columns
-            if intent == 'production_summary':
+            if intent == 'floor_production_summary':
                 columns.extend(['PRODUCTION_QTY', 'DEFECT_QTY'])
             elif intent == 'defect_analysis':
                 columns.extend(['DEFECT_QTY', 'DHU', 'UNCUT_THREAD', 'DIRTY_STAIN'])
@@ -1143,20 +1146,25 @@ async def _try_hybrid_processing(
                         api_confidence=0.0
                     )
                     
-                    hybrid_data_recorder.record_complete_hybrid_turn(
-                        turn_id=turn_id,
-                        classification_result=classification_result,
-                        processing_result=failed_result,
-                        entities=enhanced_analysis.get('entities', {}),
-                        schema_tables_used=options.get("tables", []),
-                        business_context=f"Enhanced analysis: {enhanced_analysis.get('intent', 'unknown')}",
-                        sql_execution_success=False,
-                        sql_execution_error="No SQL generated",
-                        classification_time_ms=classification_time_ms,
-                        session_id=session_id,
-                        client_ip=client_ip,
-                        user_agent=user_agent
-                    )
+                    # Record training data with new AI training recorder
+                    if ai_training_data_recorder:
+                        try:
+                            # Record execution result for failed attempt
+                            execution_details = {
+                                'execution_status': 'failed',
+                                'execution_time_ms': (time.time() - processing_start_time) * 1000,
+                                'row_count': 0,
+                                'error_message': 'No response generated from hybrid processor'
+                            }
+                            
+                            execution_id = ai_training_data_recorder.record_execution_result(
+                                query_id=turn_id,
+                                execution_details=execution_details
+                            )
+                            logger.info(f"[RAG] Recorded failed execution result with ID: {execution_id}")
+                        except Exception as record_error:
+                            logger.warning(f"[RAG] Failed to record execution result: {record_error}")
+                    
                     logger.info("[RAG] Recorded failed hybrid processing attempt for training data")
                 except Exception as record_error:
                     logger.warning(f"[RAG] Failed to record processing error: {record_error}")
@@ -1277,8 +1285,20 @@ async def _try_hybrid_processing(
                         if COLLECT_TRAINING_DATA and turn_id and 'classification_result' in locals():
                             try:
                                 # Record hybrid processing data (similar to existing code)
-                                # ... existing training data recording code ...
-                                pass
+                                if ai_training_data_recorder:
+                                    # Record execution result for fallback
+                                    execution_details = {
+                                        'execution_status': 'success',
+                                        'execution_time_ms': 0,  # Not available
+                                        'row_count': len(rows) if rows else 0,
+                                        'error_message': ''
+                                    }
+                                    
+                                    execution_id = ai_training_data_recorder.record_execution_result(
+                                        query_id=turn_id,
+                                        execution_details=execution_details
+                                    )
+                                    logger.info(f"[RAG] Recorded fallback execution result with ID: {execution_id}")
                             except Exception as e:
                                 logger.warning(f"[RAG] Failed to record hybrid processing training data: {e}")
                         
@@ -1313,8 +1333,23 @@ async def _try_hybrid_processing(
             
             # Original code for recording failures
             if COLLECT_TRAINING_DATA and turn_id and classification_result:
-                # ... existing code for recording failures ...
-                pass
+                # Record execution result for failed attempt
+                if ai_training_data_recorder:
+                    try:
+                        execution_details = {
+                            'execution_status': 'failed',
+                            'execution_time_ms': (time.time() - processing_start_time) * 1000,
+                            'row_count': 0,
+                            'error_message': 'Hybrid processing returned non-SQL response'
+                        }
+                        
+                        execution_id = ai_training_data_recorder.record_execution_result(
+                            query_id=turn_id,
+                            execution_details=execution_details
+                        )
+                        logger.info(f"[RAG] Recorded failed execution result with ID: {execution_id}")
+                    except Exception as record_error:
+                        logger.warning(f"[RAG] Failed to record execution result: {record_error}")
             
             return None
         
@@ -1351,20 +1386,8 @@ async def _try_hybrid_processing(
             # Phase 5.2: Record SQL validation failure for training data
             if COLLECT_TRAINING_DATA and turn_id and classification_result:
                 try:
-                    hybrid_data_recorder.record_complete_hybrid_turn(
-                        turn_id=turn_id,
-                        classification_result=classification_result,
-                        processing_result=processing_result,
-                        entities=enhanced_analysis.get('entities', {}),
-                        schema_tables_used=options.get("tables", []),
-                        business_context=f"Enhanced analysis: {enhanced_analysis.get('intent', 'unknown')}",
-                        sql_execution_success=False,
-                        sql_execution_error="SQL validation failed",
-                        classification_time_ms=classification_time_ms,
-                        session_id=session_id,
-                        client_ip=client_ip,
-                        user_agent=user_agent
-                    )
+                    # TODO: Implement training data recording with new AI training recorder
+                    pass
                     logger.info("[RAG] Recorded SQL validation failure for training data")
                 except Exception as record_error:
                     logger.warning(f"[RAG] Failed to record SQL validation failure: {record_error}")
@@ -1433,22 +1456,8 @@ async def _try_hybrid_processing(
     # Phase 5.3: Record successful hybrid processing with complete training data
     if COLLECT_TRAINING_DATA and turn_id and classification_result:
         try:
-            recorded_ids = hybrid_data_recorder.record_complete_hybrid_turn(
-                turn_id=turn_id,
-                classification_result=classification_result,
-                processing_result=processing_result,
-                entities=enhanced_analysis.get('entities', {}),
-                schema_tables_used=options.get("tables", []),
-                business_context=f"Enhanced analysis: {enhanced_analysis.get('intent', 'unknown')}" if enhanced_analysis else "Enhanced analysis: unknown",
-                sql_execution_success=sql_execution_success,
-                sql_execution_error=sql_execution_error,
-                result_row_count=result_row_count,
-                sql_execution_time_ms=sql_execution_time_ms,
-                classification_time_ms=classification_time_ms,
-                session_id=session_id,
-                client_ip=client_ip,
-                user_agent=user_agent
-            )
+            # TODO: Implement training data recording with new AI training recorder
+            recorded_ids = {}
             logger.info(f"[RAG] Recorded complete hybrid processing turn with training data: {recorded_ids}")
         except Exception as e:
             logger.warning(f"[RAG] Failed to record hybrid processing training data: {e}")
@@ -1574,7 +1583,7 @@ def create_dynamic_prompt_context(user_query: str, schema_context: str, selected
     
     # Build adaptive prompt
     prompt_parts = [
-        "You are an Oracle SQL expert generating queries for a manufacturing database.",
+        "You are an Oracle SQL expert generating queries for a manufacturing database. ALL RESPONSES MUST BE IN ENGLISH LANGUAGE.",
         "",
         "CRITICAL TABLE SELECTION:",
         f"- DEFAULT TABLE: {default_table}",
@@ -2164,7 +2173,7 @@ def _planner_prompt(user_query: str, options: Dict[str, Any]) -> str:
     """
     return f"""
 You are a SQL planning assistant. Choose only from the provided tables, columns, and joins.
-Do NOT invent names. Return ONLY valid JSON, no preface, no trailing text.
+Do NOT invent names. Return ONLY valid JSON, no preface, no trailing text. ALL RESPONSES MUST BE IN ENGLISH LANGUAGE.
 
 USER QUESTION:
 {user_query}
@@ -3065,8 +3074,8 @@ Important: The dataset contains {len(rows)} total records. While only a sample i
         
         # Use the OpenRouter client directly, no asyncio
         try:
-            from .openrouter_client import OpenRouterClient
-            client = OpenRouterClient()
+            from .deepseek_client import DeepSeekClient
+            client = DeepSeekClient()
             
             # This is a synchronous version that handles async internally
             messages = [{"role": "user", "content": prompt}]
@@ -3109,6 +3118,7 @@ async def answer(
     session_id: Optional[str] = None,
     client_ip: Optional[str] = None,
     user_agent: Optional[str] = None,
+    cancellation_token: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """
     Main RAG orchestrator with hybrid AI processing and comprehensive training data collection.
@@ -3120,6 +3130,7 @@ async def answer(
         session_id: Session identifier for training data collection
         client_ip: Client IP address for training data collection
         user_agent: User agent string for training data collection
+        cancellation_token: Function that returns True if operation should be cancelled
 
     Returns:
         Dictionary with query results and metadata
@@ -3141,8 +3152,7 @@ async def answer(
                 # Check if we got a valid response
                 if processing_result and processing_result.selected_response:
                     # Check if this is an error response
-                    if processing_result.processing_mode in ["general_query_api_error", "general_query_error"]:
-                        # Return error response
+                    if processing_result.processing_mode in ["general_query_error", "general_query_api_error"]:
                         return {
                             "status": "error",
                             "message": processing_result.selected_response,
@@ -3151,12 +3161,13 @@ async def answer(
                             "schema_context_ids": [],
                         }
                     
-                    # Return successful response
+                    # Return successful general query response
                     return {
                         "status": "success",
                         "summary": processing_result.selected_response,
                         "sql": None,
                         "display_mode": "summary",
+                        "visualization": False,
                         "results": {
                             "columns": [],
                             "rows": [],
@@ -3173,16 +3184,24 @@ async def answer(
                             "api_confidence": processing_result.api_confidence,
                         }
                     }
-            
-            # For general mode, if hybrid processing is not available, return an error
-            # rather than falling back to local model
-            return {
-                "status": "error",
-                "message": "General mode is not available. Hybrid processing system is not enabled or configured properly.",
-                "sql": None,
-                "schema_context": [],
-                "schema_context_ids": [],
-            }
+                else:
+                    # If hybrid processing failed, return an error
+                    return {
+                        "status": "error",
+                        "message": "General query processing failed to generate a response.",
+                        "sql": None,
+                        "schema_context": [],
+                        "schema_context_ids": [],
+                    }
+            else:
+                # If hybrid processing is not available, return an error
+                return {
+                    "status": "error",
+                    "message": "General mode is not available. Hybrid processing system is not enabled or configured properly.",
+                    "sql": None,
+                    "schema_context": [],
+                    "schema_context_ids": [],
+                }
         except Exception as e:
             logger.error(f"[RAG] General query processing failed: {e}")
             return {
@@ -3193,7 +3212,7 @@ async def answer(
                 "schema_context_ids": [],
             }
     
-    # For database modes (SOS, Test DB), continue with existing database processing
+    # Handle database queries (SOS, PRAN_ERP, RFL_ERP modes)
     uq = user_query.strip()
     if not uq:
         return {"status": "error", "message": "Empty query."}
@@ -3366,20 +3385,20 @@ async def answer(
         if COLLECT_TRAINING_DATA:
             try:
                 # Create actual AI_TURN record for training data collection during RAG processing
-                from app.feedback_store import insert_turn
+                from app.ai_training_data_recorder import ai_training_data_recorder, RecordingContext
 
-                temp_turn_id = insert_turn(
-                    source_db_id="source_db_1",
-                    client_ip=client_ip,
-                    user_question=user_query,
-                    schema_context_text="\n\n".join(schema_chunks[:5]),  # Limited context for temp record
-                    schema_context_ids=schema_context_ids[:10] if schema_context_ids else [],
-                    meta={
-                        "temp_record_for_training": True,
-                        "enhanced_analysis": enhanced_analysis.get("intent", "unknown")
-                        if enhanced_analysis
-                        else "unknown",
-                    },
+                # Create recording context
+                context = RecordingContext(
+                    session_id=session_id,
+                    client_info=f"{client_ip};{user_agent}",
+                    database_type="oracle",
+                    query_mode="rag_processing"
+                )
+
+                # Record the training query
+                temp_turn_id = ai_training_data_recorder.record_training_query(
+                    user_query_text=user_query,
+                    context=context
                 )
                 logger.info(f"[RAG] Created temporary turn_id {temp_turn_id} for training data collection")
             except Exception as e:
@@ -3499,7 +3518,7 @@ async def answer(
 
     # 4) Execute ---------------------------------------------------------------
     try:
-        rows = run_sql(sql, selected_db)
+        rows = run_sql(sql, selected_db, cancellation_token=cancellation_token)
     except Exception as e:
         logger.error(f"[RAG] Oracle error during execute: {e}")
         return {
@@ -3533,7 +3552,7 @@ async def answer(
                         sql2 = ensure_label_filter(sql2, uq, selected_db)
                         enforce_predicate_type_compat(sql2, selected_db)
                         if is_valid_sql(sql2, selected_db):
-                            rows2 = run_sql(sql2, selected_db)
+                            rows2 = run_sql(sql2, selected_db, cancellation_token=cancellation_token)
                             if rows2:
                                 # promote the successful retry to the main flow
                                 sql, rows = sql2, rows2

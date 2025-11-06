@@ -6,7 +6,8 @@ import logging
 import itertools
 import re
 from contextlib import contextmanager
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Callable, Optional
+
 from app.config import FEEDBACK_DB_ID
 from threading import Lock
 import threading
@@ -15,15 +16,17 @@ import threading
 from cx_Oracle import SessionPool
 
 _SCHEMA_TTL_SEC = int(os.getenv("SCHEMA_TTL_SEC", "600"))  # 10 min default
+# Add separate TTL for ERP databases which have many more tables
+_ERP_SCHEMA_TTL_SEC = int(os.getenv("ERP_SCHEMA_TTL_SEC", "3600"))  # 1 hour default for ERP
 _SCHEMA_LAST_REFRESH: Dict[str, float] = {}                # per-DB last refresh
 _SCHEMA_LOCK = Lock()
 
 # Connection pool configuration
 _CONNECTION_POOLS: Dict[str, SessionPool] = {}
 _POOL_LOCK = Lock()
-_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
-_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
-_POOL_INCREMENT = int(os.getenv("DB_POOL_INCREMENT", "1"))
+_POOL_MIN = int(os.getenv("DB_POOL_MIN", "5"))  # Increased minimum pool size
+_POOL_MAX = int(os.getenv("DB_POOL_MAX", "20"))  # Increased maximum pool size
+_POOL_INCREMENT = int(os.getenv("DB_POOL_INCREMENT", "2"))  # Increased increment
 
 def _get_connection_pool(db_key: str) -> SessionPool:
     """Get or create a connection pool for a database."""
@@ -58,7 +61,10 @@ def _get_connection_pool(db_key: str) -> SessionPool:
                 getmode=cx_Oracle.SPOOL_ATTRVAL_WAIT,
                 timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
                 wait_timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
-                max_lifetime_session=300,  # 5 minutes max lifetime
+                max_lifetime_session=600,  # Increased to 10 minutes max lifetime
+                # Add performance optimization parameters
+                homogeneous=True,  # All connections use the same credentials
+                externalauth=False,  # Use standard authentication
             )
             
             _CONNECTION_POOLS[db_key] = pool
@@ -69,12 +75,15 @@ def _get_connection_pool(db_key: str) -> SessionPool:
 def _maybe_refresh_schema_cache(db_key: str, validator: "SchemaValidator") -> None:
     """
     Refresh the validator's schema cache at most once per TTL *per source DB*.
+    For ERP databases with many tables, use a longer TTL to avoid expensive refreshes.
     """
     now = time.time()
     with _SCHEMA_LOCK:
         last = _SCHEMA_LAST_REFRESH.get(db_key, 0.0)
+        # Determine TTL based on database type
+        ttl = _ERP_SCHEMA_TTL_SEC if db_key == "source_db_2" else _SCHEMA_TTL_SEC
         # if the validator is "cold", force refresh regardless of TTL
-        if (now - last) < _SCHEMA_TTL_SEC:
+        if (now - last) < ttl:
             return
         validator.refresh_cache()
         _SCHEMA_LAST_REFRESH[db_key] = now
@@ -210,12 +219,31 @@ class SchemaValidator:
                 cur.execute("SELECT table_name FROM user_tables")
                 self._table_cache = {row[0].upper() for row in cur.fetchall()}
                 
-                # Cache columns
-                cur.execute("""
-                    SELECT table_name, column_name, data_type 
-                    FROM user_tab_columns
-                    ORDER BY table_name, column_id
-                """)
+                # For ERP databases, optimize the column query to avoid loading all columns for all tables
+                # which is extremely expensive for databases with many tables
+                if len(self._table_cache) > 500:  # ERP database optimization threshold
+                    logger.info(f"Optimizing schema refresh for large database with {len(self._table_cache)} tables")
+                    # For large databases, only cache columns for critical/often-used tables
+                    critical_tables = [
+                        'HR_OPERATING_UNITS', 'ORG_ORGANIZATION_DEFINITIONS', 
+                        'MTL_ONHAND_QUANTITIES_DETAIL', 'MTL_SECONDARY_INVENTORIES'
+                    ]
+                    table_placeholders = ','.join([':' + str(i) for i in range(len(critical_tables))])
+                    params = {str(i): table for i, table in enumerate(critical_tables)}
+                    
+                    cur.execute(f"""
+                        SELECT table_name, column_name, data_type 
+                        FROM user_tab_columns 
+                        WHERE table_name IN ({table_placeholders})
+                        ORDER BY table_name, column_id
+                    """, params)
+                else:
+                    # Cache columns for all tables (original behavior for smaller databases)
+                    cur.execute("""
+                        SELECT table_name, column_name, data_type 
+                        FROM user_tab_columns
+                        ORDER BY table_name, column_id
+                    """)
                 
                 # Group columns by table
                 self._column_cache = {
@@ -280,7 +308,7 @@ def initialize_connection(cfg: Dict[str, Any]) -> Tuple[cx_Oracle.Connection, Sc
         raise
 
 @contextmanager
-def connect_to_source(db_key: str) -> Tuple[cx_Oracle.Connection, SchemaValidator]:
+def connect_to_source(db_key: str):
     """
     Context manager that connects to a source database using its ID
     Returns a connection and validator tuple
@@ -291,6 +319,7 @@ def connect_to_source(db_key: str) -> Tuple[cx_Oracle.Connection, SchemaValidato
         raise ValueError(f"Unknown database: {db_key}")
     
     conn = None
+    pool = None
     try:
         logger.debug(f"Attempting to connect to source database {db_key} at {cfg['host']}:{cfg['port']}/{cfg['service_name']}")
         
@@ -307,7 +336,7 @@ def connect_to_source(db_key: str) -> Tuple[cx_Oracle.Connection, SchemaValidato
         yield conn, validator
     except cx_Oracle.Error as e:
         logger.error(f"Database error during operation with source {db_key}: {e}")
-        if conn:
+        if conn and pool:
             try:
                 pool.release(conn)
             except:
@@ -327,6 +356,7 @@ def connect_vector():
     """Connect to vector database with PDB support"""
     # Use connection pooling for vector database as well
     conn = None
+    pool = None
     try:
         dsn = cx_Oracle.makedsn(
             VECTOR_DB["host"],
@@ -355,7 +385,10 @@ def connect_vector():
                     getmode=cx_Oracle.SPOOL_ATTRVAL_WAIT,
                     timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
                     wait_timeout=int(connection_timeout_ms / 1000),  # Convert to seconds
-                    max_lifetime_session=300,  # 5 minutes max lifetime
+                    max_lifetime_session=600,  # Increased to 10 minutes max lifetime
+                    # Add performance optimization parameters
+                    homogeneous=True,  # All connections use the same credentials
+                    externalauth=False,  # Use standard authentication
                 )
                 _CONNECTION_POOLS[vector_db_key] = pool
                 logger.debug(f"Created connection pool for vector database (min={_POOL_MIN}, max={_POOL_MAX}, timeout={connection_timeout_ms}ms)")
@@ -373,14 +406,14 @@ def connect_vector():
         yield conn
     except cx_Oracle.Error as e:
         logger.error(f"Vector DB connection error: {e}")
-        if conn:
+        if conn and pool:
             try:
                 pool.release(conn)
             except:
                 pass
         raise
     finally:
-        if conn:
+        if conn and pool:
             try:
                 pool.release(conn)
                 logger.debug("Released connection back to pool for vector database")
@@ -395,6 +428,7 @@ def connect_feedback():
         raise ValueError(f"Unknown FEEDBACK_DB_ID: {FEEDBACK_DB_ID}")
     
     conn = None
+    pool = None
     try:
         logger.debug(f"Attempting to connect to feedback database at {cfg['host']}:{cfg['port']}/{cfg['service_name']}")
         
@@ -406,14 +440,14 @@ def connect_feedback():
         yield conn
     except cx_Oracle.Error as e:
         logger.error(f"Feedback DB connection error: {e}")
-        if conn:
+        if conn and pool:
             try:
                 pool.release(conn)
             except:
                 pass
         raise
     finally:
-        if conn:
+        if conn and pool:
             try:
                 pool.release(conn)
                 logger.debug("Released connection back to pool for feedback database")
@@ -431,3 +465,58 @@ def refresh_all_schemas():
         except Exception as e:
             logger.error(f"Failed to refresh schema for {db_key}: {e}")
 
+# Add a custom exception for query cancellation
+class QueryCancellationError(Exception):
+    """Exception raised when a query is cancelled."""
+    pass
+
+# Add a function to execute SQL with cancellation support
+def execute_sql_with_cancellation(sql: str, connection, cancellation_token: Optional[Callable[[], bool]] = None) -> List[Dict[str, Any]]:
+    """
+    Execute SQL with support for cancellation.
+    
+    Args:
+        sql: The SQL query to execute
+        connection: The database connection
+        cancellation_token: A function that returns True if the query should be cancelled
+        
+    Returns:
+        List of rows as dictionaries
+        
+    Raises:
+        QueryCancellationError: If the query is cancelled
+    """
+    # Check for cancellation before executing
+    if cancellation_token and cancellation_token():
+        raise QueryCancellationError("Query was cancelled before execution")
+    
+    cursor = connection.cursor()
+    
+    try:
+        cursor.execute(sql)
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        rows = [{cols[i]: to_jsonable(r[i]) for i in range(len(cols))} for r in cursor]
+        
+        # Check for cancellation after execution
+        if cancellation_token and cancellation_token():
+            raise QueryCancellationError("Query was cancelled during execution")
+            
+        return rows
+    finally:
+        try:
+            cursor.close()
+        except:
+            pass
+
+# Helper function to convert values to JSON-serializable format
+def to_jsonable(v):
+    """Convert a value to a JSON-serializable format."""
+    from decimal import Decimal
+    from datetime import datetime, date
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, bytes):
+        return v.decode('utf-8', errors='ignore')
+    return v

@@ -73,7 +73,7 @@ uttoron/
 - **Database:** Oracle (via `cx_Oracle`), SQLite (for feedback storage)  
 - **AI/ML:** Sentence Transformers, ChromaDB, Ollama  
 - **Vector Store:** ChromaDB  
-- **External APIs:** OpenRouter (cloud LLMs)
+- **External APIs:** DeepSeek (cloud LLMs)
 
 #### Frontend
 - **Framework:** React + TypeScript  
@@ -155,9 +155,9 @@ OLLAMA_SQL_MODEL=deepseek-coder-v2:16b
 # Reasoning/summary model (optional)
 OLLAMA_R1_MODEL=deepseek-r1:14b
 
-# ── Hybrid Processing (Optional: Cloud via OpenRouter) ─────────────────────────
+# ── Hybrid Processing (Optional: Cloud via DeepSeek) ─────────────────────────
 HYBRID_ENABLED=true           # set to false to use local-only
-OPENROUTER_API_KEY=your_api_key_here
+DEEPSEEK_API_KEY=your_api_key_here
 
 # ── Training Data Collection ───────────────────────────────────────────────────
 COLLECT_TRAINING_DATA=true
@@ -214,13 +214,13 @@ Update `backend/config/sources.json` with your Oracle database connections:
 #### LLM Configuration
 Set LLM settings in `.env` (see Installation):
 - **Local models** via **Ollama**
-- **Cloud models** via **OpenRouter API**
+- **Cloud models** via **DeepSeek API**
 - **Hybrid processing** (combine both)
 
 #### Enable Hybrid Processing
 ```env
 HYBRID_ENABLED=true
-OPENROUTER_API_KEY=your_openrouter_api_key
+DEEPSEEK_API_KEY=your_deepseek_api_key
 ```
 
 ---
@@ -403,7 +403,7 @@ python -m pytest
 #### Common Issues
 - **Database Connection Errors:** Verify credentials in `backend/config/sources.json`  
 - **LLM Not Responding:** Check **Ollama** install and pulled models  
-- **Hybrid Processing Not Working:** Ensure **OPENROUTER_API_KEY** is set and `HYBRID_ENABLED=true`  
+- **Hybrid Processing Not Working:** Ensure **DEEPSEEK_API_KEY** is set and `HYBRID_ENABLED=true`  
 - **Schema Cache Issues:** Restart the backend to refresh cached schema/embeddings  
 
 #### Logs
@@ -633,7 +633,7 @@ The `_enhanced_database_query` function now:
 
 - Added `DATABASE_QUERY` mapping to "general" model type
 - Database queries use the same hybrid processing pipeline as other queries
-- Both local (Ollama) and cloud (OpenRouter) models can generate SQL for database queries
+- Both local (Ollama) and cloud (DeepSeek) models can generate SQL for database queries
 
 #### How It Works
 
@@ -786,7 +786,7 @@ The original `summarizer.py` file has been completely rewritten to focus on API-
 
 - **Removed**: Complex fixed-format summarization logic
 - **Removed**: Multiple fallback mechanisms and structured reporting
-- **Added**: Clean API-based summarization using OpenRouter models
+- **Added**: Clean API-based summarization using DeepSeek models
 - **Added**: Flexible prompt engineering for natural language responses
 - **Added**: Simplified interface matching existing function signatures
 
@@ -807,7 +807,7 @@ class APISummarizer:
     def summarize(self, user_query, columns, rows, sql=None):
         # Format data for API consumption
         # Create flexible prompt
-        # Generate summary via OpenRouter API
+        # Generate summary via DeepSeek API
         # Return natural language response
     
     async def summarize_async(self, user_query, columns, rows, sql=None):
@@ -845,7 +845,7 @@ The summarizer integrates with the RAG engine through:
 
 #### Hybrid Processing
 
-When OpenRouter is enabled:
+When DeepSeek is enabled:
 - Uses primary model from API_MODELS configuration
 - Falls back to simple text response when API is unavailable
 - Maintains consistent response format regardless of processing method
@@ -853,7 +853,7 @@ When OpenRouter is enabled:
 ### Configuration
 
 The summarizer respects existing configuration:
-- `OPENROUTER_ENABLED` flag controls API usage
+- `DEEPSEEK_ENABLED` flag controls API usage
 - Uses models defined in `API_MODELS["general"]` configuration
 - Temperature setting of 0.3 for consistent business language
 - Max tokens limit of 500 for concise responses
@@ -966,9 +966,9 @@ QUERY INTERPRETATION GUIDELINES:
 - NEVER add unnecessary filtering conditions like DISABLE_DATE checks unless explicitly requested
 ```
 
-##### 2. Enhanced Prompt Instructions in `openrouter_client.py`
+##### 2. Enhanced Prompt Instructions in `deepseek_client.py`
 
-Added the same **QUERY INTERPRETATION GUIDELINES** to the OpenRouter client prompt to ensure consistency across all AI models.
+Added the same **QUERY INTERPRETATION GUIDELINES** to the DeepSeek client prompt to ensure consistency across all AI models.
 
 ##### 3. Improved Database Connection Timeout Handling
 
@@ -1076,9 +1076,9 @@ Additionally, the database connectivity improvements ensure that users don't exp
 - Improved handling of semicolons and statement boundaries
 - Added more robust parsing of multi-line responses
 
-##### 3. Fixed Model Selection (`openrouter_client.py`)
+##### 3. Fixed Model Selection (`deepseek_client.py`)
 
-**File**: `backend/app/ERP_R12_Test_DB/openrouter_client.py`
+**File**: `backend/app/ERP_R12_Test_DB/deepseek_client.py`
 **Methods**: `get_sql_response` and `get_model_with_fallback`
 
 **Changes**:

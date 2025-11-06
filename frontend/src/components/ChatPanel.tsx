@@ -1,14 +1,13 @@
 // src/components/ChatPanel.tsx
 import React, { useEffect, useState } from "react";
 import { useChat, type Message } from "./ChatContext";
-import FeedbackBox from "./FeedbackBox";
 import MessageBubble from "./MessageBubble";
-import HybridFeedbackBox from "./HybridFeedbackBox";
+import UnifiedFeedbackBox from "./UnifiedFeedbackBox";
 import DataVisualization from "./DataVisualization";
 import { BarChart, Table as TableIcon } from "lucide-react"; // Added icon imports
 import { motion, AnimatePresence } from "framer-motion"; // Added framer-motion import
 
-export default function ChatPanel() {
+function ChatPanel() {
   const { messages, mode } = useChat();
 
   // ---- Visualization state ----
@@ -21,7 +20,7 @@ export default function ChatPanel() {
   // Detect visualization-ready assistant/bot messages
   useEffect(() => {
     // Only show visualization in database mode
-    if ((mode !== "SOS" && mode !== "Test DB") || !messages || messages.length === 0) {
+    if ((mode !== "SOS" && mode !== "PRAN ERP") || !messages || messages.length === 0) {
       setVisualizationData(null);
       setShowVisualization(false);
       return;
@@ -59,59 +58,47 @@ export default function ChatPanel() {
     }
   }, [messages, mode]);
 
-  // Phase 4.2: Find the last message with hybrid metadata for hybrid feedback
-  const lastHybridMessage = [...messages]
-    .reverse()
-    .find(
-      (m) =>
-        (m as any).sender === "bot" &&
-        (m as any).hybrid_metadata &&
-        Object.keys((m as any).hybrid_metadata).length > 0
-    );
-
-  const handleHybridFeedback = (feedback: any) => {
-    // Log hybrid-specific feedback
-    console.log("Hybrid AI Feedback:", {
-      message_id: (lastHybridMessage as any)?.id,
-      hybrid_metadata: (lastHybridMessage as any)?.hybrid_metadata,
-      feedback,
-    });
-
-    // TODO: Send to backend for analytics
-    // This could be integrated with the existing feedback system
-    // or sent to a separate hybrid AI analytics endpoint
+  // Function to determine if a message should have a feedback box
+  const shouldShowFeedbackBox = (message: Message, index: number) => {
+    // Only show feedback box for bot messages
+    if (message.sender !== "bot") return false;
+    
+    // Check if this is the last bot message in a sequence
+    // Look ahead to see if the next message is also from bot
+    const nextMessage = messages[index + 1];
+    if (nextMessage && nextMessage.sender === "bot") {
+      // If the next message is also from bot, don't show feedback box for this one
+      return false;
+    }
+    
+    // Show feedback box for the last bot message in a sequence
+    return true;
   };
 
   return (
     <div className="flex-1 flex flex-col h-full">
       {/* Scrollable messages area - Fixed scrolling behavior */}
       <div className="flex-1 min-h-0 overflow-y-auto">
-        {/* Centered column like the old version */}
-        <div className="mx-auto max-w-3xl w-full px-4 pt-6 space-y-2">
+        {/* Centered column like the old version - Made responsive */}
+        <div className="mx-auto w-full max-w-2xl md:max-w-3xl lg:max-w-4xl xl:max-w-5xl 2xl:max-w-6xl px-4 pt-6 space-y-2">
           {messages.map((m, index) => (
             <React.Fragment key={(m as any).id}>
               <MessageBubble message={m} />
               
-              {/* Show feedback boxes only after bot messages */}
-              {m.sender === "bot" && (
+              {/* Show unified feedback box only after the last bot message in a sequence */}
+              {shouldShowFeedbackBox(m, index) && (
                 <div className="px-4 space-y-2">
-                  {/* Phase 4.2: Hybrid AI feedback for the last hybrid response */}
-                  {lastHybridMessage && (lastHybridMessage as any).id === (m as any).id && (
-                    <HybridFeedbackBox
-                      hybridMetadata={(lastHybridMessage as any).hybrid_metadata}
-                      onFeedback={handleHybridFeedback}
-                    />
-                  )}
-                  
-                  {/* Standard feedback box for bot messages */}
-                  <FeedbackBox messageId={(m as any).id} />
+                  <UnifiedFeedbackBox 
+                    messageId={(m as any).id}
+                    hybridMetadata={(m as any).hybrid_metadata}
+                  />
                 </div>
               )}
             </React.Fragment>
           ))}
 
           {/* Visualization toggle and panel (if data available and in database mode) */}
-          {(mode === "SOS" || mode === "Test DB") && visualizationData && (
+          {(mode === "SOS" || mode === "PRAN ERP") && visualizationData && (
             <div className="mt-2">
               <div className="mb-2">
                 <motion.button
@@ -161,3 +148,5 @@ export default function ChatPanel() {
     </div>
   );
 }
+
+export default ChatPanel;

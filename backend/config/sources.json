@@ -11,10 +11,19 @@
   {
     "id": "source_db_2",
     "type": "oracle",
-    "host": "172.17.2.43",
-    "port": 1521,
-    "service_name": "PRAN",
-    "user": "hr",
-    "password": "hr"
+    "host": "172.17.8.24",
+    "port": 1530,
+    "service_name": "BDEV",
+    "user": "apps",
+    "password": "apps"
+  },
+  {
+    "id": "source_db_3",
+    "type": "oracle",
+    "host": "172.17.8.106",
+    "port": 1615,
+    "service_name": "EDEV",
+    "user": "apps",
+    "password": "apps"
   }
 ]

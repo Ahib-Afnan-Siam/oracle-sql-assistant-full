@@ -30,7 +30,7 @@ Training Data Preparation Features:
 - High-quality sample identification (API responses that outperformed local, successful query-response pairs, domain-specific improvements needed)
 - Training dataset creation (Manufacturing query patterns, Oracle SQL best practices, Business logic examples)
 """
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Depends
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from pathlib import Path
@@ -42,24 +42,55 @@ import csv
 import re
 import hashlib
 import uuid
+import asyncio
+import threading
 from typing import Any, Dict, Optional
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import (
-    OLLAMA_SQL_MODEL, 
-    OLLAMA_ANALYTICAL_MODEL,
-    COLLECT_TRAINING_DATA 
-)
+
+# PDF handling
+import PyPDF2
+
+# In-memory storage for token-username mapping (in production, use Redis or database)
+token_username_map = {}
+token_username_map_lock = threading.Lock()
+# Token expiration time (24 hours)
+TOKEN_EXPIRATION_TIME = 24 * 60 * 60
+
+# Function to clean up expired tokens
+def _cleanup_expired_tokens():
+    """Clean up expired tokens from the token-username mapping."""
+    try:
+        # In this simple implementation, we don't track token creation time
+        # In a production system, you would store timestamp with each token
+        # and remove tokens older than expiration time
+        pass
+    except Exception as e:
+        logger.warning(f"Error cleaning up expired tokens: {e}")
+
 
 
 # Oracle error type (be tolerant to either driver)
 try:
-    from oracledb import DatabaseError as OraDatabaseError
-except Exception:
+    from oracledb import DatabaseError as _OraDatabaseError
+    OraDatabaseError = _OraDatabaseError
+except ImportError:
     try:
-        from cx_Oracle import DatabaseError as OraDatabaseError
-    except Exception:
+        from cx_Oracle import DatabaseError as _OraDatabaseError
+        OraDatabaseError = _OraDatabaseError
+    except ImportError:
         class OraDatabaseError(Exception):
             pass
+
+# Import the new AI training recorder
+try:
+    from app.ai_training_data_recorder import AITrainingDataRecorder
+    AI_TRAINING_RECORDER_AVAILABLE = True
+except ImportError:
+    AI_TRAINING_RECORDER_AVAILABLE = False
+    AITrainingDataRecorder = None
+
+# Import datetime for timestamp handling
+from datetime import datetime as _dt
 
 # === Use the RAG orchestrator ===
 from app.SOS.rag_engine import answer as sos_rag_answer
@@ -73,7 +104,7 @@ from app.db_connector import connect_feedback
 
 # Phase 5.2: Import quality metrics system
 try:
-    from app.hybrid_data_recorder import hybrid_data_recorder
+    from app.ai_training_data_recorder import ai_training_data_recorder
     QUALITY_METRICS_AVAILABLE = True
 except ImportError:
     QUALITY_METRICS_AVAILABLE = False
@@ -82,10 +113,11 @@ except ImportError:
 # optional: model names (used when inserting samples)
 # ---------------------------
 try:
-    from app.config import OLLAMA_SQL_MODEL, OLLAMA_ANALYTICAL_MODEL
+    from app.config import OLLAMA_SQL_MODEL, OLLAMA_ANALYTICAL_MODEL, COLLECT_TRAINING_DATA
 except Exception:
     OLLAMA_SQL_MODEL = "unknown-sql-model"
     OLLAMA_ANALYTICAL_MODEL = "unknown-summary-model"
+    COLLECT_TRAINING_DATA = True
 
 # ---------------------------
 # feedback-store helpers (soft import; fallback to no-ops)
@@ -98,15 +130,111 @@ except Exception:
 #   insert_feedback(...)
 # ---------------------------
 try:
-    from app.feedback_store import (
-        insert_turn,
-        insert_sql_sample,
-        update_sql_sample,
-        insert_summary_sample,
-        update_summary_sample,
-        insert_feedback,
-    )
+    # Use the new AI training recorder for feedback storage
+    from app.ai_training_data_recorder import ai_training_data_recorder, record_training_query, RecordingContext
     FEEDBACK_STORE_AVAILABLE = True
+    
+    # Create wrapper functions for the AI training recorder
+    def insert_turn(source_db_id, client_ip, user_question, schema_context_text=None, schema_context_ids=None, meta=None):
+        """Record a turn in the AI training recorder"""
+        try:
+            # Extract username from meta if available
+            username = meta.get('username') if meta else None
+            
+            context = RecordingContext(
+                session_id=meta.get('session_id') if meta else None,
+                client_info=f"{client_ip or ''};{meta.get('user_agent', '') if meta else ''}",
+                database_type=source_db_id,
+                query_mode=meta.get('processing_mode', 'unknown') if meta else 'unknown',
+                username=username
+            )
+            
+            turn_id = ai_training_data_recorder.record_training_query(
+                user_query_text=user_question,
+                context=context
+            )
+            return turn_id
+        except Exception as e:
+            logger.warning(f"Failed to record turn in AI training recorder: {e}")
+            return None
+    
+    def insert_sql_sample(turn_id, model_name, prompt_text=None, sql_text=None, display_mode=None):
+        """Record SQL sample in the AI training recorder"""
+        try:
+            if turn_id:
+                model_details = {
+                    'model_name': model_name,
+                    'response_text': sql_text or '',
+                    'prompt_text': prompt_text,
+                    'status': 'success',
+                    'provider': 'ollama'
+                }
+                
+                sample_id = ai_training_data_recorder.record_model_interaction(
+                    query_id=turn_id,
+                    model_type='local',
+                    model_details=model_details
+                )
+                return sample_id
+        except Exception as e:
+            logger.warning(f"Failed to record SQL sample in AI training recorder: {e}")
+        return None
+    
+    def update_sql_sample(sql_sample_id, **cols):
+        """Update SQL sample - noop for AI training recorder"""
+        # Not implemented for AI training recorder
+        return None
+    
+    def insert_summary_sample(turn_id, model_name, prompt_text=None, data_snapshot=None, sql_used=None, display_mode=None):
+        """Record summary sample in the AI training recorder"""
+        try:
+            if turn_id:
+                model_details = {
+                    'model_name': model_name,
+                    'response_text': data_snapshot or '',
+                    'prompt_text': prompt_text,
+                    'status': 'success',
+                    'provider': 'ollama'
+                }
+                
+                sample_id = ai_training_data_recorder.record_model_interaction(
+                    query_id=turn_id,
+                    model_type='local',
+                    model_details=model_details
+                )
+                return sample_id
+        except Exception as e:
+            logger.warning(f"Failed to record summary sample in AI training recorder: {e}")
+        return None
+    
+    def update_summary_sample(summary_sample_id, **cols):
+        """Update summary sample - noop for AI training recorder"""
+        # Not implemented for AI training recorder
+        return None
+    
+    def insert_feedback(turn_id, task_type, feedback_type, sql_sample_id=None, summary_sample_id=None, improvement_comment=None, labeler_role=None, meta=None):
+        """Record feedback in the AI training recorder"""
+        try:
+            if turn_id:
+                # Extract source information from meta if available
+                source = meta.get('source', '') if meta else ''
+                feedback_details = {
+                    'feedback_type': feedback_type,
+                    'feedback_score': 5 if feedback_type == 'good' else (1 if feedback_type == 'wrong' else 3),
+                    'feedback_comment': improvement_comment,
+                    'source': source,
+                    'submission_timestamp': _dt.now()
+                }
+                
+                feedback_id = ai_training_data_recorder.record_user_feedback(
+                    query_id=turn_id,
+                    feedback_details=feedback_details
+                )
+                return feedback_id
+        except Exception as e:
+            logger.warning(f"Failed to record feedback in AI training recorder: {e}")
+        return None
+        
 except Exception:
     FEEDBACK_STORE_AVAILABLE = False
 
@@ -141,10 +269,11 @@ def configure_logging():
     logging.getLogger("tqdm").setLevel(logging.WARNING)
     
     # Adjust logging levels to show important information while reducing noise
-    logging.getLogger("app.db_connector").setLevel(logging.INFO)  # Changed from WARNING back to INFO
+    logging.getLogger("app.db_connector").setLevel(logging.WARNING)  # Reduce from INFO to WARNING
     logging.getLogger("app.SOS.hybrid_processor").setLevel(logging.INFO)  # Keep at INFO
-    logging.getLogger("app.SOS.openrouter_client").setLevel(logging.INFO)  # Keep at INFO
-    logging.getLogger("app.hybrid_data_recorder").setLevel(logging.INFO)  # Keep at INFO
+    logging.getLogger("app.SOS.deepseek_client").setLevel(logging.INFO)  # Changed from openrouter_client to deepseek_client
+    logging.getLogger("app.ERP_R12_Test_DB.deepseek_client").setLevel(logging.INFO)  # Add ERP R12 DeepSeek client logging
+    logging.getLogger("app.ai_training_data_recorder").setLevel(logging.WARNING)  # Reduce from INFO to WARNING
     
     # Ensure RAG engine logs are visible
     logging.getLogger("app.SOS.rag_engine").setLevel(logging.INFO)
@@ -390,6 +519,14 @@ def generate_session_id(request: Request) -> Optional[str]:
 
 app = FastAPI(title="Oracle SQL Assistant (RAG-enabled)", version="2.0")
 
+# Add background task to clean up expired tokens periodically
+@app.on_event("startup")
+async def startup_event():
+    """Start background task for cleaning up expired tokens."""
+    # In a production system, you would implement a proper background task
+    # For now, we'll just log that cleanup is needed
+    logger.info("Token cleanup task would start here in production")
+
 # Simple timing middleware to see every request
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -413,21 +550,21 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ✅ quick health
 @app.get("/health")
 def health():
-    """Enhanced health check with quality metrics summary."""
+    """Enhanced health check with quality metrics summary and token usage."""
     health_data = {"ok": True, "timestamp": time.time()}
     
     # Add quality metrics summary if available
     if QUALITY_METRICS_AVAILABLE:
         try:
-            from app.hybrid_data_recorder import get_quality_dashboard
-            quality_summary = get_quality_dashboard(time_window_hours=1)  # Last hour
+            # TODO: Implement quality dashboard with new AI training recorder
+            quality_summary = {}
             health_data["quality_metrics"] = {
                 "system_health": quality_summary.get("system_health", "unknown"),
                 "overall_score": quality_summary.get("overall_score", 0.0),
@@ -437,7 +574,137 @@ def health():
         except Exception as e:
             health_data["quality_metrics"] = {"error": str(e)}
     
+    # Add token usage tracking
+    try:
+        from app.token_tracker import get_token_tracker
+        tracker = get_token_tracker()
+        usage = tracker.get_current_usage()
+        cost = tracker.calculate_cost(usage)
+        
+        health_data["token_usage"] = {
+            "total_prompt_tokens": usage["total"]["prompt_tokens"],
+            "total_completion_tokens": usage["total"]["completion_tokens"],
+            "total_tokens": usage["total"]["total_tokens"],
+            "total_requests": usage["total"]["requests_count"],
+            "estimated_cost": round(cost["total_cost"], 6)
+        }
+    except Exception as e:
+        health_data["token_usage"] = {"error": str(e)}
+    
     return health_data
+
+@app.get("/token-usage")
+def token_usage_report(hours: int = 24):
+    """Get detailed token usage report for cost tracking."""
+    try:
+        from app.token_tracker import get_token_tracker
+        tracker = get_token_tracker()
+        report = tracker.get_usage_report(hours)
+        return {
+            "status": "success",
+            "report": report,
+            "data": tracker.get_usage_since(hours)
+        }
+    except Exception as e:
+        logger.exception("Failed to generate token usage report")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate token usage report: {str(e)}"
+        )
+
+@app.get("/token-usage/reset")
+def reset_token_usage():
+    """Reset token usage tracking."""
+    try:
+        from app.token_tracker import reset_all_tracking
+        reset_all_tracking()
+        return {
+            "status": "success",
+            "message": "Token usage tracking reset successfully"
+        }
+    except Exception as e:
+        logger.exception("Failed to reset token usage tracking")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reset token usage tracking: {str(e)}"
+        )
+
+@app.get("/token-usage/detailed-logs")
+def get_detailed_token_logs():
+    """Get detailed token usage logs."""
+    try:
+        from app.token_logger import get_token_logger
+        token_logger = get_token_logger()
+        
+        # Read the detailed log file
+        import json
+        from pathlib import Path
+        
+        log_file = Path("logs") / "token_usage_detailed.log"
+        logs = []
+        
+        if log_file.exists():
+            with open(log_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            log_entry = json.loads(line.strip())
+                            logs.append(log_entry)
+                        except json.JSONDecodeError:
+                            # Skip invalid lines
+                            continue
+        
+        return {
+            "status": "success",
+            "logs": logs,
+            "count": len(logs)
+        }
+    except Exception as e:
+        logger.exception("Failed to get detailed token logs")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get detailed token logs: {str(e)}"
+        )
+
+@app.get("/token-usage/daily-summary")
+def get_daily_token_summary(date: Optional[str] = None):
+    """Get daily token usage summary."""
+    try:
+        from app.token_logger import get_token_logger
+        token_logger = get_token_logger()
+        
+        summary = token_logger.get_daily_summary(date) if date is not None else token_logger.get_daily_summary()
+        return {
+            "status": "success",
+            "date": date or "today",
+            "summary": summary
+        }
+    except Exception as e:
+        logger.exception("Failed to get daily token summary")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get daily token summary: {str(e)}"
+        )
+
+@app.get("/token-usage/daily-cost")
+def get_daily_token_cost(date: Optional[str] = None):
+    """Get daily token usage cost estimate."""
+    try:
+        from app.token_logger import get_token_logger
+        token_logger = get_token_logger()
+        
+        cost = token_logger.calculate_daily_cost(date) if date is not None else token_logger.calculate_daily_cost()
+        return {
+            "status": "success",
+            "date": date or "today",
+            "cost": cost
+        }
+    except Exception as e:
+        logger.exception("Failed to calculate daily token cost")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to calculate daily token cost: {str(e)}"
+        )
 
 # Test endpoint for CORS debugging
 @app.get("/test")
@@ -479,9 +746,16 @@ class Question(BaseModel):
     question: str
     # Frontend now sends "" for General, "source_db_1" for SOS.
     # Keep optional & permissive for backward-compatibility with aliases.
+
+# ---------------------------
+# Login Endpoint
+# ---------------------------
     selected_db: Optional[str] = ""
     # New explicit mode values: "General" | "SOS" (case-insensitive)
     mode: str = "General"
+    # Pagination parameters
+    page: Optional[int] = 1
+    page_size: Optional[int] = 1000
 
 class FeedbackIn(BaseModel):
     turn_id: int
@@ -491,6 +765,7 @@ class FeedbackIn(BaseModel):
     summary_sample_id: Optional[int] = None
     comment: Optional[str] = None
     labeler_role: Optional[str] = "end_user"
+    source: Optional[str] = None  # 'api' or 'local'
 
 # File upload models
 class FileUploadResponse(BaseModel):
@@ -532,7 +807,7 @@ def get_valid_columns() -> list:
 
 def _normalize_mode(mode: Optional[str]) -> str:
     """
-    Normalize inbound mode strings to one of: 'General', 'SOS', 'ERP'
+    Normalize inbound mode strings to one of: 'General', 'SOS', 'PRAN_ERP', 'RFL_ERP'
     Accepts legacy/loose inputs.
     """
     if not mode:
@@ -542,8 +817,10 @@ def _normalize_mode(mode: Optional[str]) -> str:
         return "General"
     if m in ("sos", "source_db_1", "db1"):
         return "SOS"
-    if m in ("erp", "source_db_2", "db2", "r12", "test db", "test_db"):
-        return "ERP"
+    if m in ("erp", "source_db_2", "db2", "r12", "test db", "test_db", "pran erp"):
+        return "PRAN_ERP"
+    if m in ("rfl erp", "source_db_3", "db3"):
+        return "RFL_ERP"
     return "General"
 
 def _normalize_selected_db(selected_db: Optional[str], mode: str) -> str:
@@ -552,18 +829,22 @@ def _normalize_selected_db(selected_db: Optional[str], mode: str) -> str:
     """
     if mode == "General":
         return ""
-    if mode == "ERP":
+    if mode == "PRAN_ERP":
         return "source_db_2"
+    if mode == "RFL_ERP":
+        return "source_db_3"
     # If caller supplied an explicit DB, normalize it; else infer from mode
     if not selected_db or not selected_db.strip():
         return "source_db_1"  # Default to SOS
     s = selected_db.strip().lower()
     if s in ("sos", "source_db_1", "db1"):
         return "source_db_1"
-    if s in ("erp", "source_db_2", "db2", "r12", "test db", "test_db"):
+    if s in ("erp", "source_db_2", "db2", "r12", "test db", "test_db", "pran erp"):
         return "source_db_2"
+    if s in ("rfl erp", "source_db_3", "db3"):
+        return "source_db_3"
     # Allow already-canonical values to pass through
-    if selected_db in ("source_db_1", "source_db_2"):
+    if selected_db in ("source_db_1", "source_db_2", "source_db_3"):
         return selected_db
     # Unknown → leave empty to force General-like behavior (safe)
     return ""
@@ -571,27 +852,33 @@ def _normalize_selected_db(selected_db: Optional[str], mode: str) -> str:
 # ---------------------------
 # Oracle exception handler (expanded map)
 # ---------------------------
-@app.exception_handler(OraDatabaseError)
-async def oracle_error_handler(request: Request, exc: OraDatabaseError):
-    text = str(exc)
-    m = re.search(r"(ORA-\d{5})", text)
-    error_code = m.group(1) if m else "ORA-00000"
-    friendly = {
-        "ORA-00904": "Invalid column name",
-        "ORA-01861": "Use TO_DATE(value, 'DD-MON-YYYY') format",
-        "ORA-00942": "Table or view does not exist",
-        "ORA-01722": "Invalid number (check numeric comparisons and casts)",
-        "ORA-01427": "Single-row subquery returns more than one row",
-        "ORA-12899": "Value too large for column",
-    }.get(error_code, text)
-    return JSONResponse(
-        status_code=400,
-        content={
-            "error": error_code,
-            "message": friendly,
-            "valid_columns": get_valid_columns(),
-        },
-    )
+# Handle Oracle database errors with a more generic approach to avoid type issues
+@app.exception_handler(Exception)
+async def oracle_error_handler(request: Request, exc: Exception):
+    # Check if this is an Oracle database error
+    if hasattr(exc, 'args') and len(exc.args) > 0:
+        text = str(exc)
+        m = re.search(r"(ORA-\d{5})", text)
+        if m:
+            error_code = m.group(1)
+            friendly = {
+                "ORA-00904": "Invalid column name",
+                "ORA-01861": "Use TO_DATE(value, 'DD-MON-YYYY') format",
+                "ORA-00942": "Table or view does not exist",
+                "ORA-01722": "Invalid number (check numeric comparisons and casts)",
+                "ORA-01427": "Single-row subquery returns more than one row",
+                "ORA-12899": "Value too large for column",
+            }.get(error_code, text)
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": error_code,
+                    "message": friendly,
+                    "valid_columns": get_valid_columns(),
+                },
+            )
+    # Re-raise non-Oracle exceptions
+    raise exc
 
 # ---------------------------
 # Chat -> uses new RAG pipeline, preserves envelope + feedback IDs
@@ -608,14 +895,15 @@ async def chat_api(question: Question, request: Request):
         # Determine & normalize mode/DB
         mode_in = question.mode
         selected_db_in = question.selected_db
-        mode = _normalize_mode(mode_in)  # 'General' | 'SOS' | 'ERP'
-        selected_db = _normalize_selected_db(selected_db_in, mode)  # "" | source_db_1 | source_db_2
+        mode = _normalize_mode(mode_in)  # 'General' | 'SOS' | 'PRAN_ERP' | 'RFL_ERP'
+        selected_db = _normalize_selected_db(selected_db_in, mode)  # "" | source_db_1 | source_db_2 | source_db_3
 
         # Log the processing details
         logger.info(f"[MAIN] Processing query with mode={mode}, db={selected_db}")
 
         # === Call the appropriate RAG orchestrator based on mode ===
-        if mode == "ERP":
+        if mode in ("PRAN_ERP", "RFL_ERP"):
+            # For both ERP modes, use the ERP R12 engine but with different databases
             output = await erp_rag_answer(
                 question.question, 
                 selected_db=selected_db,
@@ -623,7 +911,9 @@ async def chat_api(question: Question, request: Request):
                 # Phase 5: Pass training data collection parameters for hybrid processing
                 session_id=generate_session_id(request),
                 client_ip=request.client.host if request and request.client else None,
-                user_agent=request.headers.get('user-agent') if request and request.headers else None
+                user_agent=request.headers.get('user-agent') if request and request.headers else None,
+                page=question.page or 1,
+                page_size=question.page_size or 1000
             )
         else:
             # Use SOS RAG engine for General and SOS modes
@@ -686,13 +976,17 @@ async def chat_api(question: Question, request: Request):
 
                 # Enhanced feedback recording for hybrid processing
                 hybrid_meta = output.get("hybrid_metadata", {}) if output else {}
+                
+                # Extract username from request
+                username = _get_username_from_request(request)
+                
                 enhanced_meta = {
                     "ui": "web", 
                     "mode": "non_stream", 
                     "display_mode": display_mode,
                     # Phase 4.2: Add hybrid processing metadata to feedback
                     "hybrid_processing": bool(hybrid_meta),
-                    "processing_mode": hybrid_meta.get("processing_mode") if hybrid_meta else None,
+                    "processing_mode": hybrid_meta.get("processing_mode") if hybrid_meta else mode,  # Use mode parameter if hybrid_meta is not available
                     "model_used": hybrid_meta.get("model_used") if hybrid_meta else None,
                     "selection_reasoning": hybrid_meta.get("selection_reasoning") if hybrid_meta else None,
                     "processing_time_ms": (hybrid_meta.get("processing_time", 0.0) * 1000) if hybrid_meta else 0.0,
@@ -702,7 +996,9 @@ async def chat_api(question: Question, request: Request):
                     "training_data_recorded": hybrid_meta.get("training_data_recorded", False) if hybrid_meta else False,
                     "classification_time_ms": hybrid_meta.get("classification_time_ms", 0.0) if hybrid_meta else 0.0,
                     "sql_execution_time_ms": hybrid_meta.get("sql_execution_time_ms", 0.0) if hybrid_meta else 0.0,
-                    "sql_execution_success": hybrid_meta.get("sql_execution_success", False) if hybrid_meta else False
+                    "sql_execution_success": hybrid_meta.get("sql_execution_success", False) if hybrid_meta else False,
+                    # Add username to metadata
+                    "username": username
                 }
 
                 turn_id = insert_turn(
@@ -806,15 +1102,26 @@ async def root(request: Request):
 # ---------------------------
 @app.post("/feedback")
 async def post_feedback(payload: FeedbackIn, request: Request):
+    # Log received feedback
+    logger.info(f"Feedback received - Type: {payload.feedback_type}, Task: {payload.task_type}, Source: {payload.source or 'unknown'}")
+    logger.info(f"Full payload: {payload.dict()}")
+    logger.info(f"Source field value: '{payload.source}', Type: {type(payload.source)}")
+    if payload.comment:
+        logger.info(f"Feedback comment: {payload.comment[:100]}{'...' if len(payload.comment) > 100 else ''}")
+    
     # minimal validation (same as before)
     if payload.task_type == "sql" and not payload.sql_sample_id:
+        logger.warning("Feedback validation failed: sql_sample_id required for SQL task")
         return JSONResponse(status_code=400, content={"error": "sql_sample_id required"})
     if payload.task_type == "summary" and not payload.summary_sample_id:
+        logger.warning("Feedback validation failed: summary_sample_id required for summary task")
         return JSONResponse(status_code=400, content={"error": "summary_sample_id required"})
     if payload.feedback_type == "needs_improvement" and not (payload.comment and payload.comment.strip()):
+        logger.warning("Feedback validation failed: comment required for needs_improvement feedback")
         return JSONResponse(status_code=400, content={"error": "comment required for needs_improvement"})
 
     try:
+        # Record feedback in the old system (for backward compatibility)
         fid = insert_feedback(
             turn_id=payload.turn_id,
             task_type=payload.task_type,
@@ -826,8 +1133,54 @@ async def post_feedback(payload: FeedbackIn, request: Request):
             meta={
                 "client_ip": request.client.host if request and request.client else None,
                 "ui": "web",
+                "source": payload.source or ''  # Add source to meta
             },
         )
+        
+        # ALSO record feedback in the new AI training system
+        if AI_TRAINING_RECORDER_AVAILABLE:
+            try:
+                from app.ai_training_data_recorder import ai_training_data_recorder
+                from app.db_connector import connect_feedback
+                
+                # Validate that the turn_id corresponds to a valid query in AI_TRAINING_QUERIES
+                is_valid_query = False
+                try:
+                    with connect_feedback() as conn:
+                        cur = conn.cursor()
+                        cur.execute("SELECT COUNT(*) FROM AI_TRAINING_QUERIES WHERE QUERY_ID = :query_id", {"query_id": payload.turn_id})
+                        count = cur.fetchone()[0]
+                        is_valid_query = count > 0
+                except Exception as e:
+                    logger.warning(f"Failed to validate query ID {payload.turn_id}: {e}")
+                    is_valid_query = True  # Continue anyway to avoid blocking feedback
+                
+                if not is_valid_query:
+                    logger.warning(f"Invalid query ID {payload.turn_id} in feedback, using default query ID 1")
+                    query_id = 1
+                else:
+                    query_id = payload.turn_id
+                
+                feedback_details = {
+                    'feedback_type': payload.feedback_type,
+                    'feedback_score': 5 if payload.feedback_type == 'good' else (1 if payload.feedback_type == 'wrong' else 3),
+                    'feedback_comment': payload.comment,
+                    'source': payload.source or '',  # Fix: Ensure source is properly passed
+                    'submission_timestamp': _dt.now()
+                }
+                logger.info(f"Recording feedback with details: {feedback_details}")
+                logger.info(f"Source value for recording: '{feedback_details['source']}'")
+                # Record in the new AI_USER_FEEDBACK table
+                feedback_id = ai_training_data_recorder.record_user_feedback(
+                    query_id=query_id,  # turn_id maps to query_id in new system
+                    feedback_details=feedback_details
+                )
+                logger.info(f"Feedback stored successfully - ID: {feedback_id}, Type: {payload.feedback_type}, Source: {payload.source or 'unknown'}, Query ID: {query_id}")
+            except Exception as e:
+                logger.warning(f"Failed to record feedback in AI training system: {e}")
+                logger.exception("Exception details:")
+        
+        logger.info(f"Feedback processed successfully - Feedback ID: {fid}")
         return {"feedback_id": fid, "status": "created"}
     except Exception as e:
         logger.exception("Failed to insert feedback")
@@ -862,7 +1215,8 @@ async def get_quality_metrics(time_window: int = 24):
             )
         
         # Get comprehensive quality metrics
-        quality_report = hybrid_data_recorder.get_quality_metrics(time_window)
+        # TODO: Implement quality metrics with new AI training recorder
+        quality_report = {}
         
         if not quality_report:
             return JSONResponse(
@@ -906,7 +1260,8 @@ async def get_success_rates(time_window: int = 24):
         )
     
     try:
-        success_metrics = hybrid_data_recorder.get_success_rates(time_window)
+        # TODO: Implement success metrics with new AI training recorder
+        success_metrics = {}
         
         return {
             "status": "success",
@@ -942,7 +1297,8 @@ async def get_user_satisfaction(time_window: int = 24):
         )
     
     try:
-        satisfaction_metrics = hybrid_data_recorder.get_user_satisfaction_metrics(time_window)
+        # TODO: Implement user satisfaction metrics with new AI training recorder
+        satisfaction_metrics = {}
         
         return {
             "status": "success",
@@ -978,8 +1334,8 @@ async def test_quality_metrics_system_endpoint(time_window: int = 1):
         )
     
     try:
-        # Test with a short time window to minimize load
-        test_results = test_quality_metrics_system(time_window)
+        # TODO: Implement quality metrics testing with new AI training recorder
+        test_results = {}
         
         return {
             "status": "success",
@@ -1015,9 +1371,8 @@ async def test_training_data_collection():
     
     try:
         # Test the training data collection system
-        from app.SOS.hybrid_processor import HybridProcessor
-        processor = HybridProcessor()
-        test_results = processor.test_training_data_collection()
+        # Training data collection system test not implemented
+        test_results = {"status": "unavailable", "message": "Training data collection system test not implemented"}
         
         return {
             "status": "success",
@@ -1052,9 +1407,8 @@ async def get_training_data_status():
     
     try:
         # Get the training data collection system status
-        from app.SOS.hybrid_processor import HybridProcessor
-        processor = HybridProcessor()
-        status_info = processor.get_training_data_status()
+        # Training data collection system status not implemented
+        status_info = {"status": "unavailable", "message": "Training data collection system status not implemented"}
         
         return {
             "status": "success",
@@ -1093,8 +1447,8 @@ async def get_performance_comparison(time_window: int = 24):
         )
     
     try:
-        from app.hybrid_data_recorder import hybrid_data_recorder
-        performance_comparison = hybrid_data_recorder.quality_analyzer.analyze_performance_comparison(time_window)
+        # TODO: Implement performance comparison with new AI training recorder
+        performance_comparison = {}
         
         return {
             "status": "success",
@@ -1132,8 +1486,8 @@ async def get_model_strengths(time_window: int = 24):
         )
     
     try:
-        from app.hybrid_data_recorder import hybrid_data_recorder
-        model_strengths = hybrid_data_recorder.quality_analyzer.identify_model_strengths(time_window)
+        # TODO: Implement model strengths analysis with new AI training recorder
+        model_strengths = {}
         
         return {
             "status": "success",
@@ -1171,8 +1525,8 @@ async def get_user_preferences(time_window: int = 24):
         )
     
     try:
-        from app.hybrid_data_recorder import hybrid_data_recorder
-        preference_patterns = hybrid_data_recorder.quality_analyzer.analyze_user_preference_patterns(time_window)
+        # TODO: Implement user preference analysis with new AI training recorder
+        preference_patterns = {}
         
         return {
             "status": "success",
@@ -1210,8 +1564,8 @@ async def get_learning_insights(time_window: int = 24):
         )
     
     try:
-        from app.hybrid_data_recorder import hybrid_data_recorder
-        insights = hybrid_data_recorder.quality_analyzer.generate_learning_insights(time_window)
+        # TODO: Implement learning insights with new AI training recorder
+        insights = {}
         
         return {
             "status": "success",
@@ -1249,8 +1603,8 @@ async def test_learning_system(time_window: int = 24):
         )
     
     try:
-        from app.hybrid_data_recorder import test_continuous_learning_system
-        test_results = test_continuous_learning_system(time_window)
+        # TODO: Implement continuous learning system test with new AI training recorder
+        test_results = {}
         
         return {
             "status": "success",
@@ -1282,9 +1636,8 @@ async def test_learning_processor(time_window: int = 24):
         Test results and diagnostics for continuous learning system via processor
     """
     try:
-        from app.SOS.hybrid_processor import HybridProcessor
-        processor = HybridProcessor()
-        test_results = processor.test_continuous_learning_system(time_window)
+        # Continuous learning system test not implemented
+        test_results = {"status": "unavailable", "message": "Continuous learning system test not implemented"}
         
         return {
             "status": "success",
@@ -1292,7 +1645,7 @@ async def test_learning_processor(time_window: int = 24):
             "metadata": {
                 "endpoint": "learning-test-processor",
                 "version": "1.0",
-                "generated_at": test_results.get("data", {}).get("timestamp") if test_results.get("data") else None,
+                "generated_at": _dt.now().isoformat(),
                 "time_window_hours": time_window
             }
         }
@@ -1325,8 +1678,8 @@ async def get_high_quality_samples(time_window: int = 168, min_quality: float = 
         )
     
     try:
-        from app.hybrid_data_recorder import hybrid_data_recorder
-        samples = hybrid_data_recorder.quality_analyzer.identify_high_quality_samples(time_window, min_quality)
+        # TODO: Implement high-quality samples identification with new AI training recorder
+        samples = {}
         
         return {
             "status": "success",
@@ -1376,8 +1729,8 @@ async def get_training_dataset(dataset_type: str, time_window: int = 720):
         )
     
     try:
-        from app.hybrid_data_recorder import hybrid_data_recorder
-        dataset = hybrid_data_recorder.quality_analyzer.create_training_dataset(dataset_type, time_window)
+        # TODO: Implement training dataset creation with new AI training recorder
+        dataset = {}
         
         if "error" in dataset:
             return JSONResponse(
@@ -1417,9 +1770,8 @@ async def get_processor_high_quality_samples(time_window: int = 168, min_quality
         High-quality samples categorized by type
     """
     try:
-        from app.SOS.hybrid_processor import HybridProcessor
-        processor = HybridProcessor()
-        samples = processor.get_high_quality_samples(time_window, min_quality)
+        # High quality samples not implemented
+        samples = {"status": "unavailable", "message": "High quality samples not implemented"}
         
         if samples.get("status") == "unavailable":
             return JSONResponse(
@@ -1468,9 +1820,8 @@ async def get_processor_training_dataset(dataset_type: str, time_window: int = 7
         )
     
     try:
-        from app.SOS.hybrid_processor import HybridProcessor
-        processor = HybridProcessor()
-        dataset = processor.create_training_dataset(dataset_type, time_window)
+        # Training dataset creation not implemented
+        dataset = {"status": "unavailable", "message": "Training dataset creation not implemented"}
         
         if dataset.get("status") == "unavailable":
             return JSONResponse(
@@ -1574,14 +1925,14 @@ async def export_summary():
 # File Upload and Analysis Endpoints
 # ---------------------------
 
-@app.post("/upload-file", response_model=FileUploadResponse)
-async def upload_file(file: UploadFile = File(...), request: Request = None):
+@app.post("/upload-file", response_model=None)
+async def upload_file(request: Request, file: UploadFile = File(...)):
     """
     Upload a file for analysis.
     
     Args:
-        file: The file to upload
         request: FastAPI Request object for rate limiting
+        file: The file to upload
         
     Returns:
         File upload response with file metadata
@@ -1591,6 +1942,7 @@ async def upload_file(file: UploadFile = File(...), request: Request = None):
         if request:
             client_id = _get_client_identifier(request)
             rate_limits = _check_rate_limits(client_id)
+
             
             if rate_limits["upload_limited"]:
                 raise HTTPException(
@@ -1618,7 +1970,7 @@ async def upload_file(file: UploadFile = File(...), request: Request = None):
         # Generate unique file ID
         file_id = str(uuid.uuid4())
         file_extension = ALLOWED_FILE_TYPES[file.content_type]
-        filename = _sanitize_filename(file.filename)
+        filename = _sanitize_filename(file.filename or '')
         safe_filename = f"{file_id}{file_extension}"
         file_path = FILE_STORAGE_PATH / safe_filename
         
@@ -1662,8 +2014,8 @@ async def upload_file(file: UploadFile = File(...), request: Request = None):
             detail=f"Failed to upload file: {str(e)}"
         )
 
-@app.post("/analyze-file")
-async def analyze_file(request: FileAnalysisRequest, req: Request = None):
+@app.post("/analyze-file", response_model=None)
+async def analyze_file(request: FileAnalysisRequest, req: Request):
     """
     Analyze an uploaded file using Google Gemini Flash 1.5.
     
@@ -1714,12 +2066,12 @@ async def analyze_file(request: FileAnalysisRequest, req: Request = None):
                 detail="File content validation failed. File may contain unsafe content."
             )
         
-        # Use OpenRouter client to call Gemini Flash 1.5
-        from .SOS.openrouter_client import OpenRouterClient, OpenRouterError
+        # Use DeepSeek client to call DeepSeek models
+        from .SOS.deepseek_client import DeepSeekClient, DeepSeekError
         try:
-            client = OpenRouterClient()
-            # Use Gemini Flash 1.5 model specifically for file analysis
-            model = "google/gemini-flash-1.5"
+            client = DeepSeekClient()
+            # Use DeepSeek model for file analysis
+            model = "deepseek-chat"
             
             # Encode file for API transmission
             file_data = client.encode_file_for_api(str(file_path))
@@ -1764,14 +2116,14 @@ async def analyze_file(request: FileAnalysisRequest, req: Request = None):
             else:
                 raise HTTPException(
                     status_code=500, 
-                    detail=f"Failed to analyze file with Gemini Flash 1.5: {response.error}"
+                    detail=f"Failed to analyze file with DeepSeek: {response.error}"
                 )
                 
-        except OpenRouterError as e:
-            logger.exception("OpenRouter API error")
+        except DeepSeekError as e:
+            logger.exception("DeepSeek API error")
             raise HTTPException(
                 status_code=500, 
-                detail=f"OpenRouter API error: {str(e)}"
+                detail=f"DeepSeek API error: {str(e)}"
             )
         
     except HTTPException:
@@ -1841,6 +2193,280 @@ async def get_file_upload_status(request: Request):
             status_code=500, 
             detail=f"Failed to get file upload status: {str(e)}"
         )
+
+# ---------------------------
+# Admin Dashboard Endpoints
+# ---------------------------
+
+def _get_username_from_request(request: Request) -> Optional[str]:
+    """
+    Extract username from the request authentication token.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Username if available, None otherwise
+    """
+    try:
+        # Extract token from Authorization header or custom header
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:]  # Remove "Bearer " prefix
+        else:
+            # Check for custom auth token header
+            token = request.headers.get("X-Auth-Token") or request.headers.get("authToken")
+        
+        # Look up username from token-username mapping
+        if token:
+            with token_username_map_lock:
+                username = token_username_map.get(token)
+            if username:
+                return username
+    except Exception as e:
+        logger.warning(f"Failed to extract username from request: {e}")
+    
+    return None
+
+def _is_admin_user(request: Request) -> bool:
+    """
+    Check if the authenticated user is an admin.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        True if user is admin, False otherwise
+    """
+    username = _get_username_from_request(request)
+    return username == "AdminMIS"
+
+@app.get("/admin/metrics")
+async def get_admin_metrics(request: Request):
+    """
+    Get admin dashboard metrics.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Admin dashboard metrics
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin access required.")
+    
+    # In a real implementation, these would come from database queries
+    metrics = {
+        "users": 1250,
+        "chats": 3457,
+        "active_users": 312,
+        "server_status": "Online"
+    }
+    
+    return metrics
+
+
+@app.get("/admin/recent-activity")
+async def get_admin_recent_activity(request: Request):
+    """
+    Get recent system activity for admin dashboard.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Recent activity logs
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(status_code=403, detail="Access denied. Admin access required.")
+    
+    # In a real implementation, these would come from database queries
+    activity = [
+        {"date": "Apr 20", "action": "User1234 logged in", "time": "2 minutes ago"},
+        {"date": "Apr 19", "action": "Server restart completed", "time": "1 hour ago"},
+        {"date": "Apr 19", "action": "New user registration", "time": "3 hours ago"},
+        {"date": "Apr 18", "action": "System update deployed", "time": "1 day ago"}
+    ]
+    
+    return activity
+
+# ---------------------------
+# Login Endpoint
+# ---------------------------
+@app.post("/login", response_model=dict)
+async def login(login_request: dict):
+    """
+    Authenticate user by calling external HRIS API directly or admin credentials.
+    
+    Args:
+        login_request: Dictionary containing username and password
+        
+    Returns:
+        Authentication result with success status and optional token
+    """
+    try:
+        username = login_request.get("username")
+        password = login_request.get("password")
+        
+        if not username or not password:
+            raise HTTPException(
+                status_code=400, 
+                detail="Username and password are required"
+            )
+        
+        # Check for admin credentials first
+        if username == "AdminMIS" and password == "mis123":
+            # Generate a simple token for admin (in production, use JWT or similar)
+            import uuid
+            token = str(uuid.uuid4())
+            
+            # Store token-username mapping
+            with token_username_map_lock:
+                token_username_map[token] = username
+            
+            return {
+                "success": True,
+                "message": "Admin login successful",
+                "token": token,
+                "isAdmin": True
+            }
+        
+        # Directly call the external HRIS API for regular users
+        import httpx
+        import json
+        
+        url = "http://hrisapi.prangroup.com:8083/v1/Login/UserValidationAp"
+        
+        # Construct JSON payload
+        body = {
+            "UserName": username,
+            "Password": password
+        }
+        
+        # Set headers
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Basic YXV0aDoxMlByYW5AMTIzNDU2JA==",
+            "S_KEYL": "RxsJ4LQdkVFTv37rYfW9b6"
+        }
+        
+        # Make the REST API POST request
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=30.0
+            )
+            
+            # Parse JSON to extract "isSuccess" value
+            response_data = response.json()
+            is_success = response_data.get("isSuccess", False)
+            
+            if is_success:
+                # Generate a simple token (in production, use JWT or similar)
+                import uuid
+                token = str(uuid.uuid4())
+                
+                # Store token-username mapping
+                with token_username_map_lock:
+                    token_username_map[token] = username
+                
+                return {
+                    "success": True,
+                    "message": "Login successful",
+                    "token": token,
+                    "isAdmin": False
+                }
+            else:
+                raise HTTPException(
+                    status_code=401, 
+                    detail="Invalid username or password"
+                )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Login error")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Login failed: {str(e)}"
+        )
+
+@app.post("/admin/logout")
+async def admin_logout(request: Request):
+    """
+    Admin logout endpoint to invalidate token.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Logout success message
+    """
+    try:
+        # Extract token from Authorization header or custom header
+        auth_header = request.headers.get("Authorization")
+        token = None
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:]  # Remove "Bearer " prefix
+        else:
+            # Check for custom auth token header
+            token = request.headers.get("X-Auth-Token") or request.headers.get("authToken")
+        
+        # Remove token from token-username mapping
+        if token:
+            with token_username_map_lock:
+                if token in token_username_map:
+                    del token_username_map[token]
+        
+        return {"success": True, "message": "Logged out successfully"}
+    except Exception as e:
+        logger.exception("Logout error")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Logout failed: {str(e)}"
+        )
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    """
+    User logout endpoint to invalidate token.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Logout success message
+    """
+    try:
+        # Extract token from Authorization header or custom header
+        auth_header = request.headers.get("Authorization")
+        token = None
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:]  # Remove "Bearer " prefix
+        else:
+            # Check for custom auth token header
+            token = request.headers.get("X-Auth-Token") or request.headers.get("authToken")
+        
+        # Remove token from token-username mapping
+        if token:
+            with token_username_map_lock:
+                if token in token_username_map:
+                    del token_username_map[token]
+        
+        return {"success": True, "message": "Logged out successfully"}
+    except Exception as e:
+        logger.exception("Logout error")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Logout failed: {str(e)}"
+        )
+
 
 @app.post("/cleanup-expired-files")
 async def cleanup_expired_files():

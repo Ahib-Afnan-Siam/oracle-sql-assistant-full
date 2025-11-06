@@ -14,17 +14,21 @@ It exposes a stable set of helpers for:
 Used by: app/rag_engine.py
 """
 
+import json
 import logging
-import re
-from typing import Any, Dict, List, Optional, Set, Tuple
-from datetime import datetime, date, timedelta
-from calendar import monthrange
-from decimal import Decimal
-from statistics import median
 import os
+import re
+from datetime import datetime, timedelta, date
+from typing import List, Dict, Any, Optional, Tuple, Callable, Set
+import time
+from decimal import Decimal
+from functools import lru_cache
+from calendar import monthrange
+
+# Import connect_to_source from db_connector
 from app.db_connector import connect_to_source
+# Import hybrid_schema_value_search from vector_store_chroma
 from app.SOS.vector_store_chroma import hybrid_schema_value_search
-from functools import lru_cache as _memo
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -136,14 +140,16 @@ _ORG_SYNONYMS = [
     (re.compile(r"\bchorka\s+textile\b", re.I), "CTL"),
 ]
 
-_TABLE_DENYLIST = {
-    t.strip().upper()
-    for t in (os.getenv("TABLE_DENYLIST") or "").split(",")
-    if t.strip()
-}
+def _get_table_denylist():
+    """Get the table denylist from environment variable, evaluated lazily."""
+    return {
+        t.strip().upper()
+        for t in (os.getenv("TABLE_DENYLIST") or "").split(",")
+        if t.strip()
+    }
 
 def _is_banned_table(name: str) -> bool:
-    return (name or "").upper() in _TABLE_DENYLIST
+    return (name or "").upper() in _get_table_denylist()
 
 def _filter_banned_tables(names: list[str]) -> list[str]:
     return [n for n in (names or []) if n and not _is_banned_table(n)]
@@ -192,9 +198,12 @@ def _parse_single_day_literal(s: str) -> Optional[datetime]:
         return datetime(y, _MON_ABBR[mon_str[:3].upper()], int(d_str))
     if _DATE_DMON.match(s):
         # 21-AUG-25 / 21-AUG-2025
-        d, mon3, y = re.match(r"^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$", s).groups()
-        y = int(y); y = 2000 + y if y < 100 else y
-        return datetime(y, _MON_ABBR[mon3.upper()], int(d))
+        match = re.match(r"^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$", s)
+        if match:
+            d, mon3, y = match.groups()
+            y = int(y); y = 2000 + y if y < 100 else y
+            return datetime(y, _MON_ABBR[mon3.upper()], int(d))
+        return None
     return None
 
 def extract_single_day_range(user_query: str) -> Optional[Dict[str, str]]:
@@ -325,7 +334,7 @@ def _to_enhanced_oracle_date_range(date_obj: datetime, format_type: str) -> Dict
             'type': 'single_day'
         }
 
-def _extract_relative_dates(query: str) -> Optional[Dict[str, str]]:
+def _extract_relative_dates(query: str) -> Optional[Dict[str, Any]]:
     """Handle relative date expressions like 'last month', 'last 7 days', 'last day'."""
     
     query_lower = query.lower()
@@ -442,11 +451,12 @@ def ensure_label_filter(sql: str, user_query: str, selected_db: str) -> str:
         shortcodes, and injects a LIKE/normalized-LIKE predicate on a suitable text column.
         If no base-table match, tries direct FK parents.
     """
+
     # Fast exits
     if not sql or _has_text_literal_predicate(sql):
         return sql
 
-    # Skip English “X-wise” phrasing (“by X”), not a label
+    # Skip English "X-wise" phrasing ("by X"), not a label
     if re.search(r"\b\w+(?:\s*-\s*|\s+)wise\b", (user_query or "").lower()):
         logger.debug("[ensure_label_filter] skip: '-wise' phrasing detected")
         return sql
@@ -498,6 +508,11 @@ def ensure_label_filter(sql: str, user_query: str, selected_db: str) -> str:
                 ptext = _guess_text_column_for_literal(selected_db, ptab, code_value)
                 if not ptext:
                     continue
+                # Check that we have all required fields
+                child_fk_col = fk.get("child_col")
+                parent_pk_col = fk.get("parent_col")
+                if not child_fk_col or not parent_pk_col:
+                    continue
                 # Found a matching text/code column on parent: inject EXISTS join filter
                 esc = code_value.replace("'", "''")
                 norm = re.sub(r"[\s\-]", "", esc).upper()
@@ -511,8 +526,8 @@ def ensure_label_filter(sql: str, user_query: str, selected_db: str) -> str:
                     child_table=table,
                     parent_table=ptab,
                     parent_text_col=ptext,
-                    child_fk_col=fk.get("child_col"),
-                    parent_pk_col=fk.get("parent_col"),
+                    child_fk_col=child_fk_col,
+                    parent_pk_col=parent_pk_col,
                     literal=code_value,
                     parent_pred_override=parent_pred,
                 )
@@ -555,19 +570,106 @@ def ensure_label_filter(sql: str, user_query: str, selected_db: str) -> str:
                 f"( UPPER({ptext}) LIKE UPPER('%{esc}%') "
                 f"  OR UPPER(REPLACE(REPLACE({ptext},'-',''),' ','')) LIKE UPPER('%{norm}%') )"
             )
-            return _inject_exists_on_parent(
-                sql,
-                child_table=table,
-                parent_table=ptab,
-                parent_text_col=ptext,
-                child_fk_col=fk.get("child_col"),
-                parent_pk_col=fk.get("parent_col"),
-                literal=mapped,
-                parent_pred_override=parent_pred,
-            )
+            # Check that we have all required fields
+            child_fk_col = fk.get("child_col")
+            parent_pk_col = fk.get("parent_col")
+            if child_fk_col and parent_pk_col:
+                return _inject_exists_on_parent(
+                    sql,
+                    child_table=table,
+                    parent_table=ptab,
+                    parent_text_col=ptext,
+                    child_fk_col=child_fk_col,
+                    parent_pk_col=parent_pk_col,
+                    literal=mapped,
+                    parent_pred_override=parent_pred,
+                )
 
     # Nothing to add
     return sql
+
+def _fk_parents_for_child(selected_db: str, child_table: str) -> List[Dict[str, str]]:
+    """
+    Get foreign key parent relationships for a child table.
+    Returns a list of FK relationships with parent table and column information.
+    """
+    sql = """
+    SELECT pk.table_name parent_table, acc_pk.column_name parent_col, 
+           acc.column_name child_col
+      FROM all_constraints ac
+      JOIN all_cons_columns acc
+        ON acc.owner = ac.owner AND acc.constraint_name = ac.constraint_name
+      JOIN all_constraints pk
+        ON pk.owner = ac.r_owner AND pk.constraint_name = ac.r_constraint_name
+      JOIN all_cons_columns acc_pk
+        ON acc_pk.owner = pk.owner AND acc_pk.constraint_name = pk.constraint_name 
+       AND acc_pk.position = acc.position
+     WHERE ac.constraint_type = 'R'
+       AND ac.owner = USER
+       AND ac.table_name = :child_table
+    """
+    
+    parents = []
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, child_table=child_table.upper())
+            for parent_table, parent_col, child_col in cur.fetchall():
+                parents.append({
+                    "parent_table": str(parent_table),
+                    "parent_col": str(parent_col),
+                    "child_col": str(child_col)
+                })
+        except Exception as e:
+            logger.warning(f"[FK Parents] Failed to get FK parents for {child_table}: {e}")
+        finally:
+            try: cur.close()
+            except: pass
+    return parents
+
+def _inject_exists_on_parent(
+    sql: str, 
+    child_table: str, 
+    parent_table: str, 
+    parent_text_col: str, 
+    child_fk_col: str, 
+    parent_pk_col: str, 
+    literal: str,
+    parent_pred_override: Optional[str] = None
+) -> str:
+    """
+    Inject an EXISTS clause to join a child table with its parent table
+    and apply a filter on the parent table's text column.
+    """
+    # Build the EXISTS predicate
+    if parent_pred_override:
+        parent_pred = parent_pred_override
+    else:
+        esc = literal.replace("'", "''")
+        norm = re.sub(r"[\s\-]", "", esc).upper()
+        parent_pred = (
+            f"( UPPER({parent_text_col}) LIKE UPPER('%{esc}%') "
+            f"  OR UPPER(REPLACE(REPLACE({parent_text_col},'-',''),' ','')) LIKE UPPER('%{norm}%') )"
+        )
+    
+    exists_clause = (
+        f"EXISTS (SELECT 1 FROM {parent_table} "
+        f"WHERE {parent_table}.{parent_pk_col} = {child_table}.{child_fk_col} "
+        f"AND {parent_pred})"
+    )
+    
+    # Inject the EXISTS clause into the SQL
+    parts = re.split(r"(?i)\bWHERE\b", sql, maxsplit=1)
+    if len(parts) == 2:
+        head, tail = parts[0], (parts[1] or "").strip()
+        return f"{head}WHERE {exists_clause} AND {tail}" if tail else f"{head}WHERE {exists_clause}"
+    
+    # If no WHERE clause, add one before GROUP/ORDER/FETCH/OFFSET/LIMIT or at the end
+    m = re.search(r"(?i)\b(GROUP|ORDER|FETCH|OFFSET|LIMIT)\b", sql or "")
+    if m:
+        return sql[:m.start()] + f" WHERE {exists_clause} " + sql[m.start():]
+    
+    return sql + f" WHERE {exists_clause}"
 
 # --- table exclude patterns used during runtime metadata build ---
 EXCLUDE_TABLE_PATTERNS = [
@@ -613,13 +715,18 @@ def _set_case_insensitive_session(cursor):
     except Exception as e:
         logger.warning(f"Could not set case-insensitive session: {e}")
 
-def run_sql(sql: str, selected_db: str, *, cache_ok: bool = True) -> List[Dict[str, Any]]:
+def run_sql(sql: str, selected_db: str, *, cache_ok: bool = True, cancellation_token: Optional[Callable[[], bool]] = None) -> List[Dict[str, Any]]:
     cached = _cache_get_result(selected_db, sql)
     if cached:
         logger.debug("[DB] cache_hit=1 db=%s", selected_db)
         return cached["rows"]
 
     logger.debug("[DB] SQL: %s", (sql or "").replace("\n", " ")[:2000])
+    
+    # Check for cancellation before executing
+    if cancellation_token and cancellation_token():
+        from .query_engine import QueryCancellationError
+        raise QueryCancellationError("Query was cancelled before execution")
 
     with connect_to_source(selected_db) as (conn, _):
         cur = conn.cursor()
@@ -627,6 +734,11 @@ def run_sql(sql: str, selected_db: str, *, cache_ok: bool = True) -> List[Dict[s
         cur.execute(sql)
         cols = [d[0] for d in cur.description] if cur.description else []
         rows = [{cols[i]: to_jsonable(r[i]) for i in range(len(cols))} for r in cur]
+        
+        # Check for cancellation after execution
+        if cancellation_token and cancellation_token():
+            from .query_engine import QueryCancellationError
+            raise QueryCancellationError("Query was cancelled during execution")
 
     logger.debug("[DB] rows=%d cols=%d", len(rows), len(cols))
 
@@ -1715,7 +1827,7 @@ def _get_table_columns(selected_db: str, table: str) -> Set[str]:
             except: pass
     return cols
 
-@_memo(maxsize=512)
+@lru_cache(maxsize=512)
 def _guess_text_column_for_literal(selected_db: str, table: str, literal: str) -> Optional[str]:
     meta = _get_table_colmeta(selected_db, table)
     text_cols = [c for c, dt in meta.items()
@@ -1872,14 +1984,38 @@ def _is_entity_lookup(q: str) -> bool:
     low = [t.lower() for t in toks]
     if all(t in _GENERIC_SHORT_WORDS for t in low): return False
     if any(any(ch.isdigit() for ch in t) for t in toks): return True
-    if len(toks) == 2 and all(t.isalpha() and len(t) >= 2 for t in toks) and all(t not in _GENERIC_SHORT_WORDS for t in low): return True
-    if len(toks) == 1 and low[0] not in _GENERIC_SHORT_WORDS and len(toks[0]) >= 4: return True
     return False
 
 def _needle_from_question(q: str) -> str:
-    m = re.search(r"(?:who|what)\s+is\s+(.+)", q, re.I)
-    if m: return m.group(1).strip().strip("?")
-    return q.strip().strip("?")
+    """
+    Extract a search term (needle) from a user question for entity lookup.
+    This function identifies the key term to search for in the database.
+    """
+    q = q or ""
+    # Remove common stopwords and generic terms
+    q_clean = re.sub(r'\b(?:the|a|an|of|in|on|at|to|for|with|by|from|up|down|over|under|between|through|during|before|after|above|below|into|onto|upon|about|against|across|along|among|around|behind|beneath|beside|between|beyond|inside|outside|throughout|within)\b', ' ', q, flags=re.IGNORECASE)
+    # Remove extra whitespace
+    q_clean = re.sub(r'\s+', ' ', q_clean).strip()
+    
+    # If we have a "who is" or "what is" question, extract the entity name
+    who_what_match = re.match(r'^\s*(?:who|what)\s+(?:is|are|was|were)\s+(.+)', q_clean, re.IGNORECASE)
+    if who_what_match:
+        return who_what_match.group(1).strip()
+    
+    # For other questions, try to extract the main noun or entity
+    # Split into words and take the most relevant ones
+    words = re.findall(r'[A-Za-z0-9]+', q_clean)
+    if not words:
+        return q_clean.strip()
+    
+    # Filter out generic words and take the first few meaningful words
+    meaningful_words = [w for w in words if w.lower() not in _GENERIC_SHORT_WORDS and len(w) > 1]
+    if meaningful_words:
+        # Take up to 3 meaningful words
+        return ' '.join(meaningful_words[:3])
+    
+    # Fallback to the cleaned query
+    return q_clean.strip()
 
 def _list_name_like_columns(selected_db: str, limit_tables: int = 400, query_text: str = "") -> List[Dict[str, str]]:
     dyn_tokens = sorted(_nameish_for_query(query_text))
@@ -1898,22 +2034,97 @@ def _list_name_like_columns(selected_db: str, limit_tables: int = 400, query_tex
     out: List[Dict[str, str]] = []
     with connect_to_source(selected_db) as (conn, _):
         cur = conn.cursor()
+        _set_case_insensitive_session(cur)
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = [{cols[i]: to_jsonable(r[i]) for i in range(len(cols))} for r in cur]
+        try: cur.close()
+        except Exception: pass
+    return rows[:50]
+
+# Add this near the top of the file with other imports and classes
+class QueryCancellationError(Exception):
+    """Exception raised when a query is cancelled."""
+    pass
+
+# Add threading import for cancellation support
+import threading
+from typing import Callable
+
+# Add a global registry for active queries and a lock for thread safety
+_ACTIVE_QUERIES = {}
+_ACTIVE_QUERIES_LOCK = threading.Lock()
+
+# Add a function to cancel all active queries
+def cancel_all_active_queries():
+    """Cancel all currently active queries."""
+    with _ACTIVE_QUERIES_LOCK:
+        cancelled_count = 0
+        for query_id, query_info in list(_ACTIVE_QUERIES.items()):
+            try:
+                cursor = query_info.get('cursor')
+                if cursor:
+                    # For Oracle, we can't directly cancel a query, but we can close the cursor
+                    # In a more sophisticated implementation, we would use database-specific 
+                    # mechanisms to terminate the query on the server side
+                    cursor.close()
+                    cancelled_count += 1
+            except Exception as e:
+                logger.warning(f"Error cancelling query {query_id}: {e}")
+        _ACTIVE_QUERIES.clear()
+        return cancelled_count
+
+# Enhanced version of run_sql with cancellation support
+def run_sql_with_cancellation(sql: str, selected_db: str, *, cache_ok: bool = True, cancellation_token: Optional[Callable[[], bool]] = None) -> List[Dict[str, Any]]:
+    cached = _cache_get_result(selected_db, sql)
+    if cached:
+        logger.debug("[DB] cache_hit=1 db=%s", selected_db)
+        return cached["rows"]
+
+    logger.debug("[DB] SQL: %s", (sql or "").replace("\n", " ")[:2000])
+    
+    # Generate a unique query ID for tracking
+    query_id = f"{selected_db}_{hash(sql)}_{int(time.time() * 1000)}"
+    
+    with connect_to_source(selected_db) as (conn, _):
+        cur = conn.cursor()
+        _set_case_insensitive_session(cur)
+        
+        # Register the active query
+        with _ACTIVE_QUERIES_LOCK:
+            _ACTIVE_QUERIES[query_id] = {
+                'cursor': cur,
+                'connection': conn,
+                'start_time': time.time(),
+                'sql': sql
+            }
+        
         try:
+            # Check for cancellation before executing
+            if cancellation_token and cancellation_token():
+                raise QueryCancellationError("Query was cancelled before execution")
+            
             cur.execute(sql)
-            for t, c in cur.fetchall():
-                out.append({"table": t, "column": c})
-        except Exception as e:
-            logger.warning(f"[Meta fallback] column scan failed: {e}")
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = [{cols[i]: to_jsonable(r[i]) for i in range(len(cols))} for r in cur]
+            
+            # Periodically check for cancellation during execution (for long-running queries)
+            # This is a simplified check - in a more sophisticated implementation, you might want to check more frequently
+            # or use database-specific mechanisms
+            if cancellation_token:
+                # Check once after execution completes
+                if cancellation_token():
+                    raise QueryCancellationError("Query was cancelled during execution")
+            
         finally:
-            try: cur.close()
-            except: pass
-    out = [x for x in out if not _is_banned_table(x["table"])]
-    seen = set(); dedup = []
-    for x in out:
-        k = (x["table"], x["column"])
-        if k not in seen:
-            seen.add(k); dedup.append(x)
-    return dedup
+            # Remove the query from active queries
+            with _ACTIVE_QUERIES_LOCK:
+                _ACTIVE_QUERIES.pop(query_id, None)
+
+    logger.debug("[DB] rows=%d cols=%d", len(rows), len(cols))
+
+    _cache_set_result(selected_db, sql, cols, rows, cache_ok=cache_ok)
+    return rows
 
 def _merge_candidates(primary: List[Dict[str, str]], fallback: List[Dict[str, str]], cap: int = 200) -> List[Dict[str, str]]:
     seen = set(); merged = []

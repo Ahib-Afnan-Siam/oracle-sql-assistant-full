@@ -24,7 +24,7 @@
 
 Uttoron is an advanced natural language to SQL system designed specifically for Oracle databases. It enables non-technical users to query complex Oracle databases using plain English, eliminating the need for manual SQL writing and reducing dependency on database experts.
 
-The system combines Retrieval-Augmented Generation (RAG) with hybrid AI processing to provide accurate, context-aware SQL generation. It supports both local LLM inference (via Ollama) and cloud-based models (via OpenRouter), allowing for flexible deployment options that balance performance, privacy, and accuracy.
+The system combines Retrieval-Augmented Generation (RAG) with hybrid AI processing to provide accurate, context-aware SQL generation. It supports both local LLM inference (via Ollama) and cloud-based models (via DeepSeek), allowing for flexible deployment options that balance performance, privacy, and accuracy.
 
 ### Core Problems Solved
 - Eliminates the need for users to write SQL manually
@@ -89,7 +89,7 @@ Uttoron follows a two-tier client-server architecture:
 │  └───────────────────────────────────────────────────────────┘  │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                   Hybrid Processor                        │  │
-│  │  Local Models (Ollama)  │  Cloud Models (OpenRouter)      │  │
+│  │  Local Models (Ollama)  │  Cloud Models (DeepSeek)        │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                   Database Connector                      │  │
@@ -111,7 +111,7 @@ Uttoron follows a two-tier client-server architecture:
 2. Frontend sends request to `/chat` endpoint
 3. Backend classifies intent using `query_classifier.py`
 4. RAG engine retrieves relevant schema context from ChromaDB
-5. Hybrid processor routes to local (Ollama) and/or cloud (OpenRouter) LLMs
+5. Hybrid processor routes to local (Ollama) and/or cloud (DeepSeek) LLMs
 6. Generated SQL is executed via `db_connector.py`
 7. Results returned to frontend for display and visualization
 8. User feedback sent to `/feedback` endpoint for training
@@ -123,7 +123,7 @@ Uttoron follows a two-tier client-server architecture:
 - **Database:** Oracle (via cx_Oracle), SQLite (for feedback storage)
 - **AI/ML Libraries:** Sentence Transformers, ChromaDB, Ollama
 - **Vector Store:** ChromaDB
-- **External APIs:** OpenRouter (cloud LLMs)
+- **External APIs:** DeepSeek (cloud LLMs)
 - **Other:** Jinja2, Tenacity, Tabulate, aiohttp
 
 ### Frontend
@@ -152,7 +152,7 @@ uttoron/
 │   │   │   ├── rag_engine.py          # RAG orchestration for SOS
 │   │   │   ├── query_engine.py        # Query execution for SOS
 │   │   │   ├── hybrid_processor.py    # Hybrid AI processing for SOS
-│   │   │   ├── openrouter_client.py   # OpenRouter API client for SOS
+│   │   │   ├── deepseek_client.py     # DeepSeek API client for SOS
 │   │   │   ├── sql_generator.py       # SQL generation for SOS
 │   │   │   ├── summarizer.py          # Result summarization for SOS
 │   │   │   ├── schema_loader_chroma.py# Schema loading for SOS
@@ -164,7 +164,7 @@ uttoron/
 │   │   │   ├── rag_engine.py          # RAG orchestration for ERP
 │   │   │   ├── query_engine.py        # Query execution for ERP
 │   │   │   ├── hybrid_processor.py    # Hybrid AI processing for ERP
-│   │   │   ├── openrouter_client.py   # OpenRouter API client for ERP
+│   │   │   ├── deepseek_client.py     # DeepSeek API client for ERP
 │   │   │   ├── sql_generator.py       # SQL generation for ERP
 │   │   │   ├── summarizer.py          # Result summarization for ERP
 │   │   │   ├── schema_loader_chroma.py# Schema loading for ERP
@@ -178,8 +178,7 @@ uttoron/
 │   │   ├── config.py                  # Application configuration
 │   │   ├── db_connector.py            # Database connectivity and execution
 │   │   ├── embeddings.py              # Embedding generation
-│   │   ├── feedback_store.py          # Feedback storage and management
-│   │   ├── hybrid_data_recorder.py    # Training data recording
+│   │   ├── ai_training_data_recorder.py # AI training data recording
 │   │   ├── llm_client.py              # LLM client abstraction
 │   │   ├── ollama_llm.py              # Ollama LLM integration
 │   │   ├── sql_generator.py           # Generic SQL generation

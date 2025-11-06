@@ -2,27 +2,46 @@
 import logging
 from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass
-from datetime import datetime as _dt
+from datetime import datetime
 import re
 import time
 import asyncio
 
+import asyncio
+
 from .query_classifier import QueryClassifier, ConfidenceThresholdManager, QueryIntent, ModelSelectionStrategy
-from .openrouter_client import get_openrouter_client
+from .deepseek_client import get_deepseek_client
 from app.ollama_llm import ask_sql_model
 from app import config
 from app.sql_generator import extract_sql as _extract_sql_basic  # Import the existing function
 
 # Phase 5: Import hybrid data recorder for training data collection
+# Comment out the old imports as we're fully integrating the new AI training recorder
+# try:
+#     from app.hybrid_data_recorder import hybrid_data_recorder, record_hybrid_turn
+#     TRAINING_DATA_COLLECTION_AVAILABLE = True
+# except ImportError:
+#     TRAINING_DATA_COLLECTION_AVAILABLE = False
+#     hybrid_data_recorder = None
+#     record_hybrid_turn = None
+
+# Phase 6: Also try to import the new AI training recorder
 try:
-    from app.hybrid_data_recorder import hybrid_data_recorder, record_hybrid_turn
-    TRAINING_DATA_COLLECTION_AVAILABLE = True
+    from app.ai_training_data_recorder import AITrainingDataRecorder, RecordingContext, ai_training_data_recorder
+    NEW_TRAINING_RECORDER_AVAILABLE = True
 except ImportError:
-    TRAINING_DATA_COLLECTION_AVAILABLE = False
-    hybrid_data_recorder = None
-    record_hybrid_turn = None
+    NEW_TRAINING_RECORDER_AVAILABLE = False
+    AITrainingDataRecorder = None
+    RecordingContext = None
+    ai_training_data_recorder = None
+
+# Add a constant to indicate we're using the new system
+TRAINING_DATA_COLLECTION_AVAILABLE = NEW_TRAINING_RECORDER_AVAILABLE
 
 logger = logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
+
 
 
 # ------------------------------ SQL extractor ------------------------------
@@ -417,7 +436,7 @@ class SQLValidator:
                     score += 0.2
                     reasoning.append(f"Uses flexible company pattern matching for {company_code}")
 
-        if intent == QueryIntent.PRODUCTION_QUERY or intent == 'production_query' or intent == 'production_summary':
+        if intent == QueryIntent.PRODUCTION_QUERY or intent == 'production_query' or intent == 'floor_production_summary':
             if any(t in sql_upper for t in ['T_PROD', 'T_PROD_DAILY']):
                 score += 0.25
                 reasoning.append("Uses appropriate production tables")
@@ -673,7 +692,7 @@ class SQLValidator:
                     score += 0.05  # Ascending order for task dates
 
         # Enhanced grouping validation
-        if 'GROUP BY' in sql_upper and intent in (QueryIntent.PRODUCTION_QUERY, 'production_query', 'production_summary'):
+        if 'GROUP BY' in sql_upper and intent in (QueryIntent.PRODUCTION_QUERY, 'production_query', 'floor_production_summary'):
             score += 0.15
             # Check if grouping is by appropriate columns
             if 'FLOOR_NAME' in sql_upper:
@@ -954,7 +973,7 @@ class SQLValidator:
                 score += 0.1
                 reasoning.append(f"Uses key TNA columns: {', '.join(used_tna_columns)}")
                 
-        elif intent in ['production_query', 'production_summary', QueryIntent.PRODUCTION_QUERY] and any(
+        elif intent in ['production_query', 'floor_production_summary', QueryIntent.PRODUCTION_QUERY] and any(
             t in sql_upper for t in ['T_PROD', 'T_PROD_DAILY']
         ):
             score += 0.25
@@ -1383,7 +1402,7 @@ class AdvancedParallelProcessor:
     def __init__(self):
         self.classifier = QueryClassifier()
         self.threshold_manager = ConfidenceThresholdManager(config)
-        self.openrouter_client = get_openrouter_client()
+        self.deepseek_client = get_deepseek_client()
         self.sql_validator = SQLValidator()
 
         # Prefer advanced selector if available; else fallback
@@ -1393,7 +1412,6 @@ class AdvancedParallelProcessor:
             self.selector = self._create_fallback_selector()
 
         self.logger = logging.getLogger(__name__)
-        self.selection_weights = config.RESPONSE_SELECTION_WEIGHTS
 
         # Default timeouts
         self.local_timeout = 30.0
@@ -1401,15 +1419,118 @@ class AdvancedParallelProcessor:
         self.total_timeout = 60.0
 
         self.processing_stats = {
+            "local": 0,
+            "api": 0,
+            "local_fail": 0,
+            "api_fail": 0,
+            "local_timeout": 0,
+            "api_timeout": 0,
+            "local_success": 0,
+            "api_success": 0,
+            "local_retries": 0,
+            "api_retries": 0,
+            "local_retries_success": 0,
+            "api_retries_success": 0,
+            "local_retries_fail": 0,
+            "api_retries_fail": 0,
+            "local_retries_timeout": 0,
+            "api_retries_timeout": 0,
+        }
+
+    def _create_fallback_selector(self):
+        return AdvancedResponseSelector()
+
+    def _process_query(self, query: str) -> Tuple[str, str]:
+        local_response = self._get_local_response(query)
+        api_response = self._get_api_response(query)
+
+        # Use a simple scoring approach since AdvancedResponseSelector doesn't have a score method
+        local_score = len(local_response) if local_response else 0
+        api_score = len(api_response) if api_response else 0
+
+        if local_score > api_score:
+            selected = local_response
+            reason = f"Local response selected (length: {local_score} vs {api_score})."
+        elif api_score > local_score:
+            selected = api_response
+            reason = f"API response selected (length: {api_score} vs {local_score})."
+        else:
+            if local_response:
+                selected = local_response
+                reason = "Responses equal, selecting local response."
+            else:
+                selected = api_response or ""
+                reason = "No valid responses available."
+        return selected, reason
+
+    def _get_local_response(self, query: str) -> str:
+        try:
+            local_response = self._local_query(query)
+            self.processing_stats["local_success"] += 1
+            return local_response
+        except Exception as e:
+            self.processing_stats["local_fail"] += 1
+            self.logger.error(f"Local query failed: {e}")
+            return ""
+
+    def _get_api_response(self, query: str) -> str:
+        try:
+            api_response = self._api_query(query)
+            self.processing_stats["api_success"] += 1
+            return api_response
+        except Exception as e:
+            self.processing_stats["api_fail"] += 1
+            self.logger.error(f"API query failed: {e}")
+            return ""
+
+    def _local_query(self, query: str) -> str:
+        raise NotImplementedError("Local query method not implemented.")
+
+    def _api_query(self, query: str) -> str:
+        raise NotImplementedError("API query method not implemented.")
+
+    def process(self, query: str) -> str:
+        selected, reason = self._process_query(query)
+        self.logger.info(f"Selected response: {selected}")
+        self.logger.info(f"Reason: {reason}")
+        return selected
+
+# ------------------------------ Hybrid processor ------------------------------
+class HybridProcessor:
+    """Enhanced hybrid processor with proper mode tracking for all processing modes."""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.query_classifier = QueryClassifier()
+        self.confidence_manager = ConfidenceThresholdManager(config)
+        self.sql_validator = SQLValidator()
+        self.deepseek_client = get_deepseek_client()
+        
+        # Initialize threshold manager and selector
+        self.threshold_manager = ConfidenceThresholdManager(config)
+        try:
+            self.selector = AdvancedResponseSelector()
+        except Exception:
+            self.selector = self._create_fallback_selector()
+
+        # Timing configuration
+        self.local_timeout = 30.0
+        self.api_timeout = 45.0
+        self.total_timeout = 60.0
+        self._local_processing_time = 0.0
+        self._api_processing_time = 0.0
+        self.processing_stats = {
             'total_queries': 0,
             'parallel_successes': 0,
             'api_selections': 0,
             'local_selections': 0,
             'average_processing_time': 0.0
         }
-
-        # Phase 5: Initialize training data recorder
-        self.training_data_recorder = hybrid_data_recorder if TRAINING_DATA_COLLECTION_AVAILABLE else None
+        # Initialize training data recorder
+        if NEW_TRAINING_RECORDER_AVAILABLE and AITrainingDataRecorder:
+            self.training_data_recorder = AITrainingDataRecorder()
+        else:
+            self.training_data_recorder = None
 
     def _create_fallback_selector(self):
         class FallbackResponseSelector:
@@ -1447,9 +1568,27 @@ class AdvancedParallelProcessor:
         processing_result = None
         
         # Handle general queries - bypass SQL-specific processing
+        # Note: General query handling should be done in the HybridProcessor class
+        # which has access to the _process_general_query method
         if query_type == "general":
-            # Fix: Add await since _process_general_query is an async function
-            return await self._process_general_query(user_query, schema_context, file_content, file_name)
+            # For AdvancedParallelProcessor, we'll return a simple error
+            # The HybridProcessor will handle this properly
+            processing_time = time.time() - start_time
+            return ProcessingResult(
+                selected_response="General query processing not available at this level",
+                local_response=None,
+                api_response=None,
+                processing_mode="general_query_unsupported",
+                selection_reasoning="General query processing not available in AdvancedParallelProcessor",
+                local_confidence=0.0,
+                api_confidence=0.0,
+                processing_time=processing_time,
+                model_used="unsupported",
+                local_model_name=None,
+                api_model_name=None,
+                local_processing_time=None,
+                api_processing_time=None
+            )
         
         # ---- Helper: pick a safe reasoning list (never None / never undefined)
         def _pick_reasoning(*candidates):
@@ -1489,6 +1628,7 @@ class AdvancedParallelProcessor:
             from .rag_engine import analyze_enhanced_query
             query_analysis = analyze_enhanced_query(user_query)
 
+            processing_mode = "SOS"  # Default value for SOS mode
             if not has_multi_fields:
                 processing_mode = self.assess_query_complexity(user_query, query_analysis)
 
@@ -1498,11 +1638,32 @@ class AdvancedParallelProcessor:
                         f"(confidence: {query_analysis.get('intent_confidence', 0):.2f}, "
                         f"mode: {processing_mode})")
 
-            classification = type('obj', (object,), {
-                'intent': QueryIntent.GENERAL_QUERY,
-                'confidence': query_analysis.get('intent_confidence', 0.5),
-                'strategy': ModelSelectionStrategy.HYBRID_PARALLEL
-            })()
+            # Create a proper classification object
+            from app.SOS.query_classifier import QueryClassification, QueryIntent, ModelSelectionStrategy
+            
+            # Map custom intent names to valid QueryIntent enum values
+            intent_mapping = {
+                'floor_production_summary': QueryIntent.PRODUCTION_QUERY,
+                'efficiency_query': QueryIntent.PRODUCTION_QUERY,
+                'defect_analysis': QueryIntent.PRODUCTION_QUERY,
+                'employee_lookup': QueryIntent.HR_EMPLOYEE_QUERY,
+                'tna_task_query': QueryIntent.TNA_TASK_QUERY,
+                'trend_analysis': QueryIntent.COMPLEX_ANALYTICS,
+                'ranking_query': QueryIntent.COMPLEX_ANALYTICS,
+                'general': QueryIntent.GENERAL_QUERY
+            }
+            
+            intent_value = query_analysis.get('intent', 'general')
+            mapped_intent = intent_mapping.get(intent_value, QueryIntent.GENERAL_QUERY)
+            
+            classification = QueryClassification(
+                intent=mapped_intent,
+                confidence=query_analysis.get('intent_confidence', 0.5),
+                strategy=ModelSelectionStrategy.HYBRID_PARALLEL,
+                reasoning=f"Enhanced analysis: {intent_value}",
+                entities=query_analysis.get('entities', {}),
+                complexity_score=query_analysis.get('complexity_score', 0.0)
+            )
 
             query_context: Dict[str, Any] = {
                 'user_query': user_query,
@@ -1513,6 +1674,46 @@ class AdvancedParallelProcessor:
             }
 
             decision = self.threshold_manager.get_processing_decision(local_confidence, classification)
+
+            # Record query classification if training data collection is available
+            classification_id = None
+            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
+                try:
+                    classification_result = {
+                        'intent': intent_value,
+                        'confidence': query_analysis.get('intent_confidence', 0.5),
+                        'complexity_score': query_analysis.get('complexity_score', 0.0),
+                        'entities': query_analysis.get('entities', {}),
+                        'strategy': 'HYBRID_PARALLEL',
+                        'business_context': f"Enhanced analysis: {intent_value}"
+                    }
+                    
+                    classification_id = self.training_data_recorder.record_query_classification(
+                        query_id=turn_id,
+                        classification_result=classification_result
+                    )
+                    self.logger.debug(f"Recorded query classification with ID: {classification_id}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to record query classification: {e}")
+
+            # Record schema context if training data collection is available
+            schema_id = None
+            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
+                try:
+                    schema_info = {
+                        'schema_definition': schema_context or '',
+                        'tables_used': [],  # Will be populated during processing
+                        'column_mapping': {},
+                        'retrieval_timestamp': datetime.now()
+                    }
+                    
+                    schema_id = self.training_data_recorder.record_schema_context(
+                        query_id=turn_id,
+                        schema_info=schema_info
+                    )
+                    self.logger.debug(f"Recorded schema context with ID: {schema_id}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to record schema context: {e}")
 
             # Execute with timeouts
             local_response: Optional[str] = None
@@ -1538,190 +1739,490 @@ class AdvancedParallelProcessor:
             # Build a safe reasoning list once and reuse everywhere
             reasoning_list = _pick_reasoning(
                 locals().get("selection_reasoning"),
-                locals().get("api_metrics"),
-                locals().get("local_metrics"),
+                locals().get("reasoning"),
+                getattr(local_metrics, "reasoning", None) if local_metrics else None,
+                getattr(api_metrics, "reasoning", None) if api_metrics else None,
+                [f"Enhanced analysis: {query_analysis.get('intent', 'unknown')} "
+                 f"(confidence: {query_analysis.get('intent_confidence', 0):.2f})"]
             )
 
             # Select best response
-            try:
-                selected_response, selection_reasoning, sel_details = self.selector.select_best_response(
-                    local_response, api_response, local_metrics, api_metrics, query_context,
-                    local_confidence=local_confidence, api_confidence=classification.confidence,
-                    model_used=self._get_api_model_name(classification)
-                )
-                selected_confidence = float(sel_details.get("selection_margin", 0.0)) if isinstance(sel_details, dict) else 0.0
-                model_used = self._get_api_model_name(classification) if selected_response == (api_response or "") else "Local"
-            except Exception as selector_error:
-                self.logger.error(f"Response selector failed: {selector_error}")
-                if api_response and api_response.strip():
-                    selected_response = api_response
-                    selection_reasoning = "Selected API response (selector fallback)"
-                    selected_confidence = 0.8
-                    model_used = "API"
-                elif local_response and local_response.strip():
-                    selected_response = local_response
-                    selection_reasoning = "Selected local response (selector fallback)"
-                    selected_confidence = 0.7
-                    model_used = "Local"
-                else:
-                    selected_response = ""
-                    selection_reasoning = "No valid response available"
-                    selected_confidence = 0.0
-                    model_used = "None"
-
-            # Multi-field safety net: prevent SELECT 1 FROM DUAL and generate dynamic SQL
-            if has_multi_fields and (not selected_response or selected_response.strip().upper() == "SELECT 1 FROM DUAL"):
-                self.logger.info("Multi-field query detected but no valid response available. Generating dynamic SQL.")
-                # Parse month/year if present
-                m = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})',
-                              user_query, re.IGNORECASE)
-                month_name = m.group(1).capitalize() if m else None
-                year = m.group(2) if m else str(_dt.now().year)
-                has_floor = 'floor' in user_query.lower()
-                mentions_prod = any(w in user_query.lower() for w in ['production', 'prod', 'qty'])
-                mentions_defect = 'defect' in user_query.lower()
-
-                if (mentions_prod or 'qty' in user_query.lower()) and mentions_defect:
-                    if has_floor and month_name:
-                        month_abbr = month_name[:3].upper()
-                        selected_response = f"""
-SELECT 
-    FLOOR_NAME, 
-    SUM(PRODUCTION_QTY) AS TOTAL_PRODUCTION_QTY, 
-    SUM(DEFECT_QTY)     AS TOTAL_DEFECT_QTY
-FROM 
-    T_PROD_DAILY
-WHERE 
-    PROD_DATE BETWEEN TO_DATE('01-{month_abbr}-{year}', 'DD-MON-YYYY') 
-                   AND LAST_DAY(TO_DATE('01-{month_abbr}-{year}', 'DD-MON-YYYY'))
-GROUP BY 
-    FLOOR_NAME
-ORDER BY 
-    FLOOR_NAME
-""".strip()
-                        selection_reasoning = f"Generated dynamic SQL for multi-field production vs defect by floor for {month_name} {year}"
-                        model_used = "Dynamic"
-                        selected_confidence = 0.65
-                    else:
-                        selected_response = """
-SELECT 
-    FLOOR_NAME, 
-    SUM(PRODUCTION_QTY) AS TOTAL_PRODUCTION_QTY, 
-    SUM(DEFECT_QTY)     AS TOTAL_DEFECT_QTY
-FROM 
-    T_PROD_DAILY
-GROUP BY 
-    FLOOR_NAME
-ORDER BY 
-    FLOOR_NAME
-""".strip()
-                        selection_reasoning = "Generated dynamic SQL for multi-field production vs defect by floor"
-                        model_used = "Dynamic"
-                        selected_confidence = 0.6
-
-            # Update stats
-            processing_time = time.time() - start_time
-            self.processing_stats['total_queries'] += 1
-            if model_used and "API" in model_used.upper():
-                self.processing_stats['api_selections'] += 1
-            elif model_used and "LOCAL" in model_used.upper():
-                self.processing_stats['local_selections'] += 1
-            if local_response and api_response:
-                self.processing_stats['parallel_successes'] += 1
-            self.processing_stats['average_processing_time'] = (
-                (self.processing_stats['average_processing_time'] * (self.processing_stats['total_queries'] - 1) + processing_time) /
-                self.processing_stats['total_queries']
+            selector_result = self.selector.select_best_response(
+                local_response=local_response,
+                api_response=api_response,
+                local_metrics=local_metrics,
+                api_metrics=api_metrics,
+                query_context=query_context,
+                local_confidence=local_confidence,
+                api_confidence=query_analysis.get('intent_confidence', 0.5),
+                model_used="hybrid_parallel"
             )
 
-            result = ProcessingResult(
+            selected_response, selection_reasoning, selection_metadata = selector_result
+
+            # Record model interactions for both local and API processing
+            local_interaction_id = None
+            api_interaction_id = None
+            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
+                try:
+                    # Record local model interaction
+                    if local_response:
+                        local_model_details = {
+                            'model_name': 'ollama-local',  # Default local model
+                            'provider': 'Ollama',
+                            'prompt_text': '',  # Not available in this context
+                            'response_text': local_response,
+                            'response_time_ms': (time.time() - start_time) * 1000,
+                            'token_count': 0,  # Not available
+                            'confidence_score': local_confidence,
+                            'status': 'success' if local_response else 'failed',
+                            'error_message': '',
+                            'cost_usd': 0.0,
+                            'interaction_timestamp': datetime.now()
+                        }
+                        
+                        local_interaction_id = self.training_data_recorder.record_model_interaction(
+                            query_id=turn_id,
+                            model_type='local',
+                            model_details=local_model_details
+                        )
+                        self.logger.debug(f"Recorded local model interaction with ID: {local_interaction_id}")
+                    
+                    # Record API model interaction
+                    if api_response:
+                        api_model_details = {
+                            'model_name': 'deepseek-chat',  # Default API model
+                            'provider': 'DeepSeek',
+                            'prompt_text': '',  # Not available in this context
+                            'response_text': api_response,
+                            'response_time_ms': (time.time() - start_time) * 1000,
+                            'token_count': 0,  # Not available
+                            'confidence_score': query_analysis.get('intent_confidence', 0.5),
+                            'status': 'success' if api_response else 'failed',
+                            'error_message': '',
+                            'cost_usd': 0.0,
+                            'interaction_timestamp': datetime.now()
+                        }
+                        
+                        api_interaction_id = self.training_data_recorder.record_model_interaction(
+                            query_id=turn_id,
+                            model_type='api',
+                            model_details=api_model_details
+                        )
+                        self.logger.debug(f"Recorded API model interaction with ID: {api_interaction_id}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to record model interactions: {e}")
+
+            # Record response selection
+            selection_id = None
+            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
+                try:
+                    selection_details = {
+                        'selected_model_type': 'api' if api_response and (not local_response or len(api_response) > len(local_response or '')) else 'local',
+                        'selection_criteria': {},
+                        'score_comparison': {
+                            'local_score': local_metrics.overall_score if local_metrics else 0.0,
+                            'api_score': api_metrics.overall_score if api_metrics else 0.0
+                        },
+                        'final_response_text': selected_response or '',
+                        'selection_reasoning': selection_reasoning or 'No reasoning provided',
+                        'selection_timestamp': datetime.now()
+                    }
+                    
+                    selection_id = self.training_data_recorder.record_response_selection(
+                        query_id=turn_id,
+                        selection_details=selection_details
+                    )
+                    self.logger.debug(f"Recorded response selection with ID: {selection_id}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to record response selection: {e}")
+
+            # Record SQL processing
+            processing_id = None
+            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
+                try:
+                    if selected_response and selected_response.strip().upper().startswith('SELECT'):
+                        sql_processing_details = {
+                            'extracted_sql': selected_response,
+                            'validation_status': 'passed' if self.sql_validator.validate_sql(selected_response, query_context) else 'failed',
+                            'validation_errors': [],
+                            'optimization_suggestions': [],
+                            'final_sql': selected_response,
+                            'processing_timestamp': datetime.now()
+                        }
+                        
+                        processing_id = self.training_data_recorder.record_sql_processing(
+                            query_id=turn_id,
+                            processing_details=sql_processing_details
+                        )
+                        self.logger.debug(f"Recorded SQL processing with ID: {processing_id}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to record SQL processing: {e}")
+
+            processing_time = time.time() - start_time
+
+            processing_result = ProcessingResult(
                 selected_response=selected_response or "",
                 local_response=local_response,
                 api_response=api_response,
-                processing_mode=processing_mode or "unknown",
-                selection_reasoning=selection_reasoning or "No selection reasoning provided",
-                local_confidence=local_confidence or 0.0,
-                api_confidence=selected_confidence if selected_confidence is not None else 0.0,
+                processing_mode=processing_mode,
+                selection_reasoning=selection_reasoning,
+                local_confidence=local_confidence,
+                api_confidence=query_analysis.get('intent_confidence', 0.5),
                 processing_time=processing_time,
-                model_used=model_used or "Unknown",
-                local_metrics=local_metrics,
-                api_metrics=api_metrics,
-                local_model_name="ollama_deepseek_coder_v2",
-                api_model_name=self._get_api_model_name(classification),
-                local_processing_time=getattr(self, '_local_processing_time', None),
-                api_processing_time=getattr(self, '_api_processing_time', None)
+                model_used="hybrid_parallel",
+                local_model_name="ollama" if local_response else None,
+                api_model_name="deepseek-chat" if api_response else None,
+                local_processing_time=processing_time if local_response else None,
+                api_processing_time=processing_time if api_response else None
             )
-            
-            # Store the result for training data recording
-            processing_result = result
-            
-            self.logger.info(f"Advanced processing completed in {processing_time:.2f}s using {model_used}")
-            return result
+
+            # Record training data with the new AI training recorder only
+            if turn_id and processing_result is not None and NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder:
+                try:
+                    self.record_processing_result_with_ai_recorder(
+                        user_query=user_query,
+                        processing_result=processing_result,
+                        turn_id=turn_id,
+                        session_id=session_id or "",
+                        client_ip=client_ip or "",
+                        user_agent=user_agent or "",
+                        query_analysis=locals().get('query_analysis'),
+                        schema_context=schema_context,
+                        processing_mode=locals().get('processing_mode', 'unknown'),
+                        classification_time_ms=classification_time_ms
+                    )
+                except Exception as record_error:
+                    self.logger.error(f"[AI_TRAINING] Failed to record hybrid turn with new recorder: {record_error}")
+
+            return processing_result
 
         except Exception as e:
-            self.logger.error(f"Advanced processing failed: {e}")
+            self.logger.error(f"[HYBRID_PROCESSOR] Advanced query processing failed: {e}")
             processing_time = time.time() - start_time
-            error_result = ProcessingResult(
-                selected_response="",
+            
+            # Record error in fallback events if training data collection is available
+            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
+                try:
+                    fallback_details = {
+                        'trigger_reason': 'processing_error',
+                        'fallback_model_type': 'error_handling',
+                        'fallback_response_text': f"Error: {str(e)}",
+                        'recovery_status': 'failed'
+                    }
+                    
+                    fallback_id = self.training_data_recorder.record_fallback_event(
+                        query_id=turn_id,
+                        fallback_details=fallback_details
+                    )
+                    self.logger.debug(f"Recorded fallback event with ID: {fallback_id}")
+                except Exception as record_error:
+                    self.logger.warning(f"Failed to record fallback event: {record_error}")
+            
+            return ProcessingResult(
+                selected_response=f"Sorry, I couldn't process that query: {str(e)}",
                 local_response=None,
                 api_response=None,
-                processing_mode="error",
+                processing_mode="processing_error",
                 selection_reasoning=f"Error during processing: {str(e)}",
                 local_confidence=0.0,
                 api_confidence=0.0,
                 processing_time=processing_time,
-                model_used="None",
-                local_metrics=None,
-                api_metrics=None,
+                model_used="error",
                 local_model_name=None,
                 api_model_name=None,
                 local_processing_time=None,
                 api_processing_time=None
             )
             
-            # Store the error result for training data recording
-            processing_result = error_result
-            
-            return error_result
-            
         finally:
-            # Phase 5: Record training data after processing is complete
-            if TRAINING_DATA_COLLECTION_AVAILABLE and turn_id and self.training_data_recorder:
+            # Record training data with the new AI training recorder only
+            if turn_id and processing_result is not None and NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder:
                 try:
-                    # Extract schema tables from schema context
-                    schema_tables = []
-                    if schema_context:
-                        schema_tables = re.findall(r'TABLE:\s*([A-Z_][A-Z0-9_]*)', schema_context)
-                    
-                    # Record complete hybrid turn with all training data
-                    recorded_ids = self.training_data_recorder.record_complete_hybrid_turn(
-                        turn_id=turn_id,
-                        classification_result=type('obj', (object,), {
-                            'intent': query_analysis.get('intent', 'general') if 'query_analysis' in locals() else 'general',
-                            'confidence': query_analysis.get('intent_confidence', 0.5) if 'query_analysis' in locals() else 0.5,
-                            'complexity_score': query_analysis.get('complexity_score', 0.0) if 'query_analysis' in locals() else 0.0,
-                            'entities': query_analysis.get('entities', {}) if 'query_analysis' in locals() else {},
-                            'original_query': user_query
-                        })() if 'query_analysis' in locals() else type('obj', (object,), {
-                            'intent': 'general',
-                            'confidence': 0.5,
-                            'complexity_score': 0.0,
-                            'entities': {},
-                            'original_query': user_query
-                        })(),
+                    self.record_processing_result_with_ai_recorder(
+                        user_query=user_query,
                         processing_result=processing_result,
-                        entities=query_analysis.get('entities', {}) if 'query_analysis' in locals() else {},
-                        schema_tables_used=schema_tables,
-                        business_context=f"Enhanced analysis: {query_analysis.get('intent', 'unknown')}" if 'query_analysis' in locals() else "unknown",
-                        classification_time_ms=classification_time_ms,
-                        session_id=session_id,
-                        client_ip=client_ip,
-                        user_agent=user_agent
+                        turn_id=turn_id,
+                        session_id=session_id or "",
+                        client_ip=client_ip or "",
+                        user_agent=user_agent or "",
+                        query_analysis=locals().get('query_analysis'),
+                        schema_context=schema_context,
+                        processing_mode=locals().get('processing_mode', 'unknown'),
+                        classification_time_ms=classification_time_ms
                     )
-                    
-                    self.logger.info(f"[TRAINING_DATA] Recorded hybrid turn with IDs: {recorded_ids}")
-                    
                 except Exception as record_error:
-                    self.logger.error(f"[TRAINING_DATA] Failed to record hybrid turn: {record_error}")
+                    self.logger.error(f"[AI_TRAINING] Failed to record hybrid turn with new recorder: {record_error}")
+
+    def calibrate_confidence_thresholds(self, query_analysis: Dict) -> Dict:
+        base = {
+            'local_confidence': 0.7,
+            'skip_api': 0.85,
+            'force_hybrid': 0.3
+        }
+        intent = query_analysis.get('intent')
+        if intent == 'floor_production_summary':
+            base['local_confidence'] -= 0.1
+        if query_analysis.get('entities', {}).get('ctl_codes'):
+            base['skip_api'] += 0.05
+        if len(query_analysis.get('entities', {}).get('aggregations', [])) > 1:
+            base['force_hybrid'] += 0.2
+        if query_analysis.get('intent_confidence', 1.0) < 0.5:
+            base['force_hybrid'] += 0.15
+        return base
+
+    async def _process_general_query(self, user_query: str, schema_context: str = "", 
+                                  file_content: Optional[str] = None, 
+                                  file_name: Optional[str] = None) -> ProcessingResult:
+        """
+        Process general knowledge queries that don't require SQL generation.
+        
+        Args:
+            user_query: The user's general knowledge question
+            schema_context: Context/instructions for the AI model
+            file_content: Optional file content for file analysis
+            file_name: Optional file name for file analysis
+            
+        Returns:
+            ProcessingResult with the general knowledge response
+        """
+        start_time = time.time()
+        
+        try:
+            # Use DeepSeek client for general knowledge queries
+            from .deepseek_client import get_deepseek_client
+            client = get_deepseek_client()
+            
+            # Check if this is a file analysis request
+            if file_content and file_name:
+                # File analysis mode - use multimodal capabilities
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Please analyze the following file and answer the question: {user_query}\n\nFile Name: {file_name}"
+                            },
+                            {
+                                "type": "text",
+                                "text": f"File Content:\n{file_content}"
+                            }
+                        ]
+                    }
+                ]
+            else:
+                # Regular general knowledge mode
+                # Ensure we have a system prompt that enforces English responses
+                system_prompt = "You are a helpful AI assistant. ALL RESPONSES MUST BE IN ENGLISH LANGUAGE. Provide clear, accurate, and helpful responses to user questions."
+                if schema_context and schema_context.strip():
+                    system_prompt = f"{system_prompt}\n\nAdditional context:\n{schema_context}"
+                
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query}
+                ]
+            
+            # Use appropriate model for general queries
+            # Use the general model configuration from config
+            from app.config import API_MODELS
+            model_config = API_MODELS.get("general", {
+                "primary": "meta-llama/llama-3.3-8x22b-instruct:free",
+                "secondary": "openchat/openchat-8b",
+                "fallback": "microsoft/WizardLM-2-8x22B"
+            })
+            
+            # For file analysis, use DeepSeek Coder model exclusively
+            if file_content and file_name:
+                model = "deepseek-coder"
+            else:
+                model = model_config["primary"]
+            
+            # Make API call
+            response = await client.chat_completion(
+                messages=messages,
+                model=model,
+                temperature=0.3 if file_content and file_name else 0.7,  # Lower temperature for file analysis
+                max_tokens=2048 if file_content and file_name else 1024
+            )
+            
+            processing_time = time.time() - start_time
+            
+            if response.success and response.content:
+                return ProcessingResult(
+                    selected_response=response.content,
+                    local_response=None,
+                    api_response=response.content,
+                    processing_mode="file_analysis" if file_content and file_name else "general_query",
+                    selection_reasoning="Generated response for file analysis" if file_content and file_name else "Generated response for general knowledge query",
+                    local_confidence=0.0,
+                    api_confidence=0.95 if file_content and file_name else 0.9,  # Higher confidence for file analysis
+                    processing_time=processing_time,
+                    model_used=model,
+                    local_model_name=None,
+                    api_model_name=model,
+                    local_processing_time=None,
+                    api_processing_time=processing_time
+                )
+            else:
+                # For general mode, don't fallback to local model - return error instead
+                # This ensures that general mode uses API models independently
+                processing_time = time.time() - start_time
+                
+                return ProcessingResult(
+                    selected_response=f"Sorry, I couldn't process that general question. The API service is currently unavailable or taking too long to respond. Please try again later.",
+                    local_response=None,
+                    api_response=None,
+                    processing_mode="general_query_api_error",
+                    selection_reasoning="API service unavailable or timeout for general query",
+                    local_confidence=0.0,
+                    api_confidence=0.0,
+                    processing_time=processing_time,
+                    model_used="api_error",
+                    local_model_name=None,
+                    api_model_name=None,
+                    local_processing_time=None,
+                    api_processing_time=None
+                )
+                
+        except Exception as e:
+            self.logger.error(f"[HYBRID_PROCESSOR] General query processing failed: {e}")
+            processing_time = time.time() - start_time
+            
+            return ProcessingResult(
+                selected_response=f"Sorry, I couldn't process that general question: {str(e)}",
+                local_response=None,
+                api_response=None,
+                processing_mode="general_query_error",
+                selection_reasoning=f"Error during general query processing: {str(e)}",
+                local_confidence=0.0,
+                api_confidence=0.0,
+                processing_time=processing_time,
+                model_used="error",
+                local_model_name=None,
+                api_model_name=None,
+                local_processing_time=None,
+                api_processing_time=None
+            )
+
+    def record_processing_result_with_ai_recorder(self, 
+                                                user_query: str,
+                                                processing_result: ProcessingResult,
+                                                turn_id: Optional[int] = None,
+                                                session_id: Optional[str] = None,
+                                                client_ip: Optional[str] = None,
+                                                user_agent: Optional[str] = None,
+                                                query_analysis: Optional[Dict[str, Any]] = None,
+                                                schema_context: Optional[str] = None,
+                                                processing_mode: Optional[str] = None,
+                                                classification_time_ms: float = 0.0) -> None:
+        """
+        Record processing result with the new AI training recorder.
+        
+        Args:
+            user_query: The user's query text
+            processing_result: The processing result to record
+            turn_id: Reference to AI_TURN table
+            session_id: Session identifier
+            client_ip: Client IP address
+            user_agent: User agent string
+            query_analysis: Query analysis data
+            schema_context: Schema context string
+            processing_mode: Processing mode used
+            classification_time_ms: Time taken for classification
+        """
+        if not NEW_TRAINING_RECORDER_AVAILABLE or not turn_id:
+            return
+            
+        try:
+            # Create processing data structure for new AI training recorder
+            processing_data = {
+                'user_query_text': user_query,
+                'session_id': session_id,
+                'client_info': f"{client_ip or ''};{user_agent or ''}",
+                'database_type': 'oracle',
+                'query_mode': processing_mode or 'unknown'
+            }
+            
+            # Add classification result if available
+            if query_analysis:
+                processing_data['classification_result'] = {
+                    'intent': query_analysis.get('intent', 'general'),
+                    'confidence': query_analysis.get('intent_confidence', 0.5),
+                    'complexity_score': query_analysis.get('complexity_score', 0.0),
+                    'entities': query_analysis.get('entities', {}),
+                    'strategy': 'HYBRID_PARALLEL',  # Default strategy
+                    'business_context': f"Enhanced analysis: {query_analysis.get('intent', 'unknown')}"
+                }
+            
+            # Add schema context if available
+            if schema_context:
+                processing_data['schema_info'] = {
+                    'schema_definition': schema_context,
+                    'tables_used': [],
+                    'column_mapping': {}
+                }
+            
+            # Add model interactions
+            if processing_result:
+                model_details = {
+                    'model_name': processing_result.api_model_name or processing_result.local_model_name or 'unknown',
+                    'provider': 'deepseek' if processing_result.api_model_name else 'ollama',
+                    'prompt_text': '',  # Not available in this context
+                    'response_text': processing_result.selected_response or '',
+                    'response_time_ms': (processing_result.api_processing_time or processing_result.local_processing_time or 0) * 1000,
+                    'token_count': 0,  # Not available
+                    'confidence_score': processing_result.api_confidence or processing_result.local_confidence or 0.0,
+                    'status': 'success' if processing_result.selected_response else 'failed',
+                    'error_message': '' if processing_result.selected_response else 'No response generated',
+                    'cost_usd': 0.0,  # Not available
+                    'interaction_timestamp': None
+                }
+                
+                processing_data['model_interactions'] = [{
+                    'model_type': 'api' if processing_result.api_model_name else 'local',
+                    'model_details': model_details
+                }]
+            
+            # Add response selection
+            if processing_result:
+                processing_data['selection_details'] = {
+                    'selected_model_type': 'api' if processing_result.api_model_name else 'local',
+                    'selection_criteria': {},
+                    'score_comparison': {},
+                    'final_response_text': processing_result.selected_response or '',
+                    'selection_reasoning': processing_result.selection_reasoning or 'No reasoning provided',
+                    'selection_timestamp': None
+                }
+            
+            # Add SQL processing (if applicable)
+            if processing_result and processing_result.selected_response and processing_result.selected_response.strip().upper().startswith('SELECT'):
+                processing_data['sql_processing'] = {
+                    'extracted_sql': processing_result.selected_response,
+                    'validation_status': 'unknown',
+                    'validation_errors': [],
+                    'optimization_suggestions': [],
+                    'final_sql': processing_result.selected_response,
+                    'processing_timestamp': datetime.now()
+                }
+            
+            # Add execution result (placeholder)
+            processing_data['execution_result'] = {
+                'execution_status': 'unknown',
+                'execution_time_ms': 0,
+                'row_count': 0,
+                'error_message': ''
+            }
+            
+            # Record complete processing flow
+            if self.training_data_recorder is not None:
+                result = self.training_data_recorder.record_complete_processing_flow(processing_data)
+                self.logger.info(f"[AI_TRAINING] Recorded hybrid processing turn with result: {result}")
+            else:
+                self.logger.warning("[AI_TRAINING] Training data recorder not available, skipping recording")
+            
+        except Exception as e:
+            self.logger.error(f"[AI_TRAINING] Failed to record processing result with new recorder: {e}")
 
     # -------- Parallel/timeout helpers --------
 
@@ -1879,7 +2380,7 @@ ORDER BY
             if has_multi_fields:
                 enhanced_query = f"{enhanced_query} (Please provide SQL that returns multiple fields as requested, not just a single value)"
 
-            response = await self.openrouter_client.get_sql_response(
+            response = await self.deepseek_client.get_sql_response(
                 user_query=enhanced_query,
                 schema_context=schema_context,
                 model_type=model_type
@@ -2040,699 +2541,3 @@ ORDER BY
             return "hybrid_parallel"
         else:
             return "local_preferred"
-
-    def calibrate_confidence_thresholds(self, query_analysis: Dict) -> Dict:
-        base = {
-            'local_confidence': 0.7,
-            'skip_api': 0.85,
-            'force_hybrid': 0.3
-        }
-        intent = query_analysis.get('intent')
-        if intent == 'production_summary':
-            base['local_confidence'] -= 0.1
-        if query_analysis.get('entities', {}).get('ctl_codes'):
-            base['skip_api'] += 0.05
-        if len(query_analysis.get('entities', {}).get('aggregations', [])) > 1:
-            base['force_hybrid'] += 0.2
-        if query_analysis.get('intent_confidence', 1.0) < 0.5:
-            base['force_hybrid'] += 0.15
-        return base
-
-
-# ------------------------------ Public HybridProcessor wrapper ------------------------------
-class HybridProcessor(AdvancedParallelProcessor):
-    """Main hybrid processor with backward compatibility and training data collection."""
-
-    async def process_query(self, 
-                          user_query: str, 
-                          schema_context: str = "", 
-                          local_confidence: float = 0.5,
-                          query_type: str = "sql",  # Add query_type parameter
-                          # Phase 5: Add training data collection parameters
-                          turn_id: Optional[int] = None,
-                          session_id: Optional[str] = None,
-                          client_ip: Optional[str] = None,
-                          user_agent: Optional[str] = None,
-                          classification_time_ms: float = 0.0) -> ProcessingResult:
-        """
-        Process query with hybrid AI system and collect training data.
-        
-        Args:
-            user_query: The user's natural language query
-            schema_context: Database schema context
-            local_confidence: Confidence in local model response
-            query_type: Type of query - "sql" (default) or "general"
-            turn_id: Reference to AI_TURN table for training data
-            session_id: Session identifier for user pattern tracking
-            client_ip: Client IP for user pattern tracking
-            user_agent: User agent for user pattern tracking
-            classification_time_ms: Time taken for query classification
-            
-        Returns:
-            ProcessingResult with selected response and metadata
-        """
-        # Call the enhanced processing method
-        result = await self.process_query_advanced(
-            user_query=user_query,
-            schema_context=schema_context,
-            local_confidence=local_confidence,
-            query_type=query_type,  # Pass query_type parameter
-            turn_id=turn_id,
-            session_id=session_id,
-            client_ip=client_ip,
-            user_agent=user_agent,
-            classification_time_ms=classification_time_ms
-        )
-        
-        return result
-
-    def test_training_data_collection(self) -> Dict[str, Any]:
-        """
-        Phase 5: Test the training data collection system.
-        
-        Returns:
-            Test results and system status
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available",
-                "components": {}
-            }
-            
-        try:
-            # Test database connection
-            test_result = {
-                "status": "testing",
-                "timestamp": _dt.now().isoformat(),
-                "components": {}
-            }
-            
-            # Test recorder availability
-            test_result["components"]["recorder_available"] = {
-                "status": "available" if self.training_data_recorder else "unavailable",
-                "details": "HybridDataRecorder instance ready" if self.training_data_recorder else "HybridDataRecorder not initialized"
-            }
-            
-            # Test quality metrics system if available
-            if self.training_data_recorder:
-                try:
-                    quality_test = self.training_data_recorder.test_quality_metrics_system(1)  # 1 hour test
-                    test_result["components"]["quality_metrics"] = {
-                        "status": quality_test["overall_status"],
-                        "details": "Quality metrics system test completed",
-                        "test_results": quality_test
-                    }
-                except Exception as e:
-                    test_result["components"]["quality_metrics"] = {
-                        "status": "error",
-                        "details": f"Quality metrics test failed: {str(e)}",
-                        "error": str(e)
-                    }
-            
-            # Determine overall status
-            component_statuses = [comp["status"] for comp in test_result["components"].values()]
-            if all(status == "available" or status == "success" for status in component_statuses):
-                test_result["status"] = "operational"
-                test_result["message"] = "Training data collection system is fully operational"
-            elif any(status == "error" or status == "failed" for status in component_statuses):
-                test_result["status"] = "degraded"
-                test_result["message"] = "Training data collection system has issues"
-            else:
-                test_result["status"] = "limited"
-                test_result["message"] = "Training data collection system is partially available"
-                
-            return test_result
-            
-        except Exception as e:
-            logger.error(f"[TRAINING_DATA] Failed to test training data collection system: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to test training data collection system: {str(e)}",
-                "error": str(e),
-                "components": {}
-            }
-
-    def get_training_data_status(self) -> Dict[str, Any]:
-        """
-        Phase 5: Get current status of the training data collection system.
-        
-        Returns:
-            System status information
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "system_available": False,
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            # Get system status from the recorder
-            status_info = self.training_data_recorder.get_quality_system_status()
-            
-            return {
-                "system_available": True,
-                "status": status_info.get("overall_status", "unknown"),
-                "message": "Training data collection system status retrieved",
-                "details": status_info
-            }
-            
-        except Exception as e:
-            logger.error(f"[TRAINING_DATA] Failed to get training data collection status: {e}")
-            return {
-                "system_available": True,
-                "status": "error",
-                "message": f"Failed to get training data collection status: {str(e)}",
-                "error": str(e)
-            }
-            
-    # ------------------------------ Phase 6: Continuous Learning Integration ------------------------------
-    def get_learning_insights(self, time_window_hours: int = 24) -> Dict[str, Any]:
-        """
-        Phase 6: Get continuous learning insights.
-        
-        Args:
-            time_window_hours: Time window for analysis
-            
-        Returns:
-            Learning insights from pattern analysis
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            insights = self.training_data_recorder.quality_analyzer.generate_learning_insights(time_window_hours)
-            return {
-                "status": "success",
-                "data": insights,
-                "message": "Learning insights retrieved successfully"
-            }
-        except Exception as e:
-            logger.error(f"[CONTINUOUS_LEARNING] Failed to get learning insights: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to get learning insights: {str(e)}",
-                "error": str(e)
-            }
-            
-    def get_performance_comparison(self, time_window_hours: int = 24) -> Dict[str, Any]:
-        """
-        Phase 6: Get performance comparison between local and API models.
-        
-        Args:
-            time_window_hours: Time window for analysis
-            
-        Returns:
-            Performance comparison metrics by query type
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            comparison = self.training_data_recorder.quality_analyzer.analyze_performance_comparison(time_window_hours)
-            return {
-                "status": "success",
-                "data": comparison,
-                "message": "Performance comparison retrieved successfully"
-            }
-        except Exception as e:
-            logger.error(f"[CONTINUOUS_LEARNING] Failed to get performance comparison: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to get performance comparison: {str(e)}",
-                "error": str(e)
-            }
-            
-    def get_model_strengths(self, time_window_hours: int = 24) -> Dict[str, Any]:
-        """
-        Phase 6: Get model strengths by domain/query type.
-        
-        Args:
-            time_window_hours: Time window for analysis
-            
-        Returns:
-            Model strengths by domain/query type
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            strengths = self.training_data_recorder.quality_analyzer.identify_model_strengths(time_window_hours)
-            return {
-                "status": "success",
-                "data": strengths,
-                "message": "Model strengths retrieved successfully"
-            }
-        except Exception as e:
-            logger.error(f"[CONTINUOUS_LEARNING] Failed to get model strengths: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to get model strengths: {str(e)}",
-                "error": str(e)
-            }
-            
-    def get_user_preferences(self, time_window_hours: int = 24) -> Dict[str, Any]:
-        """
-        Phase 6: Get user preference patterns for different models.
-        
-        Args:
-            time_window_hours: Time window for analysis
-            
-        Returns:
-            User preference patterns analysis
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            preferences = self.training_data_recorder.quality_analyzer.analyze_user_preference_patterns(time_window_hours)
-            return {
-                "status": "success",
-                "data": preferences,
-                "message": "User preferences retrieved successfully"
-            }
-        except Exception as e:
-            logger.error(f"[CONTINUOUS_LEARNING] Failed to get user preferences: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to get user preferences: {str(e)}",
-                "error": str(e)
-            }
-
-    def test_continuous_learning_system(self, time_window_hours: int = 24) -> Dict[str, Any]:
-        """
-        Phase 6: Test the continuous learning system end-to-end.
-        
-        Args:
-            time_window_hours: Time window for testing
-            
-        Returns:
-            Test results and diagnostics for continuous learning system
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            test_results = self.training_data_recorder.test_continuous_learning_system(time_window_hours)
-            return {
-                "status": "success",
-                "data": test_results,
-                "message": "Continuous learning system test completed"
-            }
-        except Exception as e:
-            logger.error(f"[CONTINUOUS_LEARNING] Failed to test continuous learning system: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to test continuous learning system: {str(e)}",
-                "error": str(e)
-            }
-            
-    def get_high_quality_samples(self, time_window_hours: int = 168, min_quality_score: float = 0.8) -> Dict[str, Any]:
-        """
-        Step 6.2: Identify high-quality samples for training data preparation.
-        
-        Args:
-            time_window_hours: Time window for analysis
-            min_quality_score: Minimum quality score threshold
-            
-        Returns:
-            High-quality samples categorized by type
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            samples = self.training_data_recorder.quality_analyzer.identify_high_quality_samples(
-                time_window_hours, min_quality_score
-            )
-            return {
-                "status": "success",
-                "data": samples,
-                "message": "High-quality samples identified successfully"
-            }
-        except Exception as e:
-            logger.error(f"[TRAINING_DATA_PREPARATION] Failed to identify high-quality samples: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to identify high-quality samples: {str(e)}",
-                "error": str(e)
-            }
-            
-    def create_training_dataset(self, dataset_type: str = "manufacturing", time_window_hours: int = 720) -> Dict[str, Any]:
-        """
-        Step 6.2: Create training datasets for different domains.
-        
-        Args:
-            dataset_type: Type of dataset to create
-            time_window_hours: Time window for analysis
-            
-        Returns:
-            Training dataset for the specified type
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE:
-            return {
-                "status": "unavailable",
-                "message": "Training data collection system not available"
-            }
-            
-        try:
-            dataset = self.training_data_recorder.quality_analyzer.create_training_dataset(
-                dataset_type, time_window_hours
-            )
-            return {
-                "status": "success",
-                "data": dataset,
-                "message": f"Training dataset {dataset_type} created successfully"
-            }
-        except Exception as e:
-            logger.error(f"[TRAINING_DATA_PREPARATION] Failed to create training dataset {dataset_type}: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to create training dataset {dataset_type}: {str(e)}",
-                "error": str(e)
-            }
-            
-    def record_training_data(self,
-                           turn_id: int,
-                           classification_result: Any,
-                           processing_result: ProcessingResult,
-                           entities: Dict[str, List[str]] = None,
-                           schema_tables_used: List[str] = None,
-                           business_context: str = "",
-                           sql_execution_success: bool = False,
-                           sql_execution_error: str = None,
-                           result_row_count: int = None,
-                           sql_execution_time_ms: float = None,
-                           classification_time_ms: float = 0.0,
-                           session_id: str = None,
-                           client_ip: str = None,
-                           user_agent: str = None) -> Dict[str, int]:
-        """
-        Phase 5: Convenience method to record training data for hybrid processing.
-        
-        Args:
-            turn_id: Reference to AI_TURN table
-            classification_result: QueryClassification object
-            processing_result: ProcessingResult from hybrid processor
-            entities: Extracted entities from query
-            schema_tables_used: List of database tables referenced
-            business_context: Manufacturing domain context
-            sql_execution_success: Whether final SQL execution was successful
-            sql_execution_error: SQL execution error details
-            result_row_count: Number of rows returned
-            sql_execution_time_ms: SQL execution time
-            classification_time_ms: Time taken for query classification
-            session_id: Session identifier for user pattern tracking
-            client_ip: Client IP for user pattern tracking
-            user_agent: User agent for user pattern tracking
-            
-        Returns:
-            Dictionary with IDs of all created records
-        """
-        if not TRAINING_DATA_COLLECTION_AVAILABLE or not self.training_data_recorder:
-            self.logger.warning("[TRAINING_DATA] Training data collection not available")
-            return {}
-            
-        try:
-            return self.training_data_recorder.record_complete_hybrid_turn(
-                turn_id=turn_id,
-                classification_result=classification_result,
-                processing_result=processing_result,
-                entities=entities or {},
-                schema_tables_used=schema_tables_used or [],
-                business_context=business_context,
-                sql_execution_success=sql_execution_success,
-                sql_execution_error=sql_execution_error,
-                result_row_count=result_row_count,
-                sql_execution_time_ms=sql_execution_time_ms,
-                classification_time_ms=classification_time_ms,
-                session_id=session_id,
-                client_ip=client_ip,
-                user_agent=user_agent
-            )
-        except Exception as e:
-            self.logger.error(f"[TRAINING_DATA] Failed to record training data: {e}")
-            return {}
-
-    def _process_general_query(self, user_query: str, schema_context: str = "", 
-                              file_content: Optional[str] = None, 
-                              file_name: Optional[str] = None) -> ProcessingResult:
-        """
-        Process general knowledge queries using API models without fallback to local models.
-        """
-        start_time = time.time()
-        
-        try:
-            # Use OpenRouter client for general knowledge queries
-            from .openrouter_client import get_openrouter_client
-            client = get_openrouter_client()
-            
-            # Check if this is a file analysis request
-            if file_content and file_name:
-                # File analysis mode - use multimodal capabilities
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Please analyze the following file and answer the question: {user_query}\n\nFile Name: {file_name}"
-                            },
-                            {
-                                "type": "text",
-                                "text": f"File Content:\n{file_content}"
-                            }
-                        ]
-                    }
-                ]
-            else:
-                # Regular general knowledge mode
-                messages = [
-                    {"role": "system", "content": schema_context},
-                    {"role": "user", "content": user_query}
-                ]
-            
-            # Use appropriate model for general queries
-            # Use the general model configuration from config
-            model_config = config.API_MODELS.get("general", {
-                "primary": "meta-llama/llama-3.3-8b-instruct:free",
-                "secondary": "openchat/openchat-8b",
-                "fallback": "microsoft/WizardLM-2-8x22B"
-            })
-            
-            # For file analysis, use Gemini Flash 1.5 exclusively
-            if file_content and file_name:
-                model = "google/gemini-flash-1.5"
-            else:
-                model = model_config["primary"]
-            
-            # Make API call
-            response = client._make_request_sync({  # Use sync version to avoid async issues
-                "model": model,
-                "messages": messages,
-                "temperature": 0.3 if file_content and file_name else 0.7,  # Lower temperature for file analysis
-                "max_tokens": 2048 if file_content and file_name else 1024
-            })
-            
-            processing_time = time.time() - start_time
-            
-            if response.success and response.content:
-                return ProcessingResult(
-                    selected_response=response.content,
-                    local_response=None,
-                    api_response=response.content,
-                    processing_mode="file_analysis" if file_content and file_name else "general_query",
-                    selection_reasoning="Generated response for file analysis" if file_content and file_name else "Generated response for general knowledge query",
-                    local_confidence=0.0,
-                    api_confidence=0.95 if file_content and file_name else 0.9,  # Higher confidence for file analysis
-                    processing_time=processing_time,
-                    model_used=model,
-                    local_model_name=None,
-                    api_model_name=model,
-                    local_processing_time=None,
-                    api_processing_time=processing_time
-                )
-            else:
-                # For general mode, don't fallback to local model - return error instead
-                processing_time = time.time() - start_time
-                
-                return ProcessingResult(
-                    selected_response=f"Sorry, I couldn't process that general question. The API service is currently unavailable. Please try again later.",
-                    local_response=None,
-                    api_response=None,
-                    processing_mode="general_query_api_error",
-                    selection_reasoning="API service unavailable for general query",
-                    local_confidence=0.0,
-                    api_confidence=0.0,
-                    processing_time=processing_time,
-                    model_used="api_error",
-                    local_model_name=None,
-                    api_model_name=None,
-                    local_processing_time=None,
-                    api_processing_time=None
-                )
-                
-        except Exception as e:
-            self.logger.error(f"[HYBRID_PROCESSOR] General query processing failed: {e}")
-            processing_time = time.time() - start_time
-            
-            return ProcessingResult(
-                selected_response=f"Sorry, I couldn't process that general question: {str(e)}",
-                local_response=None,
-                api_response=None,
-                processing_mode="general_query_error",
-                selection_reasoning=f"Error during general query processing: {str(e)}",
-                local_confidence=0.0,
-                api_confidence=0.0,
-                processing_time=processing_time,
-                model_used="error",
-                local_model_name=None,
-                api_model_name=None,
-                local_processing_time=None,
-                api_processing_time=None
-            )
-
-    async def _process_general_query(self, user_query: str, schema_context: str, file_content: Optional[str] = None, file_name: Optional[str] = None) -> ProcessingResult:
-        """
-        Process general knowledge queries that don't require SQL generation.
-        
-        Args:
-            user_query: The user's general knowledge question
-            schema_context: Context/instructions for the AI model
-            file_content: Optional file content for file analysis
-            file_name: Optional file name for file analysis
-            
-        Returns:
-            ProcessingResult with the general knowledge response
-        """
-        start_time = time.time()
-        
-        try:
-            # Use OpenRouter client for general knowledge queries
-            from .openrouter_client import get_openrouter_client
-            client = get_openrouter_client()
-            
-            # Check if this is a file analysis request
-            if file_content and file_name:
-                # File analysis mode - use multimodal capabilities
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Please analyze the following file and answer the question: {user_query}\n\nFile Name: {file_name}"
-                            },
-                            {
-                                "type": "text",
-                                "text": f"File Content:\n{file_content}"
-                            }
-                        ]
-                    }
-                ]
-            else:
-                # Regular general knowledge mode
-                messages = [
-                    {"role": "system", "content": schema_context},
-                    {"role": "user", "content": user_query}
-                ]
-            
-            # Use appropriate model for general queries
-            # Use the general model configuration from config
-            model_config = config.API_MODELS.get("general", {
-                "primary": "meta-llama/llama-3.3-8b-instruct:free",
-                "secondary": "openchat/openchat-8b",
-                "fallback": "microsoft/WizardLM-2-8x22B"
-            })
-            
-            # For file analysis, use Gemini Flash 1.5 exclusively
-            if file_content and file_name:
-                model = "google/gemini-flash-1.5"
-            else:
-                model = model_config["primary"]
-            
-            # Make API call
-            response = await client.chat_completion(
-                messages=messages,
-                model=model,
-                temperature=0.3 if file_content and file_name else 0.7,  # Lower temperature for file analysis
-                max_tokens=2048 if file_content and file_name else 1024
-            )
-            
-            processing_time = time.time() - start_time
-            
-            if response.success and response.content:
-                return ProcessingResult(
-                    selected_response=response.content,
-                    local_response=None,
-                    api_response=response.content,
-                    processing_mode="file_analysis" if file_content and file_name else "general_query",
-                    selection_reasoning="Generated response for file analysis" if file_content and file_name else "Generated response for general knowledge query",
-                    local_confidence=0.0,
-                    api_confidence=0.95 if file_content and file_name else 0.9,  # Higher confidence for file analysis
-                    processing_time=processing_time,
-                    model_used=model,
-                    local_model_name=None,
-                    api_model_name=model,
-                    local_processing_time=None,
-                    api_processing_time=processing_time
-                )
-            else:
-                # For general mode, don't fallback to local model - return error instead
-                # This ensures that general mode uses API models independently
-                processing_time = time.time() - start_time
-                
-                return ProcessingResult(
-                    selected_response=f"Sorry, I couldn't process that general question. The API service is currently unavailable or taking too long to respond. Please try again later.",
-                    local_response=None,
-                    api_response=None,
-                    processing_mode="general_query_api_error",
-                    selection_reasoning="API service unavailable or timeout for general query",
-                    local_confidence=0.0,
-                    api_confidence=0.0,
-                    processing_time=processing_time,
-                    model_used="api_error",
-                    local_model_name=None,
-                    api_model_name=None,
-                    local_processing_time=None,
-                    api_processing_time=None
-                )
-                
-        except Exception as e:
-            self.logger.error(f"[HYBRID_PROCESSOR] General query processing failed: {e}")
-            processing_time = time.time() - start_time
-            
-            return ProcessingResult(
-                selected_response=f"Sorry, I couldn't process that general question: {str(e)}",
-                local_response=None,
-                api_response=None,
-                processing_mode="general_query_error",
-                selection_reasoning=f"Error during general query processing: {str(e)}",
-                local_confidence=0.0,
-                api_confidence=0.0,
-                processing_time=processing_time,
-                model_used="error",
-                local_model_name=None,
-                api_model_name=None,
-                local_processing_time=None,
-                api_processing_time=None
-            )

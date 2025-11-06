@@ -1,4 +1,4 @@
-// src/components/DataTable.tsx
+// src/components/PaginatedDataTable.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Copy,
@@ -9,7 +9,8 @@ import {
   ChevronDown,
   BarChart,
   Table,
-  AlertTriangle
+  AlertTriangle,
+  Loader2
 } from "lucide-react";
 import DataVisualization, { type DataVisualizationHandle } from "./DataVisualization";
 import { exportExcel, exportPDF, toCSV } from "../utils/exportUtils";
@@ -22,7 +23,24 @@ type TableMetadata = {
   total_rows_available?: number;
   rows_returned?: number;
   results_truncated?: boolean;
+  current_page?: number;
+  page_size?: number;
+  total_pages?: number;
 };
+
+// Define the props for the paginated data table
+interface PaginatedDataTableProps {
+  initialData: TableData | { columns: string[]; rows: any[]; metadata?: TableMetadata };
+  queryId?: string; // ID to use for fetching more data
+  onFetchData?: (page: number, pageSize: number) => Promise<{
+    rows: any[];
+    metadata: TableMetadata;
+  }>;
+  // Additional props for server-side pagination
+  question?: string;
+  mode?: string;
+  selectedDB?: string;
+}
 
 function isNumericValue(v: unknown): boolean {
   if (typeof v === "number") return true;
@@ -45,21 +63,21 @@ function triggerDownload(url: string, filename: string) {
   }, 200);
 }
 
-export default function DataTable({ data }: { data: TableData | { columns: string[]; rows: any[]; metadata?: TableMetadata } }) {
+export default function PaginatedDataTable({ initialData, queryId, onFetchData, question, mode, selectedDB }: PaginatedDataTableProps) {
   // Handle both old format (array of arrays) and new format (object with metadata)
   const { headers, rawRows, metadata } = useMemo(() => {
-    if (Array.isArray(data)) {
+    if (Array.isArray(initialData)) {
       // Old format - array of arrays
-      const headers = Array.isArray(data?.[0]) ? (data[0] as string[]) : [];
-      const rawRows = Array.isArray(data) ? data.slice(1) : [];
+      const headers = Array.isArray(initialData?.[0]) ? (initialData[0] as string[]) : [];
+      const rawRows = Array.isArray(initialData) ? initialData.slice(1) : [];
       return { headers, rawRows, metadata: undefined };
     } else {
       // New format - object with columns, rows, and metadata
-      const headers = Array.isArray(data.columns) ? data.columns : [];
-      const rawRows = Array.isArray(data.rows) ? data.rows : [];
-      return { headers, rawRows, metadata: data.metadata };
+      const headers = Array.isArray(initialData.columns) ? initialData.columns : [];
+      const rawRows = Array.isArray(initialData.rows) ? initialData.rows : [];
+      return { headers, rawRows, metadata: initialData.metadata };
     }
-  }, [data]);
+  }, [initialData]);
   
   // Ensure all rows are arrays
   const safeRawRows = rawRows.map(row => Array.isArray(row) ? row : []);
@@ -92,9 +110,12 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
   const [sort, setSort] = useState<{ col: number; dir: "asc" | "desc" } | null>(
     null
   );
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
+  const [page, setPage] = useState(metadata?.current_page || 1);
+  const [pageSize, setPageSize] = useState(metadata?.page_size || 1000);
   const [full, setFull] = useState(false); // ⬅ real fullscreen now
+  const [loading, setLoading] = useState(false);
+  const [tableData, setTableData] = useState(safeRawRows);
+  const [tableMetadata, setTableMetadata] = useState(metadata);
 
   // Lock body scroll + ESC to close when fullscreen
   useEffect(() => {
@@ -111,13 +132,93 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
     };
   }, [full]);
 
+  // Fetch data when page or page size changes
+  useEffect(() => {
+    // If we have a custom fetch function, use it
+    if (onFetchData && (page !== (metadata?.current_page || 1) || pageSize !== (metadata?.page_size || 1000))) {
+      setLoading(true);
+      onFetchData(page, pageSize)
+        .then((result) => {
+          setTableData(result.rows);
+          setTableMetadata(result.metadata);
+          setLoading(false);
+        })
+        .catch((error) => {
+          console.error("Failed to fetch data:", error);
+          setLoading(false);
+        });
+    }
+    // If we have question data, fetch from the backend
+    else if (question && (page !== (metadata?.current_page || 1) || pageSize !== (metadata?.page_size || 1000))) {
+      setLoading(true);
+      
+      // Prepare the request payload
+      const bodyPayload: any = {
+        question: question,
+        mode: mode || "PRAN ERP", // Default to PRAN ERP if not specified
+        page: page,
+        page_size: pageSize
+      };
+      
+      // Only include selected_db when not in General mode
+      if (mode !== "General" && selectedDB) {
+        bodyPayload.selected_db = selectedDB;
+      } else {
+        // Explicitly ensure General carries no DB
+        bodyPayload.selected_db = "";
+      }
+      
+      // Make the API call to fetch paginated data
+      fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bodyPayload),
+      })
+        .then(response => response.json())
+        .then(payload => {
+          if (payload?.status === "success" && payload?.results?.columns) {
+            const columns: string[] = payload.results.columns || [];
+            const rows: any[] = payload.results.rows || [];
+            
+            // Convert array of objects to array of arrays if needed
+            let tableRows: (string | number | null)[][] = [];
+            if (rows.length > 0) {
+              // Check if rows are objects (from backend) or already arrays
+              if (typeof rows[0] === 'object' && rows[0] !== null && !Array.isArray(rows[0])) {
+                // Convert objects to arrays using column order
+                tableRows = rows.map(row => 
+                  columns.map(col => 
+                    row[col] !== undefined ? row[col] : null
+                  )
+                );
+              } else {
+                // Rows are already arrays
+                tableRows = rows as (string | number | null)[][];
+              }
+            }
+            
+            setTableData(tableRows);
+            setTableMetadata(payload.results.metadata);
+          } else {
+            // Handle error case
+            console.error("Failed to fetch paginated data:", payload);
+          }
+          setLoading(false);
+        })
+        .catch(error => {
+          console.error("Failed to fetch paginated data:", error);
+          setLoading(false);
+        });
+    }
+  }, [page, pageSize, onFetchData, metadata, question, mode, selectedDB]);
+
   const filtered = useMemo(() => {
-    if (!query.trim()) return safeRawRows;
+    if (!query.trim()) return tableData;
     const q = query.toLowerCase();
-    return safeRawRows.filter((r) =>
+    return tableData.filter((r) =>
       r.some((c) => String(c ?? "").toLowerCase().includes(q))
     );
-  }, [query, safeRawRows]);
+  }, [query, tableData]);
 
   const sorted = useMemo(() => {
     if (!sort) return filtered;
@@ -135,10 +236,10 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
     return copy;
   }, [filtered, sort]);
 
-  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const totalPages = tableMetadata?.total_pages || Math.max(1, Math.ceil((tableMetadata?.total_rows_available || 0) / pageSize));
   const currentPage = Math.min(page, totalPages);
   const sliceStart = (currentPage - 1) * pageSize;
-  const pageRows = sorted.slice(sliceStart, sliceStart + pageSize);
+  const pageRows = sorted; // For server-side pagination, we already have the correct page
 
   // ---- EXPORTS ----
   const tableAll: (string | number | null)[][] = useMemo(
@@ -246,12 +347,12 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex items-center gap-2">
           <div className="text-xs text-gray-600 mr-2 dark:text-gray-400">
-            {sorted.length.toLocaleString()} row{sorted.length === 1 ? "" : "s"}
+            {tableMetadata?.total_rows_available?.toLocaleString() || sorted.length.toLocaleString()} row{tableMetadata?.total_rows_available === 1 ? "" : "s"}
           </div>
           
           {/* Warning icon for truncated results */}
-          {metadata?.results_truncated && (
-            <div className="flex items-center gap-1 text-xs text-yellow-600 dark:text-yellow-400" title={`Showing ${metadata.rows_returned} of ${metadata.total_rows_available} total rows`}>
+          {tableMetadata?.results_truncated && (
+            <div className="flex items-center gap-1 text-xs text-yellow-600 dark:text-yellow-400" title={`Showing ${tableMetadata.rows_returned} of ${tableMetadata.total_rows_available} total rows`}>
               <AlertTriangle size={14} />
               <span>Results truncated</span>
             </div>
@@ -282,7 +383,7 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
           className="text-sm border rounded-lg py-1.5 px-2 bg-white dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100"
           title="Rows per page"
         >
-          {[10, 25, 50, 100].map((n) => (
+          {[10, 25, 50, 100, 500, 1000].map((n) => (
             <option key={n} value={n} className="dark:bg-gray-800 dark:text-gray-100">
               {n} / page
             </option>
@@ -505,19 +606,36 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
                   </tr>
                 </thead>
                 <tbody>
-                  {pageRows.map((row, rowIdx) => (
-                    <tr key={rowIdx} className={rowIdx % 2 === 0 ? "bg-white dark:bg-gray-800" : "bg-gray-50 dark:bg-gray-900"}>
-                      {row.map((cell, cellIdx) => (
-                        <td
-                          key={cellIdx}
-                          className="px-3 py-2 text-sm text-gray-900 whitespace-nowrap max-w-[150px] truncate dark:text-gray-100"
-                          title={String(cell ?? "")}
-                        >
-                          {formatCell(cell, cellIdx)}
-                        </td>
-                      ))}
+                  {loading ? (
+                    <tr>
+                      <td colSpan={headers.length} className="px-3 py-2 text-center">
+                        <div className="flex items-center justify-center py-4">
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Loading data...
+                        </div>
+                      </td>
                     </tr>
-                  ))}
+                  ) : pageRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={headers.length} className="px-3 py-2 text-center text-gray-500">
+                        No data available
+                      </td>
+                    </tr>
+                  ) : (
+                    pageRows.map((row, rowIdx) => (
+                      <tr key={rowIdx} className={rowIdx % 2 === 0 ? "bg-white dark:bg-gray-800" : "bg-gray-50 dark:bg-gray-900"}>
+                        {row.map((cell, cellIdx) => (
+                          <td
+                            key={cellIdx}
+                            className="px-3 py-2 text-sm text-gray-900 whitespace-nowrap max-w-[150px] truncate dark:text-gray-100"
+                            title={String(cell ?? "")}
+                          >
+                            {formatCell(cell, cellIdx)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))
+                  )}
                 </tbody>
               </table>
 
@@ -526,7 +644,7 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
                 <div className="flex flex-1 justify-between sm:hidden">
                   <button
                     onClick={() => setPage((p) => Math.max(1, p - 1))}
-                    disabled={currentPage <= 1}
+                    disabled={currentPage <= 1 || loading}
                     className="relative inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 smooth-hover hover-lift dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700"
                     type="button"
                   >
@@ -534,7 +652,7 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
                   </button>
                   <button
                     onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                    disabled={currentPage >= totalPages}
+                    disabled={currentPage >= totalPages || loading}
                     className="relative ml-3 inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 smooth-hover hover-lift dark:bg-gray-800 dark:border-gray-700 dark:text-gray-100 dark:hover:bg-gray-700"
                     type="button"
                   >
@@ -547,10 +665,10 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
                     <p className="text-sm text-gray-700 dark:text-gray-300">
                       Showing <span className="font-medium">{sliceStart + 1}</span> to{" "}
                       <span className="font-medium">{sliceStart + pageRows.length}</span> of{" "}
-                      <span className="font-medium">{sorted.length}</span> results
-                      {metadata?.results_truncated && metadata?.total_rows_available && (
+                      <span className="font-medium">{tableMetadata?.total_rows_available?.toLocaleString() || sorted.length}</span> results
+                      {tableMetadata?.results_truncated && tableMetadata?.total_rows_available && (
                         <span className="ml-2 text-yellow-600 dark:text-yellow-400">
-                          (of {metadata.total_rows_available.toLocaleString()} total)
+                          (of {tableMetadata.total_rows_available.toLocaleString()} total)
                         </span>
                       )}
                     </p>
@@ -559,7 +677,7 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
                     <nav className="isolate inline-flex -space-x-px rounded-md shadow-sm" aria-label="Pagination">
                       <button
                         onClick={() => setPage((p) => Math.max(1, p - 1))}
-                        disabled={currentPage <= 1}
+                        disabled={currentPage <= 1 || loading}
                         className="relative inline-flex items-center rounded-l-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 smooth-hover hover-lift dark:bg-gray-800 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-700"
                         type="button"
                       >
@@ -576,6 +694,7 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
                             <button
                               key={pageNum}
                               onClick={() => setPage(pageNum)}
+                              disabled={loading}
                               className={`relative inline-flex items-center px-4 py-2 text-sm font-semibold ${
                                 currentPage === pageNum
                                   ? "z-10 bg-primary-purple-600 text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-purple-600"
@@ -600,7 +719,7 @@ export default function DataTable({ data }: { data: TableData | { columns: strin
                       })}
                       <button
                         onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                        disabled={currentPage >= totalPages}
+                        disabled={currentPage >= totalPages || loading}
                         className="relative inline-flex items-center rounded-r-md px-2 py-2 text-gray-400 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 focus:z-20 focus:outline-offset-0 smooth-hover hover-lift dark:bg-gray-800 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-700"
                         type="button"
                       >

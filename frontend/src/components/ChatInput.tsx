@@ -147,7 +147,8 @@ export default function ChatInput() {
       onSubmit={handleSubmit}
       className="w-full flex justify-center px-4 pb-4 relative z-20"
     >
-      <div className="w-full max-w-2xl">
+      {/* Responsive container that adjusts based on screen size */}
+      <div className="w-full max-w-2xl md:max-w-3xl lg:max-w-4xl xl:max-w-5xl 2xl:max-w-6xl">
         {/* Container with drag&drop support */}
         <div
           onDragOver={handleDragOver}

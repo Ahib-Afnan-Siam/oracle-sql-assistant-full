@@ -56,15 +56,81 @@ const ChartComponent = forwardRef<ChartComponentHandle, ChartComponentProps>(
 
       if (canvasRef.current) {
         try {
-          const newInstance = new Chart(canvasRef.current, {
+          // OPTIMIZATION: Configure Chart.js for better performance with large datasets
+          const chartConfig = {
             type,
             data,
             options: {
               responsive: true,
               maintainAspectRatio: false,
-              ...options,
+              // Performance optimizations
+              animation: {
+                duration: 0 // Disable animations for large datasets
+              },
+              hover: {
+                animationDuration: 0 // Disable hover animations
+              },
+              responsiveAnimationDuration: 0, // Disable resize animations
+              // Reduce the number of ticks for better performance
+              scales: {
+                ...options.scales,
+                x: {
+                  ...options.scales?.x,
+                  // For bar and line charts with many data points, limit the number of ticks
+                  ticks: {
+                    ...options.scales?.x?.ticks,
+                    maxTicksLimit: 20, // Limit x-axis ticks
+                    autoSkip: true,
+                    autoSkipPadding: 10
+                  }
+                },
+                y: {
+                  ...options.scales?.y,
+                  // For y-axis, also limit ticks
+                  ticks: {
+                    ...options.scales?.y?.ticks,
+                    maxTicksLimit: 15, // Limit y-axis ticks
+                    autoSkip: true
+                  }
+                }
+              },
+              plugins: {
+                ...options.plugins,
+                // Optimize legend for performance
+                legend: {
+                  ...options.plugins?.legend,
+                  labels: {
+                    ...options.plugins?.legend?.labels,
+                    usePointStyle: true,
+                    // Reduce legend item rendering for large datasets
+                    filter: (item: any, chart: any) => {
+                      // For very large datasets, only show first few legend items
+                      if (data.labels.length > 1000) {
+                        return chart.data.datasets.findIndex((d: any) => d.label === item.text) < 3;
+                      }
+                      return true;
+                    }
+                  }
+                }
+              },
+              // For pie/doughnut charts with many segments, group small values
+              ...(type === 'pie' || type === 'doughnut') && data.labels.length > 50 && {
+                plugins: {
+                  ...options.plugins,
+                  tooltip: {
+                    ...options.plugins?.tooltip,
+                    callbacks: {
+                      label: function(context: any) {
+                        return `${context.label}: ${context.parsed}`;
+                      }
+                    }
+                  }
+                }
+              }
             },
-          });
+          };
+
+          const newInstance = new Chart(canvasRef.current, chartConfig);
           setChartInstance(newInstance);
         } catch (e) {
           console.error("Chart init error:", e);

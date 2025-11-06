@@ -1,7 +1,7 @@
 # backend/app/query_classifier.py
 import re
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
 from dataclasses import dataclass
 from datetime import datetime as _dt
@@ -365,7 +365,7 @@ class ConfidenceThresholdManager:
         
         return False
     
-    def get_processing_decision(self, local_confidence: float, classification: QueryClassification) -> Dict[str, any]:
+    def get_processing_decision(self, local_confidence: float, classification: QueryClassification) -> Dict[str, Any]:
         """Get comprehensive processing decision."""
         
         decision = {

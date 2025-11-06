@@ -17,11 +17,11 @@ from app.ollama_llm import ask_analytical_model_async
 from app.config import (
     SUMMARY_MAX_ROWS,
     SUMMARY_CHAR_BUDGET,
-    OPENROUTER_ENABLED,
+    DEEPSEEK_ENABLED as OPENROUTER_ENABLED,  # Use DEEPSEEK_ENABLED instead of OPENROUTER_ENABLED
     SUMMARY_ENGINE,
 )
-# Use the SOS-specific OpenRouter client
-from .openrouter_client import OpenRouterClient
+# Use the SOS-specific DeepSeek client
+from .deepseek_client import DeepSeekClient
 from app.config import API_MODELS
 
 logger = logging.getLogger(__name__)
@@ -492,7 +492,7 @@ def _create_summarization_prompt(
     prompt = (
         "You are an intelligent data analyst assistant for a manufacturing company. "
         "Your task is to provide a comprehensive and detailed summary report based on "
-        "the database query results.\n"
+        "the database query results. ALL RESPONSES MUST BE IN ENGLISH LANGUAGE.\n"
         f'User Question: "{user_query}"\n'
         f"Database Query Results:\n{data_summary}\n"
     )
@@ -651,7 +651,7 @@ async def _generate_api_summary_async(
         model = _select_summarization_model(user_query, len(rows))
 
         # Call the API
-        client = OpenRouterClient()
+        client = DeepSeekClient()
         response = await client.chat_completion(
             messages=[{"role": "user", "content": prompt}],
             model=model,

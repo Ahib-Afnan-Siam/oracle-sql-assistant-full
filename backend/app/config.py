@@ -104,11 +104,11 @@ SUMMARIZATION_CONFIG = {
 
 # Database Query Configuration
 DATABASE_CONFIG = {
-    "query_timeout_ms": int(os.getenv("DATABASE_QUERY_TIMEOUT_MS", "5000")),  # Reduced to 5 seconds for faster failure
-    "connection_timeout_ms": int(os.getenv("DATABASE_CONNECTION_TIMEOUT_MS", "3000")),  # Reduced to 3 seconds
-    "retry_attempts": int(os.getenv("DATABASE_RETRY_ATTEMPTS", "1")),  # Reduced to 1 retry for faster failure
-    "retry_delay_ms": int(os.getenv("DATABASE_RETRY_DELAY_MS", "500")),  # Reduced to 0.5 seconds
-    "network_timeout_ms": int(os.getenv("DATABASE_NETWORK_TIMEOUT_MS", "3000"))  # Reduced to 3 seconds
+    "query_timeout_ms": int(os.getenv("DATABASE_QUERY_TIMEOUT_MS", "300000")),  # Increased to 5 minutes for large queries
+    "connection_timeout_ms": int(os.getenv("DATABASE_CONNECTION_TIMEOUT_MS", "10000")),  # Increased to 10 seconds
+    "retry_attempts": int(os.getenv("DATABASE_RETRY_ATTEMPTS", "2")),  # Increased to 2 retries
+    "retry_delay_ms": int(os.getenv("DATABASE_RETRY_DELAY_MS", "1000")),  # Increased to 1 second
+    "network_timeout_ms": int(os.getenv("DATABASE_NETWORK_TIMEOUT_MS", "10000"))  # Increased to 10 seconds
 }
 
 # Flattened variables for easier import
@@ -152,12 +152,12 @@ FEEDBACK_DB_ID = os.getenv("FEEDBACK_DB_ID", "source_db_1")
 FEEDBACK_DB_ID = os.getenv("FEEDBACK_DB_ID", "source_db_1")
 
 # ============================================================================
-# HYBRID AI SYSTEM - OpenRouter API Configuration
+# HYBRID AI SYSTEM - DeepSeek API Configuration
 # ============================================================================
 
-# OpenRouter API Configuration
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
+# DeepSeek API Configuration
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-8e0c0a38e0cf4bdcbcf2609deef16a42")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1/chat/completions")
 
 # Hybrid System Configuration
 HYBRID_ENABLED = os.getenv("HYBRID_ENABLED", "true").lower() == "true"
@@ -166,24 +166,24 @@ HYBRID_MODE = os.getenv("HYBRID_MODE", "parallel")  # "parallel" or "fallback"
 # API Models Configuration (Primary, Secondary, Fallback)
 API_MODELS = {
     "production": {
-        "primary": os.getenv("API_MODEL_PRODUCTION_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "secondary": os.getenv("API_MODEL_PRODUCTION_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "fallback": os.getenv("API_MODEL_PRODUCTION_FALLBACK", "google/gemini-flash-1.5:free")
+        "primary": os.getenv("API_MODEL_PRODUCTION_PRIMARY", "deepseek-chat"),
+        "secondary": os.getenv("API_MODEL_PRODUCTION_SECONDARY", "deepseek-chat"),
+        "fallback": os.getenv("API_MODEL_PRODUCTION_FALLBACK", "deepseek-chat")
     },
     "hr": {
-        "primary": os.getenv("API_MODEL_HR_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "secondary": os.getenv("API_MODEL_HR_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "fallback": os.getenv("API_MODEL_HR_FALLBACK", "google/gemini-flash-1.5:free")
+        "primary": os.getenv("API_MODEL_HR_PRIMARY", "deepseek-chat"),
+        "secondary": os.getenv("API_MODEL_HR_SECONDARY", "deepseek-chat"),
+        "fallback": os.getenv("API_MODEL_HR_FALLBACK", "deepseek-chat")
     },
     "tna": {
-        "primary": os.getenv("API_MODEL_TNA_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "secondary": os.getenv("API_MODEL_TNA_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "fallback": os.getenv("API_MODEL_TNA_FALLBACK", "google/gemini-flash-1.5:free")
+        "primary": os.getenv("API_MODEL_TNA_PRIMARY", "deepseek-chat"),
+        "secondary": os.getenv("API_MODEL_TNA_SECONDARY", "deepseek-chat"),
+        "fallback": os.getenv("API_MODEL_TNA_FALLBACK", "deepseek-chat")
     },
     "general": {
-        "primary": os.getenv("API_MODEL_GENERAL_PRIMARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "secondary": os.getenv("API_MODEL_GENERAL_SECONDARY", "meta-llama/llama-3.3-8b-instruct:free"),
-        "fallback": os.getenv("API_MODEL_GENERAL_FALLBACK", "google/gemini-flash-1.5:free")
+        "primary": os.getenv("API_MODEL_GENERAL_PRIMARY", "deepseek-chat"),
+        "secondary": os.getenv("API_MODEL_GENERAL_SECONDARY", "deepseek-chat"),
+        "fallback": os.getenv("API_MODEL_GENERAL_FALLBACK", "deepseek-chat")
     }
 }
 
@@ -215,5 +215,9 @@ DAILY_API_CALL_LIMIT = int(os.getenv("DAILY_API_CALL_LIMIT", "1000"))
 EMERGENCY_LOCAL_ONLY = os.getenv("EMERGENCY_LOCAL_ONLY", "false").lower() == "true"
 
 # Flattened API configuration for easier import
-OPENROUTER_ENABLED = HYBRID_ENABLED and bool(OPENROUTER_API_KEY)
+DEEPSEEK_ENABLED = HYBRID_ENABLED and bool(DEEPSEEK_API_KEY)
 DEFAULT_API_MODEL = API_MODELS["general"]["primary"]
+
+# API Client Referer Configuration
+API_CLIENT_REFERER = os.getenv("API_CLIENT_REFERER", "https://uttoron.com")
+API_CLIENT_TITLE = os.getenv("API_CLIENT_TITLE", "Uttoron - SQL Assistant")

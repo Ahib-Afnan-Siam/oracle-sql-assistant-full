@@ -1,0 +1,176 @@
+.login-container {
+  background-image: url('/gradient-bg.png');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+/* Fade in and slide up animation for the card */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.7s ease-out forwards;
+}
+
+/* Delay classes for staggered animations */
+.delay-300 {
+  animation-delay: 0.3s;
+  opacity: 0;
+  animation-fill-mode: forwards;
+}
+
+.delay-500 {
+  animation-delay: 0.5s;
+  opacity: 0;
+  animation-fill-mode: forwards;
+}
+
+.delay-700 {
+  animation-delay: 0.7s;
+  opacity: 0;
+  animation-fill-mode: forwards;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.5s ease-out forwards;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Logo breathing animation */
+@keyframes logoBreath {
+  0% {
+    transform: scale(0.95);
+  }
+  50% {
+    transform: scale(1);
+  }
+  100% {
+    transform: scale(0.95);
+  }
+}
+
+.animate-logo-breath img {
+  animation: logoBreath 3s ease-in-out infinite;
+}
+
+/* Logo glow effect */
+.logo-glow {
+  position: absolute;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(192, 132, 252, 0.4) 0%, rgba(192, 132, 252, 0) 70%);
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 0;
+  animation: glowPulse 3s ease-in-out infinite;
+}
+
+@keyframes glowPulse {
+  0% {
+    opacity: 0.3;
+    transform: translate(-50%, -50%) scale(0.8);
+  }
+  50% {
+    opacity: 0.6;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  100% {
+    opacity: 0.3;
+    transform: translate(-50%, -50%) scale(0.8);
+  }
+}
+
+/* Input field animations */
+.input-field {
+  transition: all 0.3s ease;
+}
+
+.input-field:focus {
+  box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.3);
+  border-color: #c084fc;
+}
+
+/* Button hover wave effect */
+.login-button {
+  background: linear-gradient(90deg, #9333ea, #c084fc, #9333ea);
+  background-size: 200% 200%;
+  transition: all 0.3s ease;
+}
+
+.login-button:hover {
+  background-position: 100% 0;
+  transform: translateY(-2px);
+}
+
+.login-button:active {
+  transform: translateY(0) scale(0.98);
+}
+
+/* Button loading state */
+.button-content {
+  transition: all 0.3s ease;
+}
+
+/* Shake animation for errors */
+@keyframes shake {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  20%, 60% {
+    transform: translateX(-2px);
+  }
+  40%, 80% {
+    transform: translateX(2px);
+  }
+}
+
+.shake {
+  animation: shake 0.5s ease-in-out;
+}
+
+/* Responsive adjustments */
+@media (max-width: 640px) {
+  .login-card {
+    margin: 1rem;
+    padding: 1.5rem;
+  }
+  
+  .logo-glow {
+    width: 50px;
+    height: 50px;
+  }
+}
+
+/* Extra small devices */
+@media (max-width: 480px) {
+  .login-card {
+    margin: 0.5rem;
+    padding: 1rem;
+  }
+  
+  .logo-glow {
+    width: 40px;
+    height: 40px;
+  }
+}

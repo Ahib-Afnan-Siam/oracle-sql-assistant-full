@@ -2,7 +2,7 @@
 import logging
 import time
 import asyncio
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 from dataclasses import dataclass
 from app.ERP_R12_Test_DB.query_router import route_query
 from app.ERP_R12_Test_DB.query_classifier import QueryClassifier
@@ -13,8 +13,8 @@ from app.config import (
     SKIP_API_THRESHOLD, FORCE_HYBRID_THRESHOLD,
     API_MODELS
 )
-# Use the ERP-specific OpenRouter client
-from app.ERP_R12_Test_DB.openrouter_client import get_erp_openrouter_client, OpenRouterError
+# Use the ERP-specific DeepSeek client
+from app.ERP_R12_Test_DB.deepseek_client import get_erp_deepseek_client, DeepSeekError
 
 logger = logging.getLogger(__name__)
 # Set logger level to INFO to reduce verbosity
@@ -64,6 +64,98 @@ class ERPHybridProcessor:
         }
         self.query_classifier = QueryClassifier()
     
+    def _discover_erp_tables(self) -> List[str]:
+        """
+        Dynamically discover all ERP tables from the vector store.
+        
+        Returns:
+            List of table names discovered in the vector store
+        """
+        try:
+            # Search for table information in the vector store
+            table_docs = search_similar_schema("ERP R12 tables", "source_db_2", top_k=100)
+            
+            # Extract unique table names from the documents
+            table_names = set()
+            for doc in table_docs:
+                if 'document' in doc and 'metadata' in doc:
+                    # Check if this document is about a table
+                    if doc['metadata'].get('kind') == 'table':
+                        table_name = doc['metadata'].get('table')
+                        if table_name:
+                            table_names.add(table_name)
+                    # Also check for table names mentioned in the document content
+                    elif 'document' in doc:
+                        # Look for common ERP R12 table patterns
+                        content = doc['document'].upper()
+                        # Use a more comprehensive list of known ERP tables
+                        erp_tables = [
+                            "HR_OPERATING_UNITS", "ORG_ORGANIZATION_DEFINITIONS", 
+                            "MTL_ONHAND_QUANTITIES_DETAIL", "MTL_SECONDARY_INVENTORIES",
+                            "MTL_MATERIAL_TRANSACTIONS", "MTL_SYSTEM_ITEMS_B",
+                            "MTL_ITEM_CATEGORIES", "MTL_CATEGORIES_B",
+                            "MTL_PARAMETERS", "MTL_ITEM_CATALOG_GROUPS_B",
+                            "MTL_ITEM_CATALOGS_B", "MTL_CROSS_REFERENCES",
+                            "MTL_RESERVATIONS", "MTL_DEMAND", "MTL_SUPPLY",
+                            "MTL_TRANSACTION_TYPES", "MTL_TRANSACTION_ACCOUNTS",
+                            "MTL_TXN_REQUEST_HEADERS", "MTL_TXN_REQUEST_LINES",
+                            "MTL_MATERIAL_STATUSES_B", "MTL_LOT_NUMBERS",
+                            "MTL_SERIAL_NUMBERS", "MTL_UNIT_TRANSACTIONS",
+                            "MTL_ITEM_REVISIONS", "MTL_ITEM_SUB_INVENTORIES",
+                            "HR_ALL_ORGANIZATION_UNITS", "HR_LOCATIONS_ALL",
+                            "HR_JOB_HISTORY", "HR_EMPLOYEES_CURRENT_V",
+                            "PO_HEADERS_ALL", "PO_LINES_ALL", 
+                            "PO_LINE_LOCATIONS_ALL", "PO_DISTRIBUTIONS_ALL",
+                            "PO_VENDORS", "PO_VENDOR_SITES_ALL",
+                            "AP_INVOICES_ALL", "AP_INVOICE_LINES_ALL",
+                            "AP_INVOICE_DISTRIBUTIONS_ALL", "AP_SUPPLIERS",
+                            "AP_SUPPLIER_SITES_ALL", "AP_TERMS_TL",
+                            "OE_ORDER_HEADERS_ALL", "OE_ORDER_LINES_ALL",
+                            "OE_TRANSACTION_TYPES_TL", "OE_PRICE_ADJUSTMENTS",
+                            "AR_CUSTOMERS", "AR_CUSTOMER_SITES_ALL",
+                            "AR_PAYMENT_SCHEDULES_ALL", "AR_RECEIVABLES_TRX_ALL",
+                            "GL_LEDGERS", "GL_JE_HEADERS", "GL_JE_LINES",
+                            "GL_CODE_COMBINATIONS", "GL_PERIODS", "GL_DAILY_RATES",
+                            "FA_ADDITIONS_B", "FA_BOOKS", "FA_CATEGORIES_B",
+                            "FA_DEPRN_DETAIL", "FA_DEPRN_SUMMARY",
+                            "CST_ITEM_COSTS", "CST_COST_TYPES", 
+                            "CST_QUANTITY_LAYERS", "CST_COST_ELEMENTS",
+                            "BOM_BILL_OF_MATERIALS", "BOM_INVENTORY_COMPONENTS",
+                            "BOM_RESOURCES", "BOM_DEPARTMENTS",
+                            "WIP_ENTITIES", "WIP_OPERATIONS", 
+                            "WIP_DISCRETE_JOBS", "WIP_REQUIREMENT_OPERATIONS",
+                            "INV_MGD_MEASUREMENTS", "INV_MGD_ITEM_ORG_ASSIGNMENTS"
+                        ]
+                        for table in erp_tables:
+                            if table in content:
+                                table_names.add(table)
+            
+            # If we didn't find any tables, try a broader search
+            if not table_names:
+                logger.debug("No tables found in initial search, trying broader search")
+                # Search for common ERP table prefixes
+                prefixes = ["HR_", "ORG_", "MTL_", "PO_", "AP_", "AR_", "GL_", "FA_", "CST_", "BOM_", "WIP_", "INV_"]
+                for prefix in prefixes:
+                    prefix_docs = search_similar_schema(f"{prefix} tables", "source_db_2", top_k=20)
+                    for doc in prefix_docs:
+                        if 'document' in doc and 'metadata' in doc:
+                            if doc['metadata'].get('kind') == 'table':
+                                table_name = doc['metadata'].get('table')
+                                if table_name:
+                                    table_names.add(table_name)
+            
+            logger.debug(f"Discovered ERP tables: {list(table_names)}")
+            return list(table_names)
+        except Exception as e:
+            logger.warning(f"Failed to discover ERP tables: {e}. Using default tables.")
+            # Fallback to known core tables
+            return [
+                "HR_OPERATING_UNITS", 
+                "ORG_ORGANIZATION_DEFINITIONS", 
+                "MTL_ONHAND_QUANTITIES_DETAIL", 
+                "MTL_SECONDARY_INVENTORIES"
+            ]
+    
     def _get_erp_schema_info(self) -> Dict[str, Any]:
         """
         Dynamically retrieve ERP schema information from the vector store.
@@ -72,84 +164,54 @@ class ERPHybridProcessor:
             Dictionary containing table and column information
         """
         try:
-            # Search for schema information about our key tables
-            hr_ou_docs = search_similar_schema("HR_OPERATING_UNITS", "source_db_2", top_k=20)
-            org_def_docs = search_similar_schema("ORG_ORGANIZATION_DEFINITIONS", "source_db_2", top_k=20)
-            mtl_onhand_docs = search_similar_schema("MTL_ONHAND_QUANTITIES_DETAIL", "source_db_2", top_k=20)
-            mtl_secondary_docs = search_similar_schema("MTL_SECONDARY_INVENTORIES", "source_db_2", top_k=20)
+            # Dynamically discover ERP tables instead of hardcoding them
+            table_names = self._discover_erp_tables()
             
-            # Extract table and column information from schema documents
             erp_tables = {}
             
-            # Process HR_OPERATING_UNITS documents
-            hr_columns = []
-            for doc in hr_ou_docs:
-                if 'document' in doc and 'metadata' in doc:
-                    # Check if this document is about columns
-                    if doc['metadata'].get('kind') == 'column' and doc['metadata'].get('source_table') == 'HR_OPERATING_UNITS':
-                        column_name = doc['metadata'].get('column')
-                        if column_name and column_name not in hr_columns:
-                            hr_columns.append(column_name)
+            # Process each discovered table
+            for table_name in table_names:
+                # Search for schema information about this table
+                table_docs = search_similar_schema(table_name, "source_db_2", top_k=50)
+                
+                # Extract column information from schema documents
+                columns = []
+                table_description = ""
+                processed_columns = set()  # To avoid duplicates
+                
+                for doc in table_docs:
+                    if 'document' in doc and 'metadata' in doc:
+                        # Check if this document is about columns
+                        if doc['metadata'].get('kind') == 'column' and doc['metadata'].get('source_table') == table_name:
+                            column_name = doc['metadata'].get('column')
+                            if column_name and column_name not in processed_columns:
+                                columns.append(column_name)
+                                processed_columns.add(column_name)
+                        # Get table description
+                        elif doc['metadata'].get('kind') == 'table' and doc['metadata'].get('table') == table_name:
+                            if 'document' in doc and not table_description:
+                                table_description = doc['document']
+                
+                # If we didn't find a description in the documents, generate one
+                if not table_description:
+                    table_description = f"ERP R12 table {table_name} containing business data."
+                
+                # Limit columns to top 50 most relevant ones to avoid overwhelming the API
+                if len(columns) > 50:
+                    columns = columns[:50]
+                    logger.debug(f"Truncated columns for {table_name} to top 50")
+                
+                erp_tables[table_name] = {
+                    "columns": columns,
+                    "description": table_description
+                }
             
-            erp_tables["HR_OPERATING_UNITS"] = {
-                "columns": hr_columns,
-                "description": "Contains operating unit definitions with business group associations. Key columns: ORGANIZATION_ID (PK), NAME, DATE_FROM, DATE_TO, BUSINESS_GROUP_ID, USABLE_FLAG. IMPORTANT: The primary key is ORGANIZATION_ID, not OPERATING_UNIT_ID."
-            }
-            
-            # Process ORG_ORGANIZATION_DEFINITIONS documents
-            org_columns = []
-            for doc in org_def_docs:
-                if 'document' in doc and 'metadata' in doc:
-                    # Check if this document is about columns
-                    if doc['metadata'].get('kind') == 'column' and doc['metadata'].get('source_table') == 'ORG_ORGANIZATION_DEFINITIONS':
-                        column_name = doc['metadata'].get('column')
-                        if column_name and column_name not in org_columns:
-                            org_columns.append(column_name)
-            
-            erp_tables["ORG_ORGANIZATION_DEFINITIONS"] = {
-                "columns": org_columns,
-                "description": "Defines organizations with their codes and relationships to operating units. Key columns: ORGANIZATION_ID, ORGANIZATION_NAME, ORGANIZATION_CODE, OPERATING_UNIT (FK to HR_OPERATING_UNITS.ORGANIZATION_ID), DISABLE_DATE, INVENTORY_ENABLED_FLAG. IMPORTANT: The foreign key OPERATING_UNIT links to HR_OPERATING_UNITS.ORGANIZATION_ID, not HR_OPERATING_UNITS.OPERATING_UNIT_ID."
-            }
-            
-            # Process MTL_ONHAND_QUANTITIES_DETAIL documents
-            mtl_onhand_columns = []
-            for doc in mtl_onhand_docs:
-                if 'document' in doc and 'metadata' in doc:
-                    # Check if this document is about columns
-                    if doc['metadata'].get('kind') == 'column' and doc['metadata'].get('source_table') == 'MTL_ONHAND_QUANTITIES_DETAIL':
-                        column_name = doc['metadata'].get('column')
-                        if column_name and column_name not in mtl_onhand_columns:
-                            mtl_onhand_columns.append(column_name)
-            
-            erp_tables["MTL_ONHAND_QUANTITIES_DETAIL"] = {
-                "columns": mtl_onhand_columns,
-                "description": "Contains detailed on-hand inventory quantities with subinventory locations. Key columns: INVENTORY_ITEM_ID, ORGANIZATION_ID, DATE_RECEIVED, PRIMARY_TRANSACTION_QUANTITY, SUBINVENTORY_CODE"
-            }
-            
-            # Process MTL_SECONDARY_INVENTORIES documents
-            mtl_secondary_columns = []
-            for doc in mtl_secondary_docs:
-                if 'document' in doc and 'metadata' in doc:
-                    # Check if this document is about columns
-                    if doc['metadata'].get('kind') == 'column' and doc['metadata'].get('source_table') == 'MTL_SECONDARY_INVENTORIES':
-                        column_name = doc['metadata'].get('column')
-                        if column_name and column_name not in mtl_secondary_columns:
-                            mtl_secondary_columns.append(column_name)
-            
-            erp_tables["MTL_SECONDARY_INVENTORIES"] = {
-                "columns": mtl_secondary_columns,
-                "description": "Defines secondary inventories (subinventories) with their attributes. Key columns: SECONDARY_INVENTORY_NAME, ORGANIZATION_ID, DESCRIPTION, DISABLE_DATE, RESERVABLE_TYPE, DEFAULT_COST_GROUP_ID"
-            }
-            
+            logger.debug(f"Retrieved dynamic schema info for {len(erp_tables)} tables")
             return erp_tables
         except Exception as e:
             logger.warning(f"Failed to retrieve dynamic schema info: {e}. Using empty schema.")
-            return {
-                "HR_OPERATING_UNITS": {"columns": [], "description": ""},
-                "ORG_ORGANIZATION_DEFINITIONS": {"columns": [], "description": ""},
-                "MTL_ONHAND_QUANTITIES_DETAIL": {"columns": [], "description": ""},
-                "MTL_SECONDARY_INVENTORIES": {"columns": [], "description": ""}
-            }
+            # Fallback to empty schema
+            return {}
     
     def _is_erp_query_dynamic(self, user_query: str) -> bool:
         """
@@ -176,11 +238,32 @@ class ERPHybridProcessor:
         for table_info in erp_tables.values():
             all_columns.extend(table_info.get("columns", []))
         
+        # Check for common column patterns
         for column in all_columns:
             if column.lower() in query_lower:
                 return True
         
-        # Use generic pattern matching instead of hardcoded business terms
+        # Use intelligent pattern matching for ERP-specific business terms
+        # Look for common ERP business concepts
+        erp_business_terms = [
+            "operating unit", "organization", "inventory", "subinventory",
+            "onhand", "quantity", "item", "product", "material", "stock",
+            "purchase order", "po number", "supplier", "vendor", "invoice",
+            "customer", "sales order", "order number", "shipment", "delivery",
+            "employee", "job", "department", "location", "asset", "cost",
+            "ledger", "account", "transaction", "balance", "payment",
+            "budget", "forecast", "demand", "supply", "planning",
+            "manufacturing", "bom", "bill of material", "work order",
+            "project", "task", "resource", "capacity", "schedule",
+            "quality", "inspection", "lot", "serial", "batch",
+            "requisition", "rfq", "quote", "contract", "agreement"
+        ]
+        
+        # Check if this looks like an ERP business query
+        erp_matches = sum(1 for term in erp_business_terms if term in query_lower)
+        if erp_matches >= 2:  # If at least 2 ERP business terms are found
+            return True
+            
         # Look for common database query patterns
         common_patterns = [
             "list", "show", "find", "get", "select", "retrieve", 
@@ -238,8 +321,18 @@ class ERPHybridProcessor:
             logger.warning(f"SQL validation failed: Contains ellipsis - {sql[:100]}...")
             return False
             
+        # Check for common SQL injection patterns (basic security check)
+        dangerous_patterns = ["DROP", "DELETE", "UPDATE", "INSERT", "CREATE", "ALTER", "TRUNCATE"]
+        sql_upper = sql.upper()
+        for pattern in dangerous_patterns:
+            if pattern in sql_upper and not (pattern + "_") in sql_upper and not ("_" + pattern) in sql_upper:
+                # Make sure it's not part of a table/column name
+                if f" {pattern} " in sql_upper or sql_upper.startswith(pattern + " ") or sql_upper.endswith(" " + pattern):
+                    logger.warning(f"SQL validation failed: Contains dangerous pattern '{pattern}' - {sql[:100]}...")
+                    return False
+            
         # Check that it doesn't end with a partial keyword that would make it incomplete
-        invalid_endings = ["SELECT", "FROM", "WHERE", "JOIN", "ON", "AND", "OR", "ORDER", "GROUP", "HAVING", "BY"]
+        invalid_endings = ["SELECT", "FROM", "WHERE", "JOIN", "ON", "AND", "OR", "ORDER", "GROUP", "HAVING", "BY", "UNION", "INTERSECT", "EXCEPT"]
         if sql.split():
             last_token = sql.split()[-1].upper().rstrip(';')
             if last_token in invalid_endings:
@@ -299,26 +392,29 @@ class ERPHybridProcessor:
             # Remove any trailing semicolons (we'll add one at the end)
             cleaned_line = cleaned_line.rstrip(';')
             
-            # Add the cleaned line if it's not just markdown or explanatory text
+            # Remove any markdown code block markers
+            if cleaned_line.startswith("```sql"):
+                cleaned_line = cleaned_line[6:].strip()
+            if cleaned_line.startswith("```"):
+                cleaned_line = cleaned_line[3:].strip()
+            if cleaned_line.endswith("```"):
+                cleaned_line = cleaned_line[:-3].strip()
+                
+            # Add the cleaned line if it's not just metadata or explanatory text
             if not (cleaned_line.startswith("```") or cleaned_line.startswith("--") or 
                    cleaned_line.startswith("/*") or cleaned_line.startswith("*/") or
                    "SQL Query:" in cleaned_line or "Example format:" in cleaned_line or
                    cleaned_line.upper().startswith("USER QUERY:") or
                    cleaned_line.upper().startswith("ORIGINAL QUERY:") or
-                   cleaned_line.upper().startswith("RESPONSE:")):
+                   cleaned_line.upper().startswith("RESPONSE:") or
+                   cleaned_line.upper().startswith("EXPLANATION:") or
+                   cleaned_line.upper().startswith("NOTE:") or
+                   cleaned_line.upper().startswith("COMMENT:")):
                 cleaned_lines.append(cleaned_line)
         
         # Join lines with spaces (not newlines) to avoid formatting issues
         cleaned_sql = ' '.join(cleaned_lines)
         
-        # Remove any markdown code block markers
-        if cleaned_sql.startswith("```sql"):
-            cleaned_sql = cleaned_sql[6:].strip()
-        if cleaned_sql.startswith("```"):
-            cleaned_sql = cleaned_sql[3:].strip()
-        if cleaned_sql.endswith("```"):
-            cleaned_sql = cleaned_sql[:-3].strip()
-            
         # Remove any explanatory text before the SQL
         select_pos = cleaned_sql.upper().find('SELECT')
         with_pos = cleaned_sql.upper().find('WITH')
@@ -337,6 +433,9 @@ class ERPHybridProcessor:
         if cleaned_sql and not cleaned_sql.endswith(';'):
             cleaned_sql += ';'
             
+        # Final validation - remove any trailing whitespace
+        cleaned_sql = cleaned_sql.strip()
+        
         logger.debug(f"Cleaned SQL: {cleaned_sql[:200]}...")
         return cleaned_sql
     
@@ -352,8 +451,8 @@ class ERPHybridProcessor:
             Generated SQL query or None if failed
         """
         try:
-            # Get ERP OpenRouter client
-            client = get_erp_openrouter_client()
+            # Get ERP DeepSeek client
+            client = get_erp_deepseek_client()
             
             # Get ERP schema info
             erp_tables = self._get_erp_schema_info()
@@ -506,8 +605,8 @@ class ERPHybridProcessor:
             Generated summary or None if failed
         """
         try:
-            # Get ERP OpenRouter client
-            client = get_erp_openrouter_client()
+            # Get ERP DeepSeek client
+            client = get_erp_deepseek_client()
             
             # Create a minimal summary prompt
             prompt = f"Q: {user_query}\n\nResults:\nColumns: {', '.join(columns)}\nCount: {len(rows)}\n\nSummarize:"
@@ -556,40 +655,104 @@ class ERPHybridProcessor:
             logger.exception("Exception details:")
             return None
     
-    async def process_query(
-        self, 
-        user_query: str, 
-        selected_db: str = "", 
-        mode: str = "ERP",
-        session_id: Optional[str] = None,
-        client_ip: Optional[str] = None,
-        user_agent: Optional[str] = None
-    ) -> Dict[str, Any]:
+    def _optimize_sql_for_better_results(self, sql: str, user_query: str) -> str:
         """
-        Process an ERP R12 query using hybrid approach with dynamic schema awareness.
+        Optimize SQL query when initial execution returns no results.
+        This method attempts to modify restrictive conditions to get better results.
+        
+        Args:
+            sql: The original SQL query
+            user_query: The user's natural language query
+            
+        Returns:
+            Optimized SQL query
+        """
+        optimized_sql = sql
+        
+        # Check if this is a sales analysis query that might have restrictive date filtering
+        if "sales" in user_query.lower() or "month" in user_query.lower() or "compare" in user_query.lower():
+            logger.info("Optimizing SQL for sales analysis query with potentially restrictive date filtering")
+            
+            # Look for restrictive date filters and try to broaden them
+            import re
+            
+            # Pattern to match date filters like: AND oola.actual_shipment_date >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -1)
+            date_pattern = r"AND\s+\w+\.\w+\s*>=\s*ADD_MONTHS\s*\(\s*TRUNC\s*\(\s*SYSDATE\s*,\s*'MM'\s*\)\s*,\s*-\d+\s*\)"
+            
+            # Pattern to match upper date bounds
+            upper_date_pattern = r"AND\s+\w+\.\w+\s*<\s*ADD_MONTHS\s*\(\s*TRUNC\s*\(\s*SYSDATE\s*,\s*'MM'\s*\)\s*,\s*\d+\s*\)"
+            
+            # Check if we have restrictive date patterns
+            date_matches = re.findall(date_pattern, optimized_sql, re.IGNORECASE)
+            upper_date_matches = re.findall(upper_date_pattern, optimized_sql, re.IGNORECASE)
+            
+            if date_matches or upper_date_matches:
+                logger.info("Found restrictive date filters, attempting to broaden date range")
+                
+                # For sales analysis, let's remove restrictive date filters entirely to get all available data
+                # This is a simple approach - in a production system, you might want more sophisticated logic
+                optimized_sql = re.sub(date_pattern, "", optimized_sql, flags=re.IGNORECASE)
+                optimized_sql = re.sub(upper_date_pattern, "", optimized_sql, flags=re.IGNORECASE)
+                
+                # Clean up any double spaces or extra AND operators that might have been created
+                optimized_sql = re.sub(r"\s+AND\s+AND\s+", " AND ", optimized_sql, flags=re.IGNORECASE)
+                optimized_sql = re.sub(r"WHERE\s+AND\s+", "WHERE ", optimized_sql, flags=re.IGNORECASE)
+                optimized_sql = re.sub(r"\s+", " ", optimized_sql)  # Normalize whitespace
+                
+        # Check for overly restrictive WHERE conditions that might cause 0 results
+        if "WHERE" in optimized_sql.upper():
+            import re
+            # Look for conditions that might be too restrictive
+            restrictive_conditions = [
+                r"AND\s+\w+\.\w+\s*=\s*'[^']*'",  # Exact string matches
+                r"AND\s+\w+\.\w+\s*IS\s+NOT\s+NULL",  # NOT NULL conditions
+                r"AND\s+\w+\.\w+\s*>\s*\d+",  # Greater than conditions with numbers
+                r"AND\s+\w+\.\w+\s*<\s*\d+"   # Less than conditions with numbers
+            ]
+            
+            for pattern in restrictive_conditions:
+                matches = re.findall(pattern, optimized_sql, re.IGNORECASE)
+                if len(matches) > 2:  # If we have many restrictive conditions
+                    logger.info(f"Found {len(matches)} potentially restrictive conditions, attempting to relax some")
+                    # Remove some restrictive conditions to broaden results
+                    optimized_sql = re.sub(pattern, "", optimized_sql, count=1, flags=re.IGNORECASE)
+        
+        # Log the optimization
+        if optimized_sql != sql:
+            logger.info(f"SQL optimized from: {sql[:200]}...")
+            logger.info(f"SQL optimized to: {optimized_sql[:200]}...")
+            
+        return optimized_sql
+
+    async def process_query(self, user_query: str, selected_db: str = "source_db_2", mode: str = "ERP", session_id: Optional[str] = None, client_ip: Optional[str] = None, user_agent: Optional[str] = None, page: int = 1, page_size: int = 1000, cancellation_token: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+        """
+        Process an ERP R12 query using hybrid approach with dynamic schema context.
         
         Args:
             user_query: The user's natural language query
-            selected_db: Selected database ID
-            mode: Processing mode (ERP, General)
-            session_id: User session identifier
-            client_ip: Client IP address
-            user_agent: User agent string
+            selected_db: The database ID to query (default: source_db_2 for ERP R12)
+            mode: The processing mode (default: ERP)
+            session_id: Session identifier for training data collection
+            client_ip: Client IP address for training data collection
+            user_agent: User agent string for training data collection
+            page: Page number for pagination (default: 1)
+            page_size: Number of rows per page (default: 1000)
+            cancellation_token: Function that returns True if operation should be cancelled
             
         Returns:
-            Dictionary containing the response with results and metadata
+            Dictionary containing the response with SQL, results, and summary
         """
         start_time = time.time()
+        self.processing_stats["total_queries"] += 1
         
         try:
-            self.processing_stats["total_queries"] += 1
             logger.info(f"Processing ERP R12 query: {user_query}")
             
-            # Route the query to determine the appropriate module
-            routing_info = route_query(user_query, selected_db, mode)
-            target_module = routing_info["module"]
-            target_db = routing_info["db_id"]
-            routing_confidence = routing_info["confidence"]
+            # Route the query to determine the best processing approach
+            routing_info = route_query(user_query, selected_db)
+            target_module = routing_info.get("module", "ERP_R12")  # Fixed: use "module" instead of "target_module"
+            routing_confidence = routing_info.get("confidence", 0.8)
+            target_db = routing_info.get("db_id", selected_db)
             
             logger.info(f"Query routed to {target_module} with confidence {routing_confidence:.2f}")
             
@@ -613,30 +776,64 @@ class ERPHybridProcessor:
                     try:
                         # Import the functions locally to ensure they're in scope
                         from app.ERP_R12_Test_DB.query_engine import execute_query, format_erp_results
-                        raw_results = execute_query(api_sql, target_db)
+                        raw_results = execute_query(api_sql, target_db, page, page_size, cancellation_token, user_query)
                         results = format_erp_results(raw_results)
                         
                         # Check if we got any results
                         if results.get("row_count", 0) == 0:
-                            # If no results, try local processing as a fallback
-                            logger.info("API-generated SQL returned 0 rows, trying local processing as fallback")
-                            from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
-                            local_result = _local_erp_processing(user_query, target_db, mode)
-                            if local_result.get("status") == "success" and local_result.get("results", {}).get("row_count", 0) > 0:
-                                logger.info("Local processing returned results, using local results")
-                                local_result["hybrid_metadata"] = {
-                                    "processing_mode": "local_erp_fallback",
-                                    "model_used": "local_erp_r12",
-                                    "selection_reasoning": f"API-generated SQL returned 0 rows, local processing returned results. Routing confidence: {routing_confidence:.2f}",
-                                    "processing_time": time.time() - start_time,
-                                    "routing_confidence": routing_confidence,
-                                    "target_module": target_module,
-                                    "target_db": target_db
-                                }
-                                self.processing_stats["local_processed"] += 1
-                                return local_result
+                            # If no results, try to optimize the SQL query
+                            logger.info("API-generated SQL returned 0 rows, attempting to optimize query")
+                            optimized_sql = self._optimize_sql_for_better_results(api_sql, user_query)
+                            
+                            if optimized_sql != api_sql:
+                                logger.info("Retrying with optimized SQL")
+                                raw_results = execute_query(optimized_sql, target_db, page, page_size, cancellation_token, user_query)
+                                results = format_erp_results(raw_results)
+                                
+                                # Check if optimization helped
+                                if results.get("row_count", 0) > 0:
+                                    logger.info(f"Optimized SQL returned {results.get('row_count', 0)} rows")
+                                    api_sql = optimized_sql  # Use the optimized SQL for further processing
+                                else:
+                                    logger.info("Optimized SQL also returned 0 rows, trying local processing as fallback")
+                                    # If still no results, try local processing as a fallback
+                                    from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
+                                    local_result = _local_erp_processing(user_query, target_db, mode, page, page_size, cancellation_token)
+                                    if local_result.get("status") == "success" and local_result.get("results", {}).get("row_count", 0) > 0:
+                                        logger.info("Local processing returned results, using local results")
+                                        local_result["hybrid_metadata"] = {
+                                            "processing_mode": "local_erp_fallback",
+                                            "model_used": "local_erp_r12",
+                                            "selection_reasoning": f"API-generated SQL returned 0 rows even after optimization, local processing returned results. Routing confidence: {routing_confidence:.2f}",
+                                            "processing_time": time.time() - start_time,
+                                            "routing_confidence": routing_confidence,
+                                            "target_module": target_module,
+                                            "target_db": target_db
+                                        }
+                                        self.processing_stats["local_processed"] += 1
+                                        return local_result
+                                    else:
+                                        logger.info("Local processing also returned 0 rows or failed, using API results")
                             else:
-                                logger.info("Local processing also returned 0 rows or failed, using API results")
+                                # No optimization was possible, try local processing as a fallback
+                                logger.info("API-generated SQL returned 0 rows, trying local processing as fallback")
+                                from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
+                                local_result = _local_erp_processing(user_query, target_db, mode, page, page_size, cancellation_token)
+                                if local_result.get("status") == "success" and local_result.get("results", {}).get("row_count", 0) > 0:
+                                    logger.info("Local processing returned results, using local results")
+                                    local_result["hybrid_metadata"] = {
+                                        "processing_mode": "local_erp_fallback",
+                                        "model_used": "local_erp_r12",
+                                        "selection_reasoning": f"API-generated SQL returned 0 rows, local processing returned results. Routing confidence: {routing_confidence:.2f}",
+                                        "processing_time": time.time() - start_time,
+                                        "routing_confidence": routing_confidence,
+                                        "target_module": target_module,
+                                        "target_db": target_db
+                                    }
+                                    self.processing_stats["local_processed"] += 1
+                                    return local_result
+                                else:
+                                    logger.info("Local processing also returned 0 rows or failed, using API results")
                         
                         # Try to generate summary with API
                         api_summary = await self._generate_summary_with_api(
@@ -679,7 +876,7 @@ class ERPHybridProcessor:
                         from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
                         # Import the functions locally to ensure they're in scope
                         from app.ERP_R12_Test_DB.query_engine import execute_query, format_erp_results
-                        result = _local_erp_processing(user_query, target_db, mode)
+                        result = _local_erp_processing(user_query, target_db, mode, page, page_size, cancellation_token)
                         self.processing_stats["local_processed"] += 1
                         
                         # Add hybrid metadata
@@ -700,7 +897,7 @@ class ERPHybridProcessor:
                     from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
                     # Import the functions locally to ensure they're in scope
                     from app.ERP_R12_Test_DB.query_engine import execute_query, format_erp_results
-                    result = _local_erp_processing(user_query, target_db, mode)
+                    result = _local_erp_processing(user_query, target_db, mode, page, page_size, cancellation_token)
                     self.processing_stats["local_processed"] += 1
                     
                     # Add hybrid metadata
@@ -718,7 +915,7 @@ class ERPHybridProcessor:
             else:
                 # For non-ERP queries, fall back to local processing
                 from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
-                result = _local_erp_processing(user_query, target_db, mode)
+                result = _local_erp_processing(user_query, target_db, mode, page, page_size, cancellation_token)
                 self.processing_stats["local_processed"] += 1
                 
                 # Add hybrid metadata
@@ -726,7 +923,7 @@ class ERPHybridProcessor:
                 result["hybrid_metadata"] = {
                     "processing_mode": "local_general",
                     "model_used": "local_erp_r12",
-                    "selection_reasoning": routing_info["reason"],
+                    "selection_reasoning": routing_info.get("reason", "Default fallback for non-ERP queries"),
                     "processing_time": processing_time,
                     "routing_confidence": routing_confidence,
                     "target_module": target_module,

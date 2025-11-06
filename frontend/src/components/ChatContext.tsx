@@ -45,7 +45,7 @@ export type Message = {
 type LastIds = { turn_id?: number; sql_sample_id?: number | null; sql_summary_id?: number | null };
 
 // New Mode type - reordered to reflect preference
-export type Mode = "SOS" | "General" | "Test DB";
+export type Mode = "General" | "PRAN ERP" | "RFL ERP" | "SOS";
 
 interface ChatContextType {
   messages: Message[];
@@ -75,10 +75,10 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isTyping, setIsTyping] = useState(false);
   const [isPaused, _setIsPaused] = useState(false);
-  // Default DB changed to SOS mode
-  const [selectedDB, setSelectedDB] = useState<string>("source_db_1");
-  // 🔁 New default mode - changed to SOS
-  const [mode, setMode] = useState<Mode>("SOS");
+  // Default DB changed to General mode (no DB)
+  const [selectedDB, setSelectedDB] = useState<string>("");
+  // 🔁 New default mode - changed to General
+  const [mode, setMode] = useState<Mode>("General");
   const [lastIds, setLastIds] = useState<LastIds>({});
 
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -118,7 +118,8 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
   // Helper to compute effective DB from Mode if caller didn't sync it
   const resolveDBFromMode = (m: Mode): string => {
     if (m === "SOS") return "source_db_1";
-    if (m === "Test DB") return "source_db_2";
+    if (m === "PRAN ERP") return "source_db_2";
+    if (m === "RFL ERP") return "source_db_3";
     return ""; // General → no DB
     }
 
@@ -161,6 +162,8 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
       const bodyPayload: any = {
         question: q,
         mode: effectiveMode, // ⬅️ pass new Mode to backend
+        page: 1, // Default to first page
+        page_size: 1000 // Default page size
       };
 
       // Only include selected_db when not in General
@@ -171,9 +174,17 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
         bodyPayload.selected_db = "";
       }
 
+      // Get auth token from localStorage
+      const authToken = localStorage.getItem("authToken");
+      
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
+      }
+
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify(bodyPayload),
         signal: controller.signal,
       });
@@ -398,12 +409,22 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
       // Phase 4.2: Track request start time for response time calculation
       const requestStartTime = Date.now();
       
+      // Get auth token from localStorage
+      const authToken = localStorage.getItem("authToken");
+      
       // First, upload the file
       const formData = new FormData();
       formData.append('file', file);
       
+      // Add auth token to file upload request
+      const uploadHeaders: Record<string, string> = {};
+      if (authToken) {
+        uploadHeaders["Authorization"] = `Bearer ${authToken}`;
+      }
+      
       const uploadResponse = await fetch("/api/upload-file", {
         method: "POST",
+        headers: uploadHeaders,
         body: formData,
         signal: controller.signal,
       });
@@ -419,10 +440,16 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
         file_id: uploadResult.file_id,
         question: q
       };
+      
+      // Add auth token to file analysis request
+      const analyzeHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (authToken) {
+        analyzeHeaders["Authorization"] = `Bearer ${authToken}`;
+      }
 
       const analyzeResponse = await fetch("/api/analyze-file", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: analyzeHeaders,
         body: JSON.stringify(analyzePayload),
         signal: controller.signal,
       });

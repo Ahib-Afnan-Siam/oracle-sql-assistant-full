@@ -23,13 +23,21 @@ const MODE_INFO = {
     borderColor: "border-green-500",
     hoverColor: "hover:bg-green-500"
   },
-  "Test DB": {
+  "PRAN ERP": {
     icon: "🏢",
-    description: "ERP R12 system queries for testing",
+    description: "Ask about Inventory & Supply Chain of PRAN",
     color: "bg-purple-500",
     bgColor: "bg-purple-500/20",
     borderColor: "border-purple-500",
     hoverColor: "hover:bg-purple-500"
+  },
+  "RFL ERP": {
+    icon: "🏭",
+    description: "Ask about Inventory & Supply Chain of RFL",
+    color: "bg-indigo-500",
+    bgColor: "bg-indigo-500/20",
+    borderColor: "border-indigo-500",
+    hoverColor: "hover:bg-indigo-500"
   }
 };
 
@@ -100,17 +108,18 @@ export default function Sidebar() {
   const toggleSidebar = () => setIsOpen((s) => !s);
 
   // Mode switch - updated parameter order
-  const handleModeSelect = (newMode: "SOS" | "General" | "Test DB") => {
+  const handleModeSelect = (newMode: "SOS" | "General" | "PRAN ERP" | "RFL ERP") => {
     setMode(newMode);
     if (newMode === "General") setSelectedDB("");
     else if (newMode === "SOS") setSelectedDB("source_db_1");
-    else setSelectedDB("source_db_2");
+    else if (newMode === "PRAN ERP") setSelectedDB("source_db_2");
+    else setSelectedDB("source_db_3");
     setIsModeDropdownOpen(false); // Close dropdown after selection
   };
 
   // Prompts per mode
   const promptsKey =
-    mode === "SOS" ? "source_db_1" : mode === "Test DB" ? "source_db_2" : "general";
+    mode === "SOS" ? "source_db_1" : mode === "PRAN ERP" ? "source_db_2" : mode === "RFL ERP" ? "source_db_3" : "general";
   const prompts = useMemo(() => getPrompts(promptsKey) ?? [], [promptsKey]);
 
   // Get most used mode
@@ -136,49 +145,11 @@ export default function Sidebar() {
             <div className="p-4 sm:p-6">
               <h2 className="text-lg sm:text-xl font-bold text-gray-800 mb-4 sm:mb-6 animate-fadeIn-subtle dark:text-gray-100">Select Mode</h2>
               <div className="space-y-3">
-                {/* SOS is now the first option */}
-                <button
-                  onClick={() => handleModeSelect("SOS")}
-                  className={clsx(
-                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-1-subtle smooth-hover hover-lift relative",
-                    mode === "SOS"
-                      ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
-                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
-                  )}
-                  onMouseEnter={() => setShowModeInfo("SOS")}
-                  onMouseLeave={() => setShowModeInfo(null)}
-                >
-                  <span className="mr-3 text-xl">🧠</span>
-                  <div className="flex flex-col items-start">
-                    <div className="flex items-center">
-                      <span className="text-left">SOS</span>
-                      {mostUsedMode === "SOS" && (
-                        <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
-                          Most Used
-                        </span>
-                      )}
-                    </div>
-                    <span className="text-xs text-left mt-1 opacity-80">
-                      {MODE_INFO.SOS.description}
-                    </span>
-                  </div>
-                  <Info className="ml-auto h-4 w-4 opacity-50" />
-                  {showModeInfo === "SOS" && (
-                    <div className="absolute left-full ml-2 top-0 w-64 p-3 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10">
-                      <div className="font-semibold mb-1">SOS Mode</div>
-                      <p className="text-sm text-gray-600 dark:text-gray-300">
-                        {MODE_INFO.SOS.description}
-                      </p>
-                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                        Best for: Operational data queries, business metrics, performance analysis
-                      </div>
-                    </div>
-                  )}
-                </button>
+                {/* General is now the first option */}
                 <button
                   onClick={() => handleModeSelect("General")}
                   className={clsx(
-                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-2-subtle smooth-hover hover-lift relative",
+                    "w-full py-2 sm:py-2 rounded-xl text-sm sm:text-base font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-3 transform transition-transform hover:scale-[1.01] mode-button-1-subtle smooth-hover hover-lift relative",
                     mode === "General"
                       ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
                       : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
@@ -186,7 +157,7 @@ export default function Sidebar() {
                   onMouseEnter={() => setShowModeInfo("General")}
                   onMouseLeave={() => setShowModeInfo(null)}
                 >
-                  <span className="mr-3 text-xl">🌐</span>
+                  <span className="mr-2 text-lg">🌐</span>
                   <div className="flex flex-col items-start">
                     <div className="flex items-center">
                       <span className="text-left">General</span>
@@ -196,7 +167,7 @@ export default function Sidebar() {
                         </span>
                       )}
                     </div>
-                    <span className="text-xs text-left mt-1 opacity-80">
+                    <span className="text-xs text-left opacity-80">
                       {MODE_INFO.General.description}
                     </span>
                   </div>
@@ -214,39 +185,116 @@ export default function Sidebar() {
                   )}
                 </button>
                 <button
-                  onClick={() => handleModeSelect("Test DB")}
+                  onClick={() => handleModeSelect("PRAN ERP")}
                   className={clsx(
-                    "w-full py-4 sm:py-4 rounded-xl text-base sm:text-lg font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-4 transform transition-transform hover:scale-[1.01] mode-button-3-subtle smooth-hover hover-lift relative",
-                    mode === "Test DB"
+                    "w-full py-2 sm:py-2 rounded-xl text-sm sm:text-base font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-3 transform transition-transform hover:scale-[1.01] mode-button-2-subtle smooth-hover hover-lift relative",
+                    mode === "PRAN ERP"
                       ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
                       : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
                   )}
-                  onMouseEnter={() => setShowModeInfo("Test DB")}
+                  onMouseEnter={() => setShowModeInfo("PRAN ERP")}
                   onMouseLeave={() => setShowModeInfo(null)}
                 >
-                  <span className="mr-3 text-xl">🏢</span>
+                  <span className="mr-2 text-lg">🏢</span>
                   <div className="flex flex-col items-start">
                     <div className="flex items-center">
-                      <span className="text-left">Test DB</span>
-                      {mostUsedMode === "Test DB" && (
+                      <span className="text-left">PRAN ERP</span>
+                      {mostUsedMode === "PRAN ERP" && (
                         <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
                           Most Used
                         </span>
                       )}
                     </div>
-                    <span className="text-xs text-left mt-1 opacity-80">
-                      {MODE_INFO["Test DB"].description}
+                    <span className="text-xs text-left opacity-80">
+                      {MODE_INFO["PRAN ERP"].description}
                     </span>
                   </div>
                   <Info className="ml-auto h-4 w-4 opacity-50" />
-                  {showModeInfo === "Test DB" && (
+                  {showModeInfo === "PRAN ERP" && (
                     <div className="absolute left-full ml-2 top-0 w-64 p-3 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10">
-                      <div className="font-semibold mb-1">Test DB Mode</div>
+                      <div className="font-semibold mb-1">PRAN ERP Mode</div>
                       <p className="text-sm text-gray-600 dark:text-gray-300">
-                        {MODE_INFO["Test DB"].description}
+                        {MODE_INFO["PRAN ERP"].description}
                       </p>
                       <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                        Best for: ERP system testing, specific database schema queries
+                        Best for: Ask about Inventory & Supply Chain of PRAN
+                      </div>
+                    </div>
+                  )}
+                </button>
+                <button
+                  onClick={() => handleModeSelect("RFL ERP")}
+                  className={clsx(
+                    "w-full py-2 sm:py-2 rounded-xl text-sm sm:text-base font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-3 transform transition-transform hover:scale-[1.01] mode-button-3-subtle smooth-hover hover-lift relative",
+                    mode === "RFL ERP"
+                      ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
+                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
+                  )}
+                  onMouseEnter={() => setShowModeInfo("RFL ERP")}
+                  onMouseLeave={() => setShowModeInfo(null)}
+                >
+                  <span className="mr-2 text-lg">🏭</span>
+                  <div className="flex flex-col items-start">
+                    <div className="flex items-center">
+                      <span className="text-left">RFL ERP</span>
+                      {mostUsedMode === "RFL ERP" && (
+                        <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
+                          Most Used
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-xs text-left opacity-80">
+                      {MODE_INFO["RFL ERP"].description}
+                    </span>
+                  </div>
+                  <Info className="ml-auto h-4 w-4 opacity-50" />
+                  {showModeInfo === "RFL ERP" && (
+                    <div className="absolute left-full ml-2 top-0 w-64 p-3 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10">
+                      <div className="font-semibold mb-1">RFL ERP Mode</div>
+                      <p className="text-sm text-gray-600 dark:text-gray-300">
+                        {MODE_INFO["RFL ERP"].description}
+                      </p>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                        Best for: Ask about Inventory & Supply Chain of RFL
+                      </div>
+                    </div>
+                  )}
+                </button>
+                {/* SOS is now the fourth option */}
+                <button
+                  onClick={() => handleModeSelect("SOS")}
+                  className={clsx(
+                    "w-full py-2 sm:py-2 rounded-xl text-sm sm:text-base font-semibold border shadow-sm transition-all duration-200 flex items-center justify-start px-3 transform transition-transform hover:scale-[1.01] mode-button-4-subtle smooth-hover hover-lift relative",
+                    mode === "SOS"
+                      ? "bg-primary-purple-600 text-white border-primary-purple-600 shadow-md"
+                      : "bg-white/70 text-gray-800 border-white/50 hover:bg-primary-purple-600 hover:text-white hover:shadow-md dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600"
+                  )}
+                  onMouseEnter={() => setShowModeInfo("SOS")}
+                  onMouseLeave={() => setShowModeInfo(null)}
+                >
+                  <span className="mr-2 text-lg">🧠</span>
+                  <div className="flex flex-col items-start">
+                    <div className="flex items-center">
+                      <span className="text-left">SOS</span>
+                      {mostUsedMode === "SOS" && (
+                        <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">
+                          Most Used
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-xs text-left opacity-80">
+                      {MODE_INFO.SOS.description}
+                    </span>
+                  </div>
+                  <Info className="ml-auto h-4 w-4 opacity-50" />
+                  {showModeInfo === "SOS" && (
+                    <div className="absolute left-full ml-2 top-0 w-64 p-3 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-10">
+                      <div className="font-semibold mb-1">SOS Mode</div>
+                      <p className="text-sm text-gray-600 dark:text-gray-300">
+                        {MODE_INFO.SOS.description}
+                      </p>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                        Best for: Operational data queries, business metrics, performance analysis
                       </div>
                     </div>
                   )}
@@ -377,13 +425,15 @@ export default function Sidebar() {
               // Add active mode indicator
               mode === "SOS" && "border-blue-500",
               mode === "General" && "border-green-500",
-              mode === "Test DB" && "border-purple-500"
+              mode === "PRAN ERP" && "border-purple-500",
+              mode === "RFL ERP" && "border-indigo-500"
             )}
           >
             <span className="flex items-center">
               {mode === "SOS" && "🧠"}
               {mode === "General" && "🌐"}
-              {mode === "Test DB" && "🏢"}
+              {mode === "PRAN ERP" && "🏢"}
+              {mode === "RFL ERP" && "🏭"}
               <span className="ml-2">{mode}</span>
               {mostUsedMode === mode && (
                 <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded-full dark:bg-yellow-900/30 dark:text-yellow-200">

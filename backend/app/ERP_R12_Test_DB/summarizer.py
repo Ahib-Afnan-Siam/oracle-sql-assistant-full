@@ -3,7 +3,12 @@ import logging
 from typing import List, Dict, Any
 # Use the correct function from ollama_llm
 from app.ollama_llm import ask_analytical_model
-from app.config import OLLAMA_ANALYTICAL_MODEL, OLLAMA_ANALYTICAL_URL
+from app.config import (
+    SUMMARY_MAX_ROWS,
+    SUMMARY_CHAR_BUDGET,
+    DEEPSEEK_ENABLED as OPENROUTER_ENABLED,  # Use DEEPSEEK_ENABLED instead of OPENROUTER_ENABLED
+    SUMMARY_ENGINE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +107,7 @@ def summarize_results(user_query: str, columns: List[str], rows: List[Dict], sql
         # Create a detailed prompt for summarization
         prompt = f"""
 You are an expert ERP R12 data analyst. Provide a clear, concise summary of the following query results in natural language.
+ALL RESPONSES MUST BE IN ENGLISH LANGUAGE.
 
 Original Question: {user_query}
 

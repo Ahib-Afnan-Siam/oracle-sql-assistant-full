@@ -1,4 +1,4 @@
-# backend/app/openrouter_client.py
+# ERP R12 OpenRouter Client
 import aiohttp
 import asyncio
 import logging
@@ -9,17 +9,22 @@ from typing import Dict, Any, Optional, List, Union
 from datetime import datetime as _dt
 from dataclasses import dataclass, field
 
+# Use DeepSeek configuration instead of OpenRouter since it's deprecated
 from app.config import (
-    OPENROUTER_API_KEY, 
-    OPENROUTER_BASE_URL,
+    DEEPSEEK_API_KEY, 
+    DEEPSEEK_BASE_URL,
     API_REQUEST_TIMEOUT,
     API_MAX_RETRIES,
     API_RETRY_DELAY,
     API_MODELS,
-    OPENROUTER_ENABLED
+    HYBRID_ENABLED,
+    API_CLIENT_REFERER,
+    API_CLIENT_TITLE
 )
 
 logger = logging.getLogger(__name__)
+# Set logger level to INFO to reduce verbosity
+logger.setLevel(logging.INFO)
 
 @dataclass
 class OpenRouterResponse:
@@ -41,6 +46,7 @@ class ModelTestResult:
     response_time: float = 0.0
     error: Optional[str] = None
     test_response: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class OpenRouterError(Exception):
     """Custom exception for OpenRouter API errors."""
@@ -49,18 +55,18 @@ class OpenRouterError(Exception):
         self.status_code = status_code
         self.response_data = response_data
 
-class OpenRouterClient:
+class ERPOpenRouterClient:
     """
-    OpenRouter API client with retry logic, error handling, and rate limiting.
-    Supports multiple models and provides manufacturing domain-specific prompting.
+    OpenRouter API client specifically for ERP R12 system with retry logic, error handling, and rate limiting.
+    Supports multiple models and provides ERP domain-specific prompting.
     """
     
     def __init__(self):
-        if not OPENROUTER_ENABLED:
-            raise OpenRouterError("OpenRouter is not enabled. Check HYBRID_ENABLED and OPENROUTER_API_KEY in config.")
+        if not HYBRID_ENABLED:
+            raise OpenRouterError("OpenRouter is not enabled. Check HYBRID_ENABLED and DEEPSEEK_API_KEY in config.")
         
-        self.api_key = OPENROUTER_API_KEY
-        self.base_url = OPENROUTER_BASE_URL
+        self.api_key = DEEPSEEK_API_KEY
+        self.base_url = DEEPSEEK_BASE_URL
         self.timeout = API_REQUEST_TIMEOUT
         self.max_retries = API_MAX_RETRIES
         self.retry_delay = API_RETRY_DELAY
@@ -70,7 +76,7 @@ class OpenRouterClient:
         self.last_request_time = 0
         self.min_request_interval = 0.1  # Minimum 100ms between requests
         
-        logger.info(f"OpenRouter client initialized with {self.max_retries} retries, {self.timeout}s timeout")
+        logger.info(f"ERP OpenRouter client initialized with {self.max_retries} retries, {self.timeout}s timeout")
     
     async def _make_request(
         self,
@@ -135,22 +141,20 @@ class OpenRouterClient:
                             logger.error(f"API key authentication failed: {last_error}")
                             break  # Don't retry authentication errors
                         
-                        elif response.status == 404:  # Not found (e.g., model not available due to data policy)
-                            error_data = {}
-                            try:
-                                error_data = json.loads(response_text)
-                            except:
-                                pass
-                            
-                            error_message = "Model not available"
-                            if error_data and "error" in error_data and "message" in error_data["error"]:
-                                error_message = error_data["error"]["message"]
-                            
-                            last_error = f"Model not found (HTTP 404): {error_message}"
-                            logger.warning(f"Model not available: {last_error}")
-                            
-                            # Don't retry for 404 errors as they're likely configuration issues
-                            break
+                        elif response.status == 403:  # Moderation flagged
+                            last_error = f"Content moderation flagged (HTTP 403): {response_text}"
+                            logger.warning(f"API content moderation flagged: {last_error}")
+                            # Don't retry immediately, let the calling function handle model fallback
+                            return OpenRouterResponse(
+                                content="",
+                                model=payload.get("model", "unknown"),
+                                usage={},
+                                response_time=time.time() - start_time,
+                                success=False,
+                                error=last_error,
+                                status_code=response.status,
+                                metadata={"attempt": attempt + 1, "moderation_flagged": True}
+                            )
                         
                         elif response.status >= 500:  # Server errors
                             last_error = f"Server error (HTTP {response.status}): {response_text}"
@@ -242,8 +246,8 @@ class OpenRouterClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:8090",
-            "X-Title": "Oracle SQL Assistant - Hybrid AI System"
+            "HTTP-Referer": API_CLIENT_REFERER,
+            "X-Title": API_CLIENT_TITLE
         }
         
         payload = {
@@ -326,91 +330,31 @@ class OpenRouterClient:
         self, 
         user_query: str, 
         schema_context: str, 
-        model_type: str = "production"
+        model_type: str = "hr"
     ) -> OpenRouterResponse:
         """
-        Generate SQL response using appropriate model for query type.
+        Generate SQL response using appropriate model for ERP query type.
         
         Args:
             user_query: User's natural language query
             schema_context: Database schema information
-            model_type: Type of query (production, hr, tna, general)
+            model_type: Type of query (hr, general)
             
         Returns:
             OpenRouterResponse with generated SQL
         """
         
-        # Select model based on query type
-        model_config = API_MODELS.get(model_type, API_MODELS["general"])
-        model = model_config["primary"]
+        # Select model based on query type - ONLY use primary model to avoid content moderation issues
+        model_config = API_MODELS.get(model_type, API_MODELS["hr"])
+        model = model_config["primary"]  # Always use primary model only
         
-        # Manufacturing domain-specific system prompt with comprehensive schema awareness
-        system_prompt = f"""You are an expert Oracle SQL assistant for a manufacturing company (Chorka Apparel Limited - CAL, Winner, BIP). 
-Generate precise Oracle SQL queries based on user questions and ONLY use tables and columns that exist in the provided schema.
+        # Strict system prompt to avoid content moderation issues and ensure only SQL is returned
+        system_prompt = f"""SQL Assistant. Generate Oracle SQL only.
 
-ACTUAL SCHEMA CONTEXT FROM DATABASE:
+Schema:
 {schema_context}
 
-CRITICAL RULES - MUST FOLLOW:
-1. ONLY use columns that exist in the schema context above
-2. NEVER assume column names - validate against schema first
-3. NO 'COMPANY' column exists anywhere - use FLOOR_NAME patterns instead
-4. For company filtering: Use flexible patterns to match company names within FLOOR_NAME
-   - For CAL: UPPER(FLOOR_NAME) LIKE '%CAL%' 
-   - For Winner: UPPER(FLOOR_NAME) LIKE '%WINNER%'
-   - For BIP: UPPER(FLOOR_NAME) LIKE '%BIP%'
-5. Always validate table and column names against the provided schema
-
-VERIFIED TABLE STRUCTURES (use these as reference):
-Production Tables:
-- T_PROD: PROD_DATE, FLOOR_NAME, PM_OR_APM_NAME, PRODUCTION_QTY, DEFECT_QTY, DHU, FLOOR_EF, DEFECT_PERS, UNCUT_THREAD, DIRTY_STAIN, BROKEN_STITCH, SKIP_STITCH, OPEN_SEAM, LAST_UPDATE
-- T_PROD_DAILY: Same as T_PROD plus AC_PRODUCTION_HOUR, AC_WORKING_HOUR
-
-TNA Tables:
-- T_TNA_STATUS: JOB_NO, PO_NUMBER_ID, TASK_NUMBER, TASK_FINISH_DATE, ACTUAL_FINISH_DATE, TASK_SHORT_NAME, PO_NUMBER, PO_RECEIVED_DATE, PUB_SHIPMENT_DATE, SHIPMENT_DATE, STYLE_REF_NO, STYLE_DESCRIPTION, BUYER_NAME, TEAM_MEMBER_NAME, TEAM_LEADER_NAME
-- V_TNA_STATUS: Similar to T_TNA_STATUS with additional computed fields
-
-Employee Tables:
-- EMP: EMPNO, ENAME, JOB, MGR, HIREDATE, SAL, COMM, DEPTNO
-- T_USERS: USER_ID, USERNAME, FULL_NAME, PHONE_NUMBER, EMAIL_ADDRESS, IMAGE, IS_ACTIVE, PIN, FILENAME, LAST_UPDATED, ADDED_DATE, UPDATE_DATE, MIME_TYPE, LAST_LOGIN
-- DEPT: DEPTNO, DNAME, LOC
-
-Order Tables:
-- T_ORDC: BUYER_NAME, STYLEPO, STYLE, JOB, ITEM_NAME, FACTORY, POQTY, CUTQTY, SINPUT, SOUTPUT, SHIPQTY, LEFTQTY, FOBP, SMV, CM, CEFFI, AEFFI, CMER, ACM, EXMAT, SHIPDATE
-
-Master Tables:
-- COMPANIES: COMPANY_ID, COMPANY_NAME, COMPANY_ADDRESS, COMPANY_CNCL
-- ITEM_MASTER: ITEM_ID, ITEM_CODE, DESCRIPTION, LENGTH_CM, WIDTH_CM, HEIGHT_CM, CBM
-- CONTAINER_MASTER: CONTAINER_ID, CONTAINER_TYPE, INNER_LENGTH_CM, INNER_WIDTH_CM, INNER_HEIGHT_CM, MAX_CBM, MAX_WEIGHT_KG
-
-QUERY GENERATION GUIDELINES:
-- For floor-wise analysis: GROUP BY FLOOR_NAME
-- For production metrics: use PRODUCTION_QTY, DEFECT_QTY, DHU, FLOOR_EF
-- For date filtering: use PROD_DATE for production tables, TASK_FINISH_DATE for TNA
-- For employee queries: use EMP or T_USERS tables
-- For case-insensitive matching: use UPPER() function
-- Always include appropriate ORDER BY clauses
-- For company name matching in FLOOR_NAME: Use flexible patterns like UPPER(FLOOR_NAME) LIKE '%CAL%' to match company identifiers anywhere in the floor name
-
-COMMON QUERY PATTERNS:
-- Floor production: SELECT FLOOR_NAME, SUM(PRODUCTION_QTY) FROM T_PROD_DAILY GROUP BY FLOOR_NAME
-- Company filtering: WHERE UPPER(FLOOR_NAME) LIKE '%CAL%' OR UPPER(FLOOR_NAME) LIKE '%WINNER%'
-- Employee lookup: SELECT FULL_NAME, EMAIL_ADDRESS FROM T_USERS WHERE UPPER(FULL_NAME) LIKE '%NAME%'
-- TNA tasks: SELECT JOB_NO, TASK_SHORT_NAME FROM T_TNA_STATUS WHERE conditions
-
-RESPONSE FORMAT:
-- Return ONLY executable Oracle SQL
-- No explanations or comments
-- Use proper Oracle SQL syntax
-- Include column aliases for readability
-- Add ORDER BY when appropriate for meaningful results
-
-VALIDATION CHECKLIST:
-✓ All table names exist in schema
-✓ All column names exist in selected tables  
-✓ No assumed or non-existent columns used
-✓ Proper Oracle SQL syntax
-✓ Appropriate filtering and grouping"""
+Rules: 1. Use only schema tables/columns 2. Return ONLY valid SQL starting with SELECT 3. No explanations or text 4. Only SQL code 5. Pay close attention to column relationships. The correct relationship is: ORG_ORGANIZATION_DEFINITIONS.OPERATING_UNIT links to HR_OPERATING_UNITS.ORGANIZATION_ID. DO NOT use HR_OPERATING_UNITS.OPERATING_UNIT_ID as this column does not exist. Use HR_OPERATING_UNITS.ORGANIZATION_ID instead."""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -437,7 +381,7 @@ VALIDATION CHECKLIST:
         Try to get SQL response with fallback to secondary and tertiary models.
         
         Args:
-            model_type: Type of query (production, hr, tna, general)
+            model_type: Type of query (hr, general)
             user_query: User's natural language query
             schema_context: Database schema information
             
@@ -445,32 +389,77 @@ VALIDATION CHECKLIST:
             OpenRouterResponse from the first successful model
         """
         
-        model_config = API_MODELS.get(model_type, API_MODELS["general"])
-        models_to_try = [model_config["primary"], model_config["secondary"], model_config["fallback"]]
+        # Get model configuration
+        model_config = API_MODELS.get(model_type, API_MODELS["hr"])
+        primary_model = model_config["primary"]
+        secondary_model = model_config["secondary"]
+        fallback_model = model_config["fallback"]
         
-        for i, model in enumerate(models_to_try):
-            logger.info(f"Attempting SQL generation with {model} (attempt {i + 1}/3)")
+        logger.info(f"Attempting SQL generation with primary model {primary_model}")
+        
+        # Try primary model first
+        response = await self.get_sql_response(user_query, schema_context, model_type)
+        
+        # If primary model succeeds, return the response
+        if response.success and response.content.strip():
+            logger.info(f"Successfully generated SQL with primary model {primary_model}")
+            response.metadata["fallback_used"] = False
+            response.metadata["model_priority"] = "primary"
+            return response
+        else:
+            logger.warning(f"Failed to generate SQL with primary model {primary_model}: {response.error}")
             
-            response = await self.get_sql_response(user_query, schema_context, model_type)
+            # Check if it was a content moderation issue
+            if response.status_code == 403 and "moderation" in (response.error or "").lower():
+                logger.info(f"Content moderation flagged for {primary_model}, trying secondary model {secondary_model}")
+                
+                # Try secondary model with the same parameters but different model
+                messages = [
+                    {"role": "system", "content": f"SQL Assistant. Generate Oracle SQL only.\n\nSchema:\n{schema_context}\n\nRules: 1. Use only schema tables/columns 2. Return ONLY valid SQL starting with SELECT 3. No explanations or text 4. Only SQL code 5. Pay close attention to column relationships. The correct relationship is: ORG_ORGANIZATION_DEFINITIONS.OPERATING_UNIT links to HR_OPERATING_UNITS.ORGANIZATION_ID. DO NOT use HR_OPERATING_UNITS.OPERATING_UNIT_ID as this column does not exist. Use HR_OPERATING_UNITS.ORGANIZATION_ID instead."},
+                    {"role": "user", "content": user_query}
+                ]
+                
+                response = await self.chat_completion(
+                    messages=messages, 
+                    model=secondary_model,
+                    temperature=0.1,
+                    max_tokens=1024,
+                    top_p=0.9
+                )
+                
+                if response.success and response.content.strip():
+                    logger.info(f"Successfully generated SQL with secondary model {secondary_model}")
+                    response.metadata["fallback_used"] = True
+                    response.metadata["model_priority"] = "secondary"
+                    return response
+                else:
+                    logger.warning(f"Failed to generate SQL with secondary model {secondary_model}: {response.error}")
             
-            if response.success and response.content.strip():
-                logger.info(f"Successfully generated SQL with {model}")
-                response.metadata["fallback_used"] = i > 0
-                response.metadata["model_priority"] = ["primary", "secondary", "fallback"][i]
-                return response
+            # If still failed or wasn't a moderation issue, try fallback model
+            logger.info(f"Trying fallback model {fallback_model}")
+            # Create messages for the fallback model
+            messages = [
+                {"role": "system", "content": f"SQL Assistant. Generate Oracle SQL only.\n\nSchema:\n{schema_context}\n\nRules: 1. Use only schema tables/columns 2. Return ONLY valid SQL starting with SELECT 3. No explanations or text 4. Only SQL code 5. Pay close attention to column relationships. The correct relationship is: ORG_ORGANIZATION_DEFINITIONS.OPERATING_UNIT links to HR_OPERATING_UNITS.ORGANIZATION_ID. DO NOT use HR_OPERATING_UNITS.OPERATING_UNIT_ID as this column does not exist. Use HR_OPERATING_UNITS.ORGANIZATION_ID instead."},
+                {"role": "user", "content": user_query}
+            ]
+            
+            fallback_response = await self.chat_completion(
+                messages=messages, 
+                model=fallback_model,
+                temperature=0.1,
+                max_tokens=1024,
+                top_p=0.9
+            )
+            
+            if fallback_response.success and fallback_response.content.strip():
+                logger.info(f"Successfully generated SQL with fallback model {fallback_model}")
+                fallback_response.metadata["fallback_used"] = True
+                fallback_response.metadata["model_priority"] = "fallback"
+                return fallback_response
             else:
-                logger.warning(f"Failed to generate SQL with {model}: {response.error}")
-                if i < len(models_to_try) - 1:
-                    await asyncio.sleep(1)  # Brief pause before trying next model
-        
-        # All models failed
-        return OpenRouterResponse(
-            content="",
-            model=models_to_try[-1],
-            success=False,
-            error="All models failed to generate SQL",
-            metadata={"all_models_failed": True, "models_tried": models_to_try}
-        )
+                logger.warning(f"Failed to generate SQL with fallback model {fallback_model}: {fallback_response.error}")
+                # Return the last response (fallback) even if it failed
+                return fallback_response
     
     @staticmethod
     def create_multimodal_message(
@@ -487,12 +476,12 @@ VALIDATION CHECKLIST:
         Returns:
             List of message dictionaries formatted for multimodal API calls
         """
-        message_content = [{"type": "text", "text": text_content}]
+        message_content: List[Dict[str, Any]] = [{"type": "text", "text": text_content}]
         
         if file_data:
             message_content.append({
-                "type": "file",
-                "file": file_data
+                "type": "image_url",
+                "image_url": {"url": file_data["url"]}
             })
         
         return [
@@ -546,8 +535,7 @@ VALIDATION CHECKLIST:
             data_url = f"data:{mime_type};base64,{file_base64}"
             
             return {
-                "filename": os.path.basename(file_path),
-                "file_data": data_url
+                "url": data_url
             }
             
         except Exception as e:
@@ -576,8 +564,8 @@ VALIDATION CHECKLIST:
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost:8090",
-                "X-Title": "Oracle SQL Assistant - Hybrid AI System"
+                "HTTP-Referer": API_CLIENT_REFERER,
+                "X-Title": API_CLIENT_TITLE
             }
         
         start_time = time.time()
@@ -657,25 +645,36 @@ VALIDATION CHECKLIST:
             )
 
 # Global client instance (singleton pattern)
-_openrouter_client: Optional[OpenRouterClient] = None
+_erp_openrouter_client: Optional[ERPOpenRouterClient] = None
 
-def get_openrouter_client() -> OpenRouterClient:
-    """Get singleton OpenRouter client instance."""
-    global _openrouter_client
-    if _openrouter_client is None:
-        _openrouter_client = OpenRouterClient()
-    return _openrouter_client
+def get_erp_openrouter_client() -> ERPOpenRouterClient:
+    """Get singleton OpenRouter client instance for ERP R12 system."""
+    global _erp_openrouter_client
+    if _erp_openrouter_client is None:
+        _erp_openrouter_client = ERPOpenRouterClient()
+    return _erp_openrouter_client
 
-async def test_all_models() -> Dict[str, List[ModelTestResult]]:
-    """Test all configured models for availability."""
-    client = get_openrouter_client()
+async def test_erp_models() -> Dict[str, List[ModelTestResult]]:
+    """Test all configured ERP models for availability."""
+    client = get_erp_openrouter_client()
     results = {}
     
-    for model_type, models in API_MODELS.items():
+    # Test HR models specifically for ERP
+    model_types = ["hr", "general"]
+    for model_type in model_types:
+        model_config = API_MODELS.get(model_type, API_MODELS["hr"])
         results[model_type] = []
-        for priority, model in models.items():
-            result = await client.test_model_availability(model)
-            result.metadata = {"priority": priority, "model_type": model_type}
-            results[model_type].append(result)
+        # Fixed: Access models correctly from the model_config dictionary
+        models_to_test = [
+            model_config.get("primary"),
+            model_config.get("secondary"),
+            model_config.get("fallback")
+        ]
+        
+        for model in models_to_test:
+            if model:  # Only test if model is not None
+                result = await client.test_model_availability(model)
+                result.metadata = {"model_type": model_type}
+                results[model_type].append(result)
     
     return results

@@ -30,7 +30,7 @@ export function determineChartType(columns: string[], rows: any[]): 'bar' | 'lin
   return 'bar';
 }
 
-// Format table data for Chart.js
+// Format table data for Chart.js with large dataset optimization
 export function formatChartData(columns: string[], rows: any[], chartType: 'bar' | 'line' | 'pie' | 'doughnut') {
   // If rows is an array of arrays, convert to objects first
   const normalizedRows = Array.isArray(rows[0]) 
@@ -47,23 +47,35 @@ export function formatChartData(columns: string[], rows: any[], chartType: 'bar'
   console.log('formatChartData - Normalized Rows:', normalizedRows);
   console.log('formatChartData - Chart Type:', chartType);
   
+  // OPTIMIZATION: For large datasets, sample the data to prevent performance issues
+  const maxDataPoints = 1000; // Maximum number of data points to show in charts
+  const originalRowCount = normalizedRows.length;
+  let processedRows = normalizedRows;
+  
+  if (originalRowCount > maxDataPoints) {
+    // For large datasets, we'll sample the data to improve performance
+    const sampleRate = Math.ceil(originalRowCount / maxDataPoints);
+    processedRows = normalizedRows.filter((_, index) => index % sampleRate === 0);
+    console.log(`formatChartData - Sampled ${processedRows.length} rows from ${originalRowCount} total rows`);
+  }
+  
   // Find label column (usually first non-numeric column)
   const labelColumn = columns.find(col => 
-    normalizedRows.length > 0 && typeof normalizedRows[0][col] === 'string'
+    processedRows.length > 0 && typeof processedRows[0][col] === 'string'
   ) || columns[0];
   
   // Find data columns (numeric columns)
   const dataColumns = columns.filter(col => 
     col !== labelColumn && 
-    normalizedRows.length > 0 && 
-    (typeof normalizedRows[0][col] === 'number' || !isNaN(parseFloat(normalizedRows[0][col])))
+    processedRows.length > 0 && 
+    (typeof processedRows[0][col] === 'number' || !isNaN(parseFloat(processedRows[0][col])))
   );
   
   console.log('formatChartData - Label Column:', labelColumn);
   console.log('formatChartData - Data Columns:', dataColumns);
   
   // Extract labels
-  const labels = normalizedRows.map(row => row[labelColumn]);
+  const labels = processedRows.map(row => row[labelColumn]);
   
   // Generate colors
   const generateColors = (count: number) => {
@@ -82,7 +94,7 @@ export function formatChartData(columns: string[], rows: any[], chartType: 'bar'
   
   // Create datasets
   const datasets = dataColumns.map((column, index) => {
-    const data = normalizedRows.map(row => {
+    const data = processedRows.map(row => {
       const value = row[column];
       const parsed = typeof value === 'number' ? value : parseFloat(value);
       return isNaN(parsed) ? 0 : parsed;

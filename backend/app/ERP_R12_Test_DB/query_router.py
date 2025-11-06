@@ -139,7 +139,7 @@ def get_erp_keywords_and_patterns(erp_tables: Dict[str, Any], erp_relationships:
         # Add pattern for table name with possible separators
         patterns.append(rf"\b{table_name_lower.replace('_', r'[_\s]')}\b")
         
-        # Add variations
+        # Add variations dynamically based on schema context
         if 'operating' in table_name_lower:
             patterns.append(r"\boperating[_\s]units?\b")
         if 'organization' in table_name_lower:
@@ -287,18 +287,27 @@ def route_query(user_query: str, selected_db: str = "", mode: str = "General") -
     Args:
         user_query: The user's natural language query
         selected_db: Selected database ID
-        mode: Processing mode (General, SOS, ERP)
+        mode: Processing mode (General, SOS, PRAN_ERP, RFL_ERP)
         
     Returns:
         Dictionary containing routing information with confidence and reasoning
     """
-    # If mode is explicitly set to ERP, route to ERP
-    if mode.upper() == "ERP":
+    # If mode is explicitly set to PRAN_ERP, route to ERP with source_db_2
+    if mode.upper() == "PRAN_ERP":
         return {
             "module": "ERP_R12",
-            "db_id": "source_db_2",
+            "db_id": "source_db_2",  # Use source_db_2 for PRAN_ERP
             "confidence": 1.0,
-            "reason": "Explicit ERP mode selected"
+            "reason": "Explicit PRAN ERP mode selected"
+        }
+    
+    # If mode is explicitly set to RFL_ERP, route to ERP with source_db_3
+    if mode.upper() == "RFL_ERP":
+        return {
+            "module": "ERP_R12",
+            "db_id": "source_db_3",  # Use source_db_3 for RFL_ERP
+            "confidence": 1.0,
+            "reason": "Explicit RFL ERP mode selected"
         }
     
     # If mode is explicitly set to SOS, route to SOS
@@ -312,12 +321,12 @@ def route_query(user_query: str, selected_db: str = "", mode: str = "General") -
     
     # If selected_db is explicitly set, use that
     if selected_db:
-        if selected_db == "source_db_2":
+        if selected_db in ["source_db_2", "source_db_3"]:
             return {
                 "module": "ERP_R12",
-                "db_id": "source_db_2",
+                "db_id": selected_db,
                 "confidence": 0.95,
-                "reason": "source_db_2 (ERP R12) explicitly selected"
+                "reason": f"{selected_db} (ERP) explicitly selected"
             }
         elif selected_db == "source_db_1":
             return {
@@ -330,9 +339,9 @@ def route_query(user_query: str, selected_db: str = "", mode: str = "General") -
     # Use query classification for intelligent routing
     try:
         classification = query_classifier.classify_query(user_query)
-        intent = classification.intent
-        confidence = classification.confidence
-        entities = classification.entities
+        intent = classification["intent"]
+        confidence = classification["confidence"]
+        entities = classification["entities"]
         
         logger.info(f"Query classified as {intent.value} with confidence {confidence:.2f}")
         
@@ -350,6 +359,8 @@ def route_query(user_query: str, selected_db: str = "", mode: str = "General") -
             if erp_entities:
                 reasoning += f". Detected ERP entities: {list(erp_entities.keys())}"
             
+            # Route to the appropriate ERP database
+            # For now, default to source_db_2 (PRAN_ERP) but this could be enhanced
             return {
                 "module": "ERP_R12",
                 "db_id": "source_db_2",
@@ -377,6 +388,8 @@ def route_query(user_query: str, selected_db: str = "", mode: str = "General") -
         if erp_entities:
             reasoning += f": {list(erp_entities.keys())}"
             
+        # Route to the appropriate ERP database
+        # For now, default to source_db_2 (PRAN_ERP) but this could be enhanced
         return {
             "module": "ERP_R12",
             "db_id": "source_db_2",

@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Bot, User, Copy, RotateCcw, Check, Paperclip } from "lucide-react";
 import DataTable from "./DataTable";
+import PaginatedDataTable from "./PaginatedDataTable";
 import { useChat } from "./ChatContext";
 import HybridMetadataDisplay from "./HybridMetadataDisplay";
 import clsx from "clsx";
@@ -199,8 +200,8 @@ const MessageBubble: React.FC<Props> = ({ message }) => {
 // Wider rules for tables; narrower for text bubbles
 const bubbleMaxWidth =
   type === "table"
-    ? "w-full max-w-[1200px] sm:max-w-[95%]" // wide but bounded
-    : "max-w-full sm:max-w-[90%] md:max-w-[80%] lg:max-w-[70%]";
+    ? "w-full max-w-[1200px] sm:max-w-[95%] md:max-w-[90%] lg:max-w-[85%] xl:max-w-[80%] 2xl:max-w-[75%]" // wide but bounded
+    : "max-w-full sm:max-w-[90%] md:max-w-[80%] lg:max-w-[70%] xl:max-w-[65%] 2xl:max-w-[60%]";
 
 const tableMaxWidthStyle =
   message.type === "table"
@@ -254,7 +255,36 @@ const tableMaxWidthStyle =
     if (type === "table") {
       // Always show table data regardless of current mode
       // The mode check was preventing table display when switching modes
-      return <DataTable data={content as TableData} />;
+      // Check if we have metadata that indicates server-side pagination is available
+      const tableData = content as TableData;
+      const hasPaginationMetadata = 
+        Array.isArray(tableData) && 
+        tableData.length > 0 && 
+        typeof tableData[tableData.length - 1] === 'object' && 
+        (tableData[tableData.length - 1] as any).metadata;
+      
+      if (hasPaginationMetadata) {
+        // Use paginated data table for large datasets
+        // Extract the question from the previous user message
+        const currentIndex = messages.findIndex((m) => m.id === message.id);
+        let question = "";
+        for (let i = currentIndex - 1; i >= 0; i--) {
+          if (messages[i].sender === "user" && typeof messages[i].content === "string") {
+            question = messages[i].content as string;
+            break;
+          }
+        }
+        
+        return <PaginatedDataTable 
+          initialData={tableData} 
+          question={question}
+          mode={mode}
+          selectedDB={selectedDB}
+        />;
+      } else {
+        // Use regular data table for smaller datasets
+        return <DataTable data={tableData} />;
+      }
     }
 
     if (type === "summary") {
