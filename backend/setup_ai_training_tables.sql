@@ -1,5 +1,8 @@
 -- Setup script for New AI Training Data Tables
 -- Connect to the appropriate database/schema
+--
+-- NOTE: The AI Training Data Recorder system has been removed from the application.
+-- This script is provided for historical reference only.
 
 -- Drop existing AI training tables if they exist (for clean setup)
 BEGIN

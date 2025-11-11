@@ -1,4 +1,7 @@
 -- SQL script to verify username recording in AI_TRAINING_QUERIES table
+--
+-- NOTE: The AI Training Data Recorder system has been removed from the application.
+-- This script is provided for historical reference only.
 
 -- Check if USERNAME column exists
 SELECT column_name, data_type, data_length 

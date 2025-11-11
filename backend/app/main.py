@@ -70,24 +70,25 @@ def _cleanup_expired_tokens():
 
 
 # Oracle error type (be tolerant to either driver)
+# Fixed type assignment issue by using sys.modules approach
+import sys
+
 try:
-    from oracledb import DatabaseError as _OraDatabaseError
-    OraDatabaseError = _OraDatabaseError
+    from oracledb import DatabaseError as _DatabaseError
+    # Dynamically create OraDatabaseError in the module namespace
+    globals()['OraDatabaseError'] = _DatabaseError
+    # Also add to sys.modules to make it available module-wide
+    sys.modules[__name__].__dict__['OraDatabaseError'] = _DatabaseError
 except ImportError:
     try:
-        from cx_Oracle import DatabaseError as _OraDatabaseError
-        OraDatabaseError = _OraDatabaseError
+        from cx_Oracle import DatabaseError as _DatabaseError
+        # Dynamically create OraDatabaseError in the module namespace
+        globals()['OraDatabaseError'] = _DatabaseError
+        # Also add to sys.modules to make it available module-wide
+        sys.modules[__name__].__dict__['OraDatabaseError'] = _DatabaseError
     except ImportError:
         class OraDatabaseError(Exception):
             pass
-
-# Import the new AI training recorder
-try:
-    from app.ai_training_data_recorder import AITrainingDataRecorder
-    AI_TRAINING_RECORDER_AVAILABLE = True
-except ImportError:
-    AI_TRAINING_RECORDER_AVAILABLE = False
-    AITrainingDataRecorder = None
 
 # Import datetime for timestamp handling
 from datetime import datetime as _dt
@@ -102,12 +103,11 @@ from app.SOS.vector_store_chroma import hybrid_schema_value_search  # noqa: F401
 # Optional feedback DB exports
 from app.db_connector import connect_feedback
 
+# Import the user access module
+import app.user_access as user_access
+
 # Phase 5.2: Import quality metrics system
-try:
-    from app.ai_training_data_recorder import ai_training_data_recorder
-    QUALITY_METRICS_AVAILABLE = True
-except ImportError:
-    QUALITY_METRICS_AVAILABLE = False
+QUALITY_METRICS_AVAILABLE = False
 
 # ---------------------------
 # optional: model names (used when inserting samples)
@@ -129,124 +129,17 @@ except Exception:
 #   update_summary_sample(summary_sample_id:int, **cols)
 #   insert_feedback(...)
 # ---------------------------
-try:
-    # Use the new AI training recorder for feedback storage
-    from app.ai_training_data_recorder import ai_training_data_recorder, record_training_query, RecordingContext
-    FEEDBACK_STORE_AVAILABLE = True
-    
-    # Create wrapper functions for the AI training recorder
-    def insert_turn(source_db_id, client_ip, user_question, schema_context_text=None, schema_context_ids=None, meta=None):
-        """Record a turn in the AI training recorder"""
-        try:
-            # Extract username from meta if available
-            username = meta.get('username') if meta else None
-            
-            context = RecordingContext(
-                session_id=meta.get('session_id') if meta else None,
-                client_info=f"{client_ip or ''};{meta.get('user_agent', '') if meta else ''}",
-                database_type=source_db_id,
-                query_mode=meta.get('processing_mode', 'unknown') if meta else 'unknown',
-                username=username
-            )
-            
-            turn_id = ai_training_data_recorder.record_training_query(
-                user_query_text=user_question,
-                context=context
-            )
-            return turn_id
-        except Exception as e:
-            logger.warning(f"Failed to record turn in AI training recorder: {e}")
-            return None
-    
-    def insert_sql_sample(turn_id, model_name, prompt_text=None, sql_text=None, display_mode=None):
-        """Record SQL sample in the AI training recorder"""
-        try:
-            if turn_id:
-                model_details = {
-                    'model_name': model_name,
-                    'response_text': sql_text or '',
-                    'prompt_text': prompt_text,
-                    'status': 'success',
-                    'provider': 'ollama'
-                }
-                
-                sample_id = ai_training_data_recorder.record_model_interaction(
-                    query_id=turn_id,
-                    model_type='local',
-                    model_details=model_details
-                )
-                return sample_id
-        except Exception as e:
-            logger.warning(f"Failed to record SQL sample in AI training recorder: {e}")
-        return None
-    
-    def update_sql_sample(sql_sample_id, **cols):
-        """Update SQL sample - noop for AI training recorder"""
-        # Not implemented for AI training recorder
-        return None
-    
-    def insert_summary_sample(turn_id, model_name, prompt_text=None, data_snapshot=None, sql_used=None, display_mode=None):
-        """Record summary sample in the AI training recorder"""
-        try:
-            if turn_id:
-                model_details = {
-                    'model_name': model_name,
-                    'response_text': data_snapshot or '',
-                    'prompt_text': prompt_text,
-                    'status': 'success',
-                    'provider': 'ollama'
-                }
-                
-                sample_id = ai_training_data_recorder.record_model_interaction(
-                    query_id=turn_id,
-                    model_type='local',
-                    model_details=model_details
-                )
-                return sample_id
-        except Exception as e:
-            logger.warning(f"Failed to record summary sample in AI training recorder: {e}")
-        return None
-    
-    def update_summary_sample(summary_sample_id, **cols):
-        """Update summary sample - noop for AI training recorder"""
-        # Not implemented for AI training recorder
-        return None
-    
-    def insert_feedback(turn_id, task_type, feedback_type, sql_sample_id=None, summary_sample_id=None, improvement_comment=None, labeler_role=None, meta=None):
-        """Record feedback in the AI training recorder"""
-        try:
-            if turn_id:
-                # Extract source information from meta if available
-                source = meta.get('source', '') if meta else ''
-                feedback_details = {
-                    'feedback_type': feedback_type,
-                    'feedback_score': 5 if feedback_type == 'good' else (1 if feedback_type == 'wrong' else 3),
-                    'feedback_comment': improvement_comment,
-                    'source': source,
-                    'submission_timestamp': _dt.now()
-                }
-                
-                feedback_id = ai_training_data_recorder.record_user_feedback(
-                    query_id=turn_id,
-                    feedback_details=feedback_details
-                )
-                return feedback_id
-        except Exception as e:
-            logger.warning(f"Failed to record feedback in AI training recorder: {e}")
-        return None
-        
-except Exception:
-    FEEDBACK_STORE_AVAILABLE = False
+FEEDBACK_STORE_AVAILABLE = False
 
-    def _noop(*args, **kwargs):
-        return None
+def _noop(*args, **kwargs):
+    return None
 
-    insert_turn = _noop
-    insert_sql_sample = _noop
-    update_sql_sample = _noop
-    insert_summary_sample = _noop
-    update_summary_sample = _noop
-    insert_feedback = _noop
+insert_turn = _noop
+insert_sql_sample = _noop
+update_sql_sample = _noop
+insert_summary_sample = _noop
+update_summary_sample = _noop
+insert_feedback = _noop
 
 # ---------------------------
 # app setup
@@ -273,7 +166,6 @@ def configure_logging():
     logging.getLogger("app.SOS.hybrid_processor").setLevel(logging.INFO)  # Keep at INFO
     logging.getLogger("app.SOS.deepseek_client").setLevel(logging.INFO)  # Changed from openrouter_client to deepseek_client
     logging.getLogger("app.ERP_R12_Test_DB.deepseek_client").setLevel(logging.INFO)  # Add ERP R12 DeepSeek client logging
-    logging.getLogger("app.ai_training_data_recorder").setLevel(logging.WARNING)  # Reduce from INFO to WARNING
     
     # Ensure RAG engine logs are visible
     logging.getLogger("app.SOS.rag_engine").setLevel(logging.INFO)
@@ -548,7 +440,7 @@ async def log_requests(request: Request, call_next):
 # ---------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1137,48 +1029,6 @@ async def post_feedback(payload: FeedbackIn, request: Request):
             },
         )
         
-        # ALSO record feedback in the new AI training system
-        if AI_TRAINING_RECORDER_AVAILABLE:
-            try:
-                from app.ai_training_data_recorder import ai_training_data_recorder
-                from app.db_connector import connect_feedback
-                
-                # Validate that the turn_id corresponds to a valid query in AI_TRAINING_QUERIES
-                is_valid_query = False
-                try:
-                    with connect_feedback() as conn:
-                        cur = conn.cursor()
-                        cur.execute("SELECT COUNT(*) FROM AI_TRAINING_QUERIES WHERE QUERY_ID = :query_id", {"query_id": payload.turn_id})
-                        count = cur.fetchone()[0]
-                        is_valid_query = count > 0
-                except Exception as e:
-                    logger.warning(f"Failed to validate query ID {payload.turn_id}: {e}")
-                    is_valid_query = True  # Continue anyway to avoid blocking feedback
-                
-                if not is_valid_query:
-                    logger.warning(f"Invalid query ID {payload.turn_id} in feedback, using default query ID 1")
-                    query_id = 1
-                else:
-                    query_id = payload.turn_id
-                
-                feedback_details = {
-                    'feedback_type': payload.feedback_type,
-                    'feedback_score': 5 if payload.feedback_type == 'good' else (1 if payload.feedback_type == 'wrong' else 3),
-                    'feedback_comment': payload.comment,
-                    'source': payload.source or '',  # Fix: Ensure source is properly passed
-                    'submission_timestamp': _dt.now()
-                }
-                logger.info(f"Recording feedback with details: {feedback_details}")
-                logger.info(f"Source value for recording: '{feedback_details['source']}'")
-                # Record in the new AI_USER_FEEDBACK table
-                feedback_id = ai_training_data_recorder.record_user_feedback(
-                    query_id=query_id,  # turn_id maps to query_id in new system
-                    feedback_details=feedback_details
-                )
-                logger.info(f"Feedback stored successfully - ID: {feedback_id}, Type: {payload.feedback_type}, Source: {payload.source or 'unknown'}, Query ID: {query_id}")
-            except Exception as e:
-                logger.warning(f"Failed to record feedback in AI training system: {e}")
-                logger.exception("Exception details:")
         
         logger.info(f"Feedback processed successfully - Feedback ID: {fid}")
         return {"feedback_id": fid, "status": "created"}
@@ -2198,15 +2048,15 @@ async def get_file_upload_status(request: Request):
 # Admin Dashboard Endpoints
 # ---------------------------
 
-def _get_username_from_request(request: Request) -> Optional[str]:
+def _get_username_from_request(request: Request) -> str | None:
     """
-    Extract username from the request authentication token.
+    Extract username from request using token.
     
     Args:
         request: FastAPI Request object
         
     Returns:
-        Username if available, None otherwise
+        Username if found, None otherwise
     """
     try:
         # Extract token from Authorization header or custom header
@@ -2219,10 +2069,15 @@ def _get_username_from_request(request: Request) -> Optional[str]:
         
         # Look up username from token-username mapping
         if token:
+            logger.info(f"Looking up token: {token}")
             with token_username_map_lock:
                 username = token_username_map.get(token)
+                logger.info(f"Token map contents: {token_username_map}")
+                logger.info(f"Found username for token: {username}")
             if username:
                 return username
+        else:
+            logger.info("No token found in request")
     except Exception as e:
         logger.warning(f"Failed to extract username from request: {e}")
     
@@ -2332,6 +2187,13 @@ async def login(login_request: dict):
                 "token": token,
                 "isAdmin": True
             }
+        
+        # Check if user is authorized to access the system and has active status
+        if not user_access.is_user_authorized(username):
+            raise HTTPException(
+                status_code=401, 
+                detail="User not authorized or access disabled. Please request access."
+            )
         
         # Directly call the external HRIS API for regular users
         import httpx
@@ -2467,7 +2329,6 @@ async def logout(request: Request):
             detail=f"Logout failed: {str(e)}"
         )
 
-
 @app.post("/cleanup-expired-files")
 async def cleanup_expired_files():
     """
@@ -2488,3 +2349,434 @@ async def cleanup_expired_files():
             status_code=500, 
             detail=f"Failed to cleanup expired files: {str(e)}"
         )
+
+@app.post("/register", response_model=dict)
+async def register_user(user_data: dict):
+    """
+    Register a new user and create an access request.
+    
+    Args:
+        user_data: Dictionary containing user registration information
+            - user_id: Employee ID
+            - full_name: Full name of the user
+            - email: Email address
+            - designation: Job designation (optional)
+            - department: Department name (optional)
+    
+    Returns:
+        Registration result with success status
+    """
+    try:
+        # Validate required fields
+        required_fields = ['user_id', 'full_name', 'email']
+        for field in required_fields:
+            if not user_data.get(field):
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Missing required field: {field}"
+                )
+        
+        # Validate email format
+        import re
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_pattern, user_data['email']):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid email format"
+            )
+        
+        # Create the user access request
+        success = user_access.create_user_access_request(user_data)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "User registration request submitted successfully. Waiting for admin approval."
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to submit registration request"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Registration error")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Registration failed: {str(e)}"
+        )
+
+@app.get("/admin/access-requests", response_model=dict)
+async def get_access_requests(request: Request):
+    """
+    Get all pending access requests (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        List of pending access requests
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get pending access requests
+        requests = user_access.get_pending_access_requests()
+        
+        return {
+            "success": True,
+            "requests": requests
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching access requests")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch access requests: {str(e)}"
+        )
+
+@app.get("/admin/user-stats", response_model=dict)
+async def get_user_stats(request: Request):
+    """
+    Get user statistics including total users and active users (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        User statistics
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get user statistics
+        stats = user_access.get_user_statistics()
+        
+        return stats
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching user statistics")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch user statistics: {str(e)}"
+        )
+
+
+@app.post("/admin/approve-request/{request_id}", response_model=dict)
+async def approve_request(request_id: int, request: Request):
+    """
+    Approve a user access request (admin only).
+    
+    Args:
+        request_id: ID of the access request to approve
+        request: FastAPI Request object
+        
+    Returns:
+        Approval result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Approve the access request
+        success = user_access.approve_user_access(request_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "User access request approved successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to approve access request"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error approving access request")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to approve access request: {str(e)}"
+        )
+
+@app.post("/admin/deny-request/{request_id}", response_model=dict)
+async def deny_request(request_id: int, request: Request):
+    """
+    Deny a user access request (admin only).
+    
+    Args:
+        request_id: ID of the access request to deny
+        request: FastAPI Request object
+        
+    Returns:
+        Denial result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Deny the access request
+        success = user_access.deny_user_access(request_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "User access request denied successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to deny access request"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error denying access request")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to deny access request: {str(e)}"
+        )
+
+@app.post("/admin/add-user", response_model=dict)
+async def add_user(user_data: dict, request: Request):
+    """
+    Add a user directly to the access list (admin only).
+    
+    Args:
+        user_data: Dictionary containing user information
+            - user_id: Employee ID
+            - full_name: Full name of the user
+            - email: Email address
+            - designation: Job designation (optional)
+            - department: Department name (optional)
+        request: FastAPI Request object
+        
+    Returns:
+        Add user result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        
+        # Validate required fields
+        required_fields = ['user_id', 'full_name', 'email']
+        for field in required_fields:
+            if not user_data.get(field):
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Missing required field: {field}"
+                )
+        
+        # Validate email format
+        import re
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_pattern, user_data['email']):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid email format"
+            )
+        
+        # Add the user directly
+        success = user_access.add_user_directly(user_data)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "User added successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to add user. User may already exist."
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error adding user")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to add user: {str(e)}"
+        )
+
+@app.post("/admin/disable-user", response_model=dict)
+async def disable_user(user_data: dict, request: Request):
+    """
+    Disable a user's access (admin only).
+    
+    Args:
+        user_data: Dictionary containing user information
+            - user_id: Employee ID of the user to disable
+        request: FastAPI Request object
+        
+    Returns:
+        Disable user result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        user_id = user_data.get("user_id")
+        if not user_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing required field: user_id"
+            )
+        
+        # Disable the user access
+        success = user_access.disable_user_access(user_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"User {user_id} access disabled successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"User {user_id} not found or already disabled"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error disabling user access")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to disable user access: {str(e)}"
+        )
+
+@app.post("/admin/enable-user", response_model=dict)
+async def enable_user(user_data: dict, request: Request):
+    """
+    Enable a user's access (admin only).
+    
+    Args:
+        user_data: Dictionary containing user information
+            - user_id: Employee ID of the user to enable
+        request: FastAPI Request object
+        
+    Returns:
+        Enable user result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        user_id = user_data.get("user_id")
+        if not user_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing required field: user_id"
+            )
+        
+        # Enable the user access
+        success = user_access.enable_user_access(user_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"User {user_id} access enabled successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"User {user_id} not found or already enabled"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error enabling user access")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to enable user access: {str(e)}"
+        )
+
+@app.get("/admin/authorized-users", response_model=dict)
+async def get_authorized_users_endpoint(request: Request):
+    """
+    Get all authorized users (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        List of authorized users
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        
+        # Get authorized users
+        users = user_access.get_authorized_users()
+        
+        return {
+            "success": True,
+            "users": users
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching authorized users")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch authorized users: {str(e)}"
+        )
+
+

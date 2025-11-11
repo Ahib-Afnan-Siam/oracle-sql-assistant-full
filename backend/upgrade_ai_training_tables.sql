@@ -1,5 +1,8 @@
 -- Upgrade script for AI Training Data Tables
 -- This script adds the USERNAME column to existing AI_TRAINING_QUERIES table
+--
+-- NOTE: The AI Training Data Recorder system has been removed from the application.
+-- This script is provided for historical reference only.
 
 -- Add USERNAME column to AI_TRAINING_QUERIES table
 ALTER TABLE AI_TRAINING_QUERIES ADD USERNAME VARCHAR2(100);

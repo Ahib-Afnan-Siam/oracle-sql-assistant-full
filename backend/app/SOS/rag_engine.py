@@ -79,15 +79,8 @@ try:
     else:
         logger.info("[RAG] Hybrid processing disabled in configuration")
         
-    # Import training data collection system if available
-    if COLLECT_TRAINING_DATA:
-        try:
-            from app.ai_training_data_recorder import ai_training_data_recorder
-            from .query_classifier import QueryClassifier
-            logger.info("[RAG] Training data collection system enabled")
-        except ImportError as e:
-            logger.warning(f"[RAG] Training data collection dependencies not available: {e}")
-            COLLECT_TRAINING_DATA = False
+    # Training data collection system has been removed
+    COLLECT_TRAINING_DATA = False
     
 except ImportError as e:
     HYBRID_PROCESSING_AVAILABLE = False
@@ -1146,28 +1139,22 @@ async def _try_hybrid_processing(
                         api_confidence=0.0
                     )
                     
-                    # Record training data with new AI training recorder
-                    if ai_training_data_recorder:
-                        try:
-                            # Record execution result for failed attempt
-                            execution_details = {
-                                'execution_status': 'failed',
-                                'execution_time_ms': (time.time() - processing_start_time) * 1000,
-                                'row_count': 0,
-                                'error_message': 'No response generated from hybrid processor'
-                            }
-                            
-                            execution_id = ai_training_data_recorder.record_execution_result(
-                                query_id=turn_id,
-                                execution_details=execution_details
-                            )
-                            logger.info(f"[RAG] Recorded failed execution result with ID: {execution_id}")
-                        except Exception as record_error:
-                            logger.warning(f"[RAG] Failed to record execution result: {record_error}")
+                    # Training data recording disabled
+                    logger.info("[RAG] Training data recording disabled - recorder not available")
+                    try:
+                        # Training data recording placeholder
+                        execution_details = {
+                            'execution_status': 'failed',
+                            'execution_time_ms': (time.time() - processing_start_time) * 1000,
+                            'row_count': 0,
+                            'error_message': 'No response generated from hybrid processor'
+                        }
+                    except Exception as record_error:
+                        logger.warning(f"[RAG] Training data recording failed: {record_error}")
                     
-                    logger.info("[RAG] Recorded failed hybrid processing attempt for training data")
+                    logger.info("[RAG] Training data recording disabled for failed hybrid processing")
                 except Exception as record_error:
-                    logger.warning(f"[RAG] Failed to record processing error: {record_error}")
+                    logger.warning(f"[RAG] Training data recording failed: {record_error}")
         
             return None
         
@@ -1285,22 +1272,10 @@ async def _try_hybrid_processing(
                         if COLLECT_TRAINING_DATA and turn_id and 'classification_result' in locals():
                             try:
                                 # Record hybrid processing data (similar to existing code)
-                                if ai_training_data_recorder:
-                                    # Record execution result for fallback
-                                    execution_details = {
-                                        'execution_status': 'success',
-                                        'execution_time_ms': 0,  # Not available
-                                        'row_count': len(rows) if rows else 0,
-                                        'error_message': ''
-                                    }
-                                    
-                                    execution_id = ai_training_data_recorder.record_execution_result(
-                                        query_id=turn_id,
-                                        execution_details=execution_details
-                                    )
-                                    logger.info(f"[RAG] Recorded fallback execution result with ID: {execution_id}")
+                                # Training data recording disabled
+                                logger.info("[RAG] Training data recording disabled for fallback execution")
                             except Exception as e:
-                                logger.warning(f"[RAG] Failed to record hybrid processing training data: {e}")
+                                logger.warning(f"[RAG] Training data recording skipped: {e}")
                         
                         # Return successful fallback result
                         visualization_requested = has_visualization_intent(user_query)
@@ -1334,22 +1309,13 @@ async def _try_hybrid_processing(
             # Original code for recording failures
             if COLLECT_TRAINING_DATA and turn_id and classification_result:
                 # Record execution result for failed attempt
-                if ai_training_data_recorder:
-                    try:
-                        execution_details = {
-                            'execution_status': 'failed',
-                            'execution_time_ms': (time.time() - processing_start_time) * 1000,
-                            'row_count': 0,
-                            'error_message': 'Hybrid processing returned non-SQL response'
-                        }
-                        
-                        execution_id = ai_training_data_recorder.record_execution_result(
-                            query_id=turn_id,
-                            execution_details=execution_details
-                        )
-                        logger.info(f"[RAG] Recorded failed execution result with ID: {execution_id}")
-                    except Exception as record_error:
-                        logger.warning(f"[RAG] Failed to record execution result: {record_error}")
+                # Training data recording disabled
+                logger.info("[RAG] Training data recording disabled for non-SQL response")
+                try:
+                    # Training data recording placeholder
+                    pass
+                except Exception as record_error:
+                    logger.warning(f"[RAG] Training data recording skipped: {record_error}")
             
             return None
         
@@ -3380,29 +3346,8 @@ async def answer(
         logger.info("[RAG] Attempting hybrid processing for SQL generation")
         logger.info(f"[RAG] COLLECT_TRAINING_DATA is {COLLECT_TRAINING_DATA}")
 
-        # Create an actual turn_id for training data collection if not available
+        # Training data collection is disabled
         temp_turn_id = None
-        if COLLECT_TRAINING_DATA:
-            try:
-                # Create actual AI_TURN record for training data collection during RAG processing
-                from app.ai_training_data_recorder import ai_training_data_recorder, RecordingContext
-
-                # Create recording context
-                context = RecordingContext(
-                    session_id=session_id,
-                    client_info=f"{client_ip};{user_agent}",
-                    database_type="oracle",
-                    query_mode="rag_processing"
-                )
-
-                # Record the training query
-                temp_turn_id = ai_training_data_recorder.record_training_query(
-                    user_query_text=user_query,
-                    context=context
-                )
-                logger.info(f"[RAG] Created temporary turn_id {temp_turn_id} for training data collection")
-            except Exception as e:
-                logger.warning(f"[RAG] Failed to create temporary turn_id: {e}")
 
         # Pass the forced table information to hybrid processing
         hybrid_context_info = {

@@ -25,18 +25,14 @@ from app.sql_generator import extract_sql as _extract_sql_basic  # Import the ex
 #     hybrid_data_recorder = None
 #     record_hybrid_turn = None
 
-# Phase 6: Also try to import the new AI training recorder
-try:
-    from app.ai_training_data_recorder import AITrainingDataRecorder, RecordingContext, ai_training_data_recorder
-    NEW_TRAINING_RECORDER_AVAILABLE = True
-except ImportError:
-    NEW_TRAINING_RECORDER_AVAILABLE = False
-    AITrainingDataRecorder = None
-    RecordingContext = None
-    ai_training_data_recorder = None
+# Phase 6: Training data collection is no longer available
+NEW_TRAINING_RECORDER_AVAILABLE = False
+AITrainingDataRecorder = None
+RecordingContext = None
+ai_training_data_recorder = None
 
-# Add a constant to indicate we're using the new system
-TRAINING_DATA_COLLECTION_AVAILABLE = NEW_TRAINING_RECORDER_AVAILABLE
+# Add a constant to indicate we're not using the training system
+TRAINING_DATA_COLLECTION_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -1527,10 +1523,7 @@ class HybridProcessor:
             'average_processing_time': 0.0
         }
         # Initialize training data recorder
-        if NEW_TRAINING_RECORDER_AVAILABLE and AITrainingDataRecorder:
-            self.training_data_recorder = AITrainingDataRecorder()
-        else:
-            self.training_data_recorder = None
+        self.training_data_recorder = None
 
     def _create_fallback_selector(self):
         class FallbackResponseSelector:
@@ -1676,44 +1669,11 @@ class HybridProcessor:
             decision = self.threshold_manager.get_processing_decision(local_confidence, classification)
 
             # Record query classification if training data collection is available
+            # Training data recording is disabled
             classification_id = None
-            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
-                try:
-                    classification_result = {
-                        'intent': intent_value,
-                        'confidence': query_analysis.get('intent_confidence', 0.5),
-                        'complexity_score': query_analysis.get('complexity_score', 0.0),
-                        'entities': query_analysis.get('entities', {}),
-                        'strategy': 'HYBRID_PARALLEL',
-                        'business_context': f"Enhanced analysis: {intent_value}"
-                    }
-                    
-                    classification_id = self.training_data_recorder.record_query_classification(
-                        query_id=turn_id,
-                        classification_result=classification_result
-                    )
-                    self.logger.debug(f"Recorded query classification with ID: {classification_id}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to record query classification: {e}")
 
-            # Record schema context if training data collection is available
+            # Record schema context is disabled
             schema_id = None
-            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
-                try:
-                    schema_info = {
-                        'schema_definition': schema_context or '',
-                        'tables_used': [],  # Will be populated during processing
-                        'column_mapping': {},
-                        'retrieval_timestamp': datetime.now()
-                    }
-                    
-                    schema_id = self.training_data_recorder.record_schema_context(
-                        query_id=turn_id,
-                        schema_info=schema_info
-                    )
-                    self.logger.debug(f"Recorded schema context with ID: {schema_id}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to record schema context: {e}")
 
             # Execute with timeouts
             local_response: Optional[str] = None
@@ -1760,104 +1720,15 @@ class HybridProcessor:
 
             selected_response, selection_reasoning, selection_metadata = selector_result
 
-            # Record model interactions for both local and API processing
+            # Record model interactions is disabled
             local_interaction_id = None
             api_interaction_id = None
-            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
-                try:
-                    # Record local model interaction
-                    if local_response:
-                        local_model_details = {
-                            'model_name': 'ollama-local',  # Default local model
-                            'provider': 'Ollama',
-                            'prompt_text': '',  # Not available in this context
-                            'response_text': local_response,
-                            'response_time_ms': (time.time() - start_time) * 1000,
-                            'token_count': 0,  # Not available
-                            'confidence_score': local_confidence,
-                            'status': 'success' if local_response else 'failed',
-                            'error_message': '',
-                            'cost_usd': 0.0,
-                            'interaction_timestamp': datetime.now()
-                        }
-                        
-                        local_interaction_id = self.training_data_recorder.record_model_interaction(
-                            query_id=turn_id,
-                            model_type='local',
-                            model_details=local_model_details
-                        )
-                        self.logger.debug(f"Recorded local model interaction with ID: {local_interaction_id}")
-                    
-                    # Record API model interaction
-                    if api_response:
-                        api_model_details = {
-                            'model_name': 'deepseek-chat',  # Default API model
-                            'provider': 'DeepSeek',
-                            'prompt_text': '',  # Not available in this context
-                            'response_text': api_response,
-                            'response_time_ms': (time.time() - start_time) * 1000,
-                            'token_count': 0,  # Not available
-                            'confidence_score': query_analysis.get('intent_confidence', 0.5),
-                            'status': 'success' if api_response else 'failed',
-                            'error_message': '',
-                            'cost_usd': 0.0,
-                            'interaction_timestamp': datetime.now()
-                        }
-                        
-                        api_interaction_id = self.training_data_recorder.record_model_interaction(
-                            query_id=turn_id,
-                            model_type='api',
-                            model_details=api_model_details
-                        )
-                        self.logger.debug(f"Recorded API model interaction with ID: {api_interaction_id}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to record model interactions: {e}")
 
-            # Record response selection
+            # Record response selection is disabled
             selection_id = None
-            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
-                try:
-                    selection_details = {
-                        'selected_model_type': 'api' if api_response and (not local_response or len(api_response) > len(local_response or '')) else 'local',
-                        'selection_criteria': {},
-                        'score_comparison': {
-                            'local_score': local_metrics.overall_score if local_metrics else 0.0,
-                            'api_score': api_metrics.overall_score if api_metrics else 0.0
-                        },
-                        'final_response_text': selected_response or '',
-                        'selection_reasoning': selection_reasoning or 'No reasoning provided',
-                        'selection_timestamp': datetime.now()
-                    }
-                    
-                    selection_id = self.training_data_recorder.record_response_selection(
-                        query_id=turn_id,
-                        selection_details=selection_details
-                    )
-                    self.logger.debug(f"Recorded response selection with ID: {selection_id}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to record response selection: {e}")
 
-            # Record SQL processing
+            # Record SQL processing is disabled
             processing_id = None
-            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
-                try:
-                    if selected_response and selected_response.strip().upper().startswith('SELECT'):
-                        sql_processing_details = {
-                            'extracted_sql': selected_response,
-                            'validation_status': 'passed' if self.sql_validator.validate_sql(selected_response, query_context) else 'failed',
-                            'validation_errors': [],
-                            'optimization_suggestions': [],
-                            'final_sql': selected_response,
-                            'processing_timestamp': datetime.now()
-                        }
-                        
-                        processing_id = self.training_data_recorder.record_sql_processing(
-                            query_id=turn_id,
-                            processing_details=sql_processing_details
-                        )
-                        self.logger.debug(f"Recorded SQL processing with ID: {processing_id}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to record SQL processing: {e}")
 
             processing_time = time.time() - start_time
 
@@ -1877,47 +1748,13 @@ class HybridProcessor:
                 api_processing_time=processing_time if api_response else None
             )
 
-            # Record training data with the new AI training recorder only
-            if turn_id and processing_result is not None and NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder:
-                try:
-                    self.record_processing_result_with_ai_recorder(
-                        user_query=user_query,
-                        processing_result=processing_result,
-                        turn_id=turn_id,
-                        session_id=session_id or "",
-                        client_ip=client_ip or "",
-                        user_agent=user_agent or "",
-                        query_analysis=locals().get('query_analysis'),
-                        schema_context=schema_context,
-                        processing_mode=locals().get('processing_mode', 'unknown'),
-                        classification_time_ms=classification_time_ms
-                    )
-                except Exception as record_error:
-                    self.logger.error(f"[AI_TRAINING] Failed to record hybrid turn with new recorder: {record_error}")
-
             return processing_result
 
         except Exception as e:
             self.logger.error(f"[HYBRID_PROCESSOR] Advanced query processing failed: {e}")
             processing_time = time.time() - start_time
             
-            # Record error in fallback events if training data collection is available
-            if NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder and turn_id:
-                try:
-                    fallback_details = {
-                        'trigger_reason': 'processing_error',
-                        'fallback_model_type': 'error_handling',
-                        'fallback_response_text': f"Error: {str(e)}",
-                        'recovery_status': 'failed'
-                    }
-                    
-                    fallback_id = self.training_data_recorder.record_fallback_event(
-                        query_id=turn_id,
-                        fallback_details=fallback_details
-                    )
-                    self.logger.debug(f"Recorded fallback event with ID: {fallback_id}")
-                except Exception as record_error:
-                    self.logger.warning(f"Failed to record fallback event: {record_error}")
+            # Fallback event recording is disabled
             
             return ProcessingResult(
                 selected_response=f"Sorry, I couldn't process that query: {str(e)}",
@@ -1934,27 +1771,30 @@ class HybridProcessor:
                 local_processing_time=None,
                 api_processing_time=None
             )
-            
+        
         finally:
-            # Record training data with the new AI training recorder only
-            if turn_id and processing_result is not None and NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder:
-                try:
-                    self.record_processing_result_with_ai_recorder(
-                        user_query=user_query,
-                        processing_result=processing_result,
-                        turn_id=turn_id,
-                        session_id=session_id or "",
-                        client_ip=client_ip or "",
-                        user_agent=user_agent or "",
-                        query_analysis=locals().get('query_analysis'),
-                        schema_context=schema_context,
-                        processing_mode=locals().get('processing_mode', 'unknown'),
-                        classification_time_ms=classification_time_ms
-                    )
-                except Exception as record_error:
-                    self.logger.error(f"[AI_TRAINING] Failed to record hybrid turn with new recorder: {record_error}")
+            # Record training data with the new AI training recorder only (removed)
+            # if turn_id and processing_result is not None and NEW_TRAINING_RECORDER_AVAILABLE and self.training_data_recorder:
+            #     try:
+            #         self.record_processing_result_with_ai_recorder(
+            #             user_query=user_query,
+            #             processing_result=processing_result,
+            #             turn_id=turn_id,
+            #             session_id=session_id or "",
+            #             client_ip=client_ip or "",
+            #             user_agent=user_agent or "",
+            #             query_analysis=locals().get('query_analysis'),
+            #             schema_context=schema_context,
+            #             processing_mode=locals().get('processing_mode', 'unknown'),
+            #             classification_time_ms=classification_time_ms
+            #         )
+            #     except Exception as record_error:
+            #         self.logger.error(f"[AI_TRAINING] Failed to record hybrid turn with new recorder: {record_error}")
+            pass  # Properly close the finally block
 
+    # Confidence threshold calibration method
     def calibrate_confidence_thresholds(self, query_analysis: Dict) -> Dict:
+        """Calibrates confidence thresholds for processing queries."""
         base = {
             'local_confidence': 0.7,
             'skip_api': 0.85,
@@ -1967,7 +1807,9 @@ class HybridProcessor:
             base['skip_api'] += 0.05
         if len(query_analysis.get('entities', {}).get('aggregations', [])) > 1:
             base['force_hybrid'] += 0.2
-        if query_analysis.get('intent_confidence', 1.0) < 0.5:
+        # Fix: Ensure intent_confidence is properly retrieved and compared
+        intent_confidence = query_analysis.get('intent_confidence', 1.0)
+        if isinstance(intent_confidence, (int, float)) and intent_confidence < 0.5:
             base['force_hybrid'] += 0.15
         return base
 
@@ -2105,124 +1947,6 @@ class HybridProcessor:
                 api_processing_time=None
             )
 
-    def record_processing_result_with_ai_recorder(self, 
-                                                user_query: str,
-                                                processing_result: ProcessingResult,
-                                                turn_id: Optional[int] = None,
-                                                session_id: Optional[str] = None,
-                                                client_ip: Optional[str] = None,
-                                                user_agent: Optional[str] = None,
-                                                query_analysis: Optional[Dict[str, Any]] = None,
-                                                schema_context: Optional[str] = None,
-                                                processing_mode: Optional[str] = None,
-                                                classification_time_ms: float = 0.0) -> None:
-        """
-        Record processing result with the new AI training recorder.
-        
-        Args:
-            user_query: The user's query text
-            processing_result: The processing result to record
-            turn_id: Reference to AI_TURN table
-            session_id: Session identifier
-            client_ip: Client IP address
-            user_agent: User agent string
-            query_analysis: Query analysis data
-            schema_context: Schema context string
-            processing_mode: Processing mode used
-            classification_time_ms: Time taken for classification
-        """
-        if not NEW_TRAINING_RECORDER_AVAILABLE or not turn_id:
-            return
-            
-        try:
-            # Create processing data structure for new AI training recorder
-            processing_data = {
-                'user_query_text': user_query,
-                'session_id': session_id,
-                'client_info': f"{client_ip or ''};{user_agent or ''}",
-                'database_type': 'oracle',
-                'query_mode': processing_mode or 'unknown'
-            }
-            
-            # Add classification result if available
-            if query_analysis:
-                processing_data['classification_result'] = {
-                    'intent': query_analysis.get('intent', 'general'),
-                    'confidence': query_analysis.get('intent_confidence', 0.5),
-                    'complexity_score': query_analysis.get('complexity_score', 0.0),
-                    'entities': query_analysis.get('entities', {}),
-                    'strategy': 'HYBRID_PARALLEL',  # Default strategy
-                    'business_context': f"Enhanced analysis: {query_analysis.get('intent', 'unknown')}"
-                }
-            
-            # Add schema context if available
-            if schema_context:
-                processing_data['schema_info'] = {
-                    'schema_definition': schema_context,
-                    'tables_used': [],
-                    'column_mapping': {}
-                }
-            
-            # Add model interactions
-            if processing_result:
-                model_details = {
-                    'model_name': processing_result.api_model_name or processing_result.local_model_name or 'unknown',
-                    'provider': 'deepseek' if processing_result.api_model_name else 'ollama',
-                    'prompt_text': '',  # Not available in this context
-                    'response_text': processing_result.selected_response or '',
-                    'response_time_ms': (processing_result.api_processing_time or processing_result.local_processing_time or 0) * 1000,
-                    'token_count': 0,  # Not available
-                    'confidence_score': processing_result.api_confidence or processing_result.local_confidence or 0.0,
-                    'status': 'success' if processing_result.selected_response else 'failed',
-                    'error_message': '' if processing_result.selected_response else 'No response generated',
-                    'cost_usd': 0.0,  # Not available
-                    'interaction_timestamp': None
-                }
-                
-                processing_data['model_interactions'] = [{
-                    'model_type': 'api' if processing_result.api_model_name else 'local',
-                    'model_details': model_details
-                }]
-            
-            # Add response selection
-            if processing_result:
-                processing_data['selection_details'] = {
-                    'selected_model_type': 'api' if processing_result.api_model_name else 'local',
-                    'selection_criteria': {},
-                    'score_comparison': {},
-                    'final_response_text': processing_result.selected_response or '',
-                    'selection_reasoning': processing_result.selection_reasoning or 'No reasoning provided',
-                    'selection_timestamp': None
-                }
-            
-            # Add SQL processing (if applicable)
-            if processing_result and processing_result.selected_response and processing_result.selected_response.strip().upper().startswith('SELECT'):
-                processing_data['sql_processing'] = {
-                    'extracted_sql': processing_result.selected_response,
-                    'validation_status': 'unknown',
-                    'validation_errors': [],
-                    'optimization_suggestions': [],
-                    'final_sql': processing_result.selected_response,
-                    'processing_timestamp': datetime.now()
-                }
-            
-            # Add execution result (placeholder)
-            processing_data['execution_result'] = {
-                'execution_status': 'unknown',
-                'execution_time_ms': 0,
-                'row_count': 0,
-                'error_message': ''
-            }
-            
-            # Record complete processing flow
-            if self.training_data_recorder is not None:
-                result = self.training_data_recorder.record_complete_processing_flow(processing_data)
-                self.logger.info(f"[AI_TRAINING] Recorded hybrid processing turn with result: {result}")
-            else:
-                self.logger.warning("[AI_TRAINING] Training data recorder not available, skipping recording")
-            
-        except Exception as e:
-            self.logger.error(f"[AI_TRAINING] Failed to record processing result with new recorder: {e}")
 
     # -------- Parallel/timeout helpers --------
 

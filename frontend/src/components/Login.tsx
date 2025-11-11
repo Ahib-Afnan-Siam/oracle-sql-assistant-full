@@ -1,6 +1,7 @@
 // src/components/Login.tsx
 import React, { useState } from "react";
 import { Eye, EyeOff, Check, Loader2 } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import "./Login.css";
 
 const Login = () => {
@@ -10,22 +11,63 @@ const Login = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
+  const navigate = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError("");
     
-    // Check for admin credentials first
+    // Check for admin credentials by making a request to the backend
     if (username === "AdminMIS" && password === "mis123") {
-      setSuccess(true);
-      // Store token in localStorage
-      localStorage.setItem("authToken", "admin-token");
-      localStorage.setItem("isAdmin", "true");
-      // Redirect to admin dashboard
-      setTimeout(() => {
-        window.location.href = "/admin";
-      }, 1000);
+      try {
+        const response = await fetch("/api/login", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            username: username,
+            password: password,
+          }),
+        });
+        
+        const data = await response.json();
+        
+        if (response.ok && data.success) {
+          setSuccess(true);
+          // Store token in localStorage
+          localStorage.setItem("authToken", data.token);
+          localStorage.setItem("isAdmin", data.isAdmin ? "true" : "false");
+          // Redirect to admin dashboard
+          setTimeout(() => {
+            window.location.href = "/admin";
+          }, 1000);
+        } else {
+          setError(data.message || "Admin login failed");
+          // Trigger shake animation on error
+          const card = document.querySelector('.login-card');
+          if (card) {
+            card.classList.add('shake');
+            setTimeout(() => {
+              card.classList.remove('shake');
+            }, 500);
+          }
+        }
+      } catch (err) {
+        setError("Network error. Please try again.");
+        // Trigger shake animation on error
+        const card = document.querySelector('.login-card');
+        if (card) {
+          card.classList.add('shake');
+          setTimeout(() => {
+            card.classList.remove('shake');
+          }, 500);
+        }
+        console.error("Admin login error:", err);
+      } finally {
+        setLoading(false);
+      }
       return;
     }
     
@@ -60,7 +102,12 @@ const Login = () => {
           window.location.href = "/app";
         }, 1000);
       } else {
-        setError(data.message || "Login failed");
+        // Check if the error is related to unauthorized access
+        if (data.message && (data.message.includes("authorized") || data.message.includes("access"))) {
+          setError("You are not authorized or don't have access. Please register to get access.");
+        } else {
+          setError(data.message || "Login failed");
+        }
         // Trigger shake animation on error
         const card = document.querySelector('.login-card');
         if (card) {
@@ -105,6 +152,12 @@ const Login = () => {
           {error && (
             <div className="text-red-500 text-sm text-center py-2 px-4 bg-red-50 rounded-lg animate-fade-in">
               {error}
+            </div>
+          )}
+          
+          {success && (
+            <div className="text-green-700 text-sm text-center py-2 px-4 bg-green-50 rounded-lg animate-fade-in">
+              Login successful! Redirecting...
             </div>
           )}
           
@@ -169,6 +222,15 @@ const Login = () => {
             </div>
           </button>
         </form>
+        
+        <div className="mt-6 text-center">
+          <button 
+            onClick={() => navigate("/register")}
+            className="text-primary-purple-600 hover:text-primary-purple-800 text-sm font-medium transition-colors"
+          >
+            Need to register a new user?
+          </button>
+        </div>
       </div>
     </div>
   );

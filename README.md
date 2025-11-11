@@ -178,7 +178,6 @@ uttoron/
 │   │   ├── config.py                  # Application configuration
 │   │   ├── db_connector.py            # Database connectivity and execution
 │   │   ├── embeddings.py              # Embedding generation
-│   │   ├── ai_training_data_recorder.py # AI training data recording
 │   │   ├── llm_client.py              # LLM client abstraction
 │   │   ├── ollama_llm.py              # Ollama LLM integration
 │   │   ├── sql_generator.py           # Generic SQL generation
