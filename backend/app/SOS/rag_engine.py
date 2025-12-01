@@ -1070,7 +1070,8 @@ async def _try_hybrid_processing(
     session_id: Optional[str] = None,
     client_ip: Optional[str] = None,
     user_agent: Optional[str] = None,
-    hybrid_context_info: Optional[Dict[str, Any]] = None
+    hybrid_context_info: Optional[Dict[str, Any]] = None,
+    chat_id: Optional[int] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Attempt hybrid processing for SQL generation with enhanced schema context and comprehensive training data collection.
@@ -1120,7 +1121,8 @@ async def _try_hybrid_processing(
         processing_result = await processor.process_query_advanced(
             user_query=user_query,
             schema_context=enhanced_schema_context,  # Pass enhanced context
-            local_confidence=0.6  # Default confidence for RAG context
+            local_confidence=0.6,  # Default confidence for RAG context
+            chat_id=chat_id  # Pass chat_id for message recording
         )
         
         if not processing_result or not processing_result.selected_response:
@@ -1130,7 +1132,7 @@ async def _try_hybrid_processing(
                     # Create a minimal ProcessingResult for failed attempts
                     from app.SOS.hybrid_processor import ProcessingResult
                     failed_result = ProcessingResult(
-                        processing_mode="failed",
+                        processing_mode="error",  # Changed from "failed" to "error" for consistency
                         model_used="none",
                         selected_response="",
                         selection_reasoning="No response generated",
@@ -1144,7 +1146,7 @@ async def _try_hybrid_processing(
                     try:
                         # Training data recording placeholder
                         execution_details = {
-                            'execution_status': 'failed',
+                            'execution_status': 'error',  # Changed from 'failed' to 'error' to match DB constraints
                             'execution_time_ms': (time.time() - processing_start_time) * 1000,
                             'row_count': 0,
                             'error_message': 'No response generated from hybrid processor'
@@ -1459,6 +1461,13 @@ async def _try_hybrid_processing(
             "classification_time_ms": classification_time_ms or 0.0,
             "sql_execution_time_ms": sql_execution_time_ms or 0.0,
             "sql_execution_success": sql_execution_success,
+            # Token usage data
+            "token_usage": {
+                "prompt_tokens": processing_result.api_prompt_tokens or 0,
+                "completion_tokens": processing_result.api_completion_tokens or 0,
+                "total_tokens": (processing_result.api_prompt_tokens or 0) + (processing_result.api_completion_tokens or 0),
+                "cost_usd": processing_result.api_cost_usd or 0.0
+            } if processing_result.api_prompt_tokens is not None else None
         }
     }
 
@@ -3084,6 +3093,7 @@ async def answer(
     session_id: Optional[str] = None,
     client_ip: Optional[str] = None,
     user_agent: Optional[str] = None,
+    chat_id: Optional[int] = None,  # Add chat_id parameter
     cancellation_token: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """
@@ -3096,6 +3106,7 @@ async def answer(
         session_id: Session identifier for training data collection
         client_ip: Client IP address for training data collection
         user_agent: User agent string for training data collection
+        chat_id: Chat identifier for dashboard message recording
         cancellation_token: Function that returns True if operation should be cancelled
 
     Returns:
@@ -3367,6 +3378,7 @@ async def answer(
             client_ip=client_ip,
             user_agent=user_agent,
             hybrid_context_info=hybrid_context_info,  # Pass the forced table information
+            chat_id=chat_id,  # Pass chat_id for message recording
         )
 
         if hybrid_result and hybrid_result.get("status") == "success":

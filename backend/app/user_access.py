@@ -483,3 +483,117 @@ def get_user_statistics() -> Dict[str, int]:
     finally:
         if conn:
             release_db_connection(conn)
+
+def is_user_admin(user_id: str) -> bool:
+    """
+    Check if a user has admin access.
+    
+    Args:
+        user_id: Employee ID to check
+        
+    Returns:
+        bool: True if user has admin access, False otherwise
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+            SELECT COUNT(*) 
+            FROM user_access_list 
+            WHERE user_id = :user_id AND admin_access = 'Y' AND status = 'Y'
+        """
+        
+        cursor.execute(query, {'user_id': user_id})
+        count = cursor.fetchone()[0]
+        cursor.close()
+        return count > 0
+        
+    except cx_Oracle.Error as e:
+        logger.error(f"Database error checking user admin access: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error checking user admin access: {e}")
+        return False
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+
+def grant_admin_access(user_id: str) -> bool:
+    """
+    Grant admin access to a user.
+    
+    Args:
+        user_id: Employee ID to grant admin access to
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+            UPDATE user_access_list
+            SET admin_access = 'Y'
+            WHERE user_id = :user_id AND status = 'Y'
+        """
+        
+        cursor.execute(query, {'user_id': user_id})
+        rows_affected = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        
+        return rows_affected > 0
+        
+    except cx_Oracle.Error as e:
+        logger.error(f"Database error granting admin access: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error granting admin access: {e}")
+        return False
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+
+def revoke_admin_access(user_id: str) -> bool:
+    """
+    Revoke admin access from a user.
+    
+    Args:
+        user_id: Employee ID to revoke admin access from
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+            UPDATE user_access_list
+            SET admin_access = 'N'
+            WHERE user_id = :user_id AND status = 'Y'
+        """
+        
+        cursor.execute(query, {'user_id': user_id})
+        rows_affected = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        
+        return rows_affected > 0
+        
+    except cx_Oracle.Error as e:
+        logger.error(f"Database error revoking admin access: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error revoking admin access: {e}")
+        return False
+    finally:
+        if conn:
+            release_db_connection(conn)

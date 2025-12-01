@@ -47,14 +47,29 @@ import threading
 from typing import Any, Dict, Optional
 from fastapi.middleware.cors import CORSMiddleware
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 # PDF handling
 import PyPDF2
 
+# Configure logging early so it can be used throughout the module
+logger = logging.getLogger(__name__)
+
+import PyPDF2
+
+# Oracle error type (be tolerant to either driver)
+# Fixed type assignment issue by using sys.modules approach
+import sys
+
 # In-memory storage for token-username mapping (in production, use Redis or database)
-token_username_map = {}
-token_username_map_lock = threading.Lock()
+# DEPRECATED: Replaced with JWT tokens
+# token_username_map = {}
+# token_username_map_lock = threading.Lock()
 # Token expiration time (24 hours)
-TOKEN_EXPIRATION_TIME = 24 * 60 * 60
+# DEPRECATED: Token expiration now handled by JWT
+# TOKEN_EXPIRATION_TIME = 24 * 60 * 60
 
 # Function to clean up expired tokens
 def _cleanup_expired_tokens():
@@ -93,59 +108,7 @@ except ImportError:
 # Import datetime for timestamp handling
 from datetime import datetime as _dt
 
-# === Use the RAG orchestrator ===
-from app.SOS.rag_engine import answer as sos_rag_answer
-from app.ERP_R12_Test_DB.rag_engine import answer as erp_rag_answer
-
-# Optional: vector search utility still useful for debugging endpoints if you add any later
-from app.SOS.vector_store_chroma import hybrid_schema_value_search  # noqa: F401 (kept for parity)
-
-# Optional feedback DB exports
-from app.db_connector import connect_feedback
-
-# Import the user access module
-import app.user_access as user_access
-
-# Phase 5.2: Import quality metrics system
-QUALITY_METRICS_AVAILABLE = False
-
-# ---------------------------
-# optional: model names (used when inserting samples)
-# ---------------------------
-try:
-    from app.config import OLLAMA_SQL_MODEL, OLLAMA_ANALYTICAL_MODEL, COLLECT_TRAINING_DATA
-except Exception:
-    OLLAMA_SQL_MODEL = "unknown-sql-model"
-    OLLAMA_ANALYTICAL_MODEL = "unknown-summary-model"
-    COLLECT_TRAINING_DATA = True
-
-# ---------------------------
-# feedback-store helpers (soft import; fallback to no-ops)
-# expected signatures:
-#   insert_turn(source_db_id, client_ip, user_question, schema_context_text:str|None, schema_context_ids:list[str]|None, meta:dict|None) -> int
-#   insert_sql_sample(turn_id:int, model_name:str, prompt_text:str|None, sql_text:str|None, display_mode:str|None=None) -> int
-#   update_sql_sample(sql_sample_id:int, **cols)
-#   insert_summary_sample(turn_id:int, model_name:str, prompt_text:str|None, data_snapshot:str|None, sql_used:str|None, display_mode:str|None=None) -> int
-#   update_summary_sample(summary_sample_id:int, **cols)
-#   insert_feedback(...)
-# ---------------------------
-FEEDBACK_STORE_AVAILABLE = False
-
-def _noop(*args, **kwargs):
-    return None
-
-insert_turn = _noop
-insert_sql_sample = _noop
-update_sql_sample = _noop
-insert_summary_sample = _noop
-update_summary_sample = _noop
-insert_feedback = _noop
-
-# ---------------------------
-# app setup
-# ---------------------------
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-
+# Configure logging early so it can be used in imports
 logger = logging.getLogger(__name__)
 
 def configure_logging():
@@ -176,6 +139,99 @@ def configure_logging():
 
 # Configure logging
 configure_logging()
+
+# Admin access middleware
+def require_admin_access(request: Request):
+    """
+    Middleware function to require admin access for protected routes.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Raises:
+        HTTPException: If user is not authenticated as admin
+    """
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+
+# === Use the RAG orchestrator ===
+from app.SOS.rag_engine import answer as sos_rag_answer
+from app.ERP_R12_Test_DB.rag_engine import answer as erp_rag_answer
+
+# Optional: vector search utility still useful for debugging endpoints if you add any later
+from app.SOS.vector_store_chroma import hybrid_schema_value_search  # noqa: F401 (kept for parity)
+
+# Optional feedback DB exports
+from app.db_connector import connect_feedback
+
+# Import the user access module
+import app.user_access as user_access
+
+# Import the dashboard recorder
+from app.dashboard_recorder import get_dashboard_recorder
+
+# Phase 5.2: Import quality metrics system
+QUALITY_METRICS_AVAILABLE = False
+
+# ---------------------------
+# optional: model names (used when inserting samples)
+# ---------------------------
+try:
+    from app.config import OLLAMA_SQL_MODEL, OLLAMA_ANALYTICAL_MODEL, COLLECT_TRAINING_DATA
+except Exception:
+    OLLAMA_SQL_MODEL = "unknown-sql-model"
+    OLLAMA_ANALYTICAL_MODEL = "unknown-summary-model"
+    COLLECT_TRAINING_DATA = True
+
+# ---------------------------
+# feedback-store helpers (soft import; fallback to no-ops)
+# expected signatures:
+#   insert_turn(source_db_id, client_ip, user_question, schema_context_text:str|None, schema_context_ids:list[str]|None, meta:dict|None) -> int
+#   insert_sql_sample(turn_id:int, model_name:str, prompt_text:str|None, sql_text:str|None, display_mode:str|None=None) -> int
+#   update_sql_sample(sql_sample_id:int, **cols)
+#   insert_summary_sample(turn_id:int, model_name:str, prompt_text:str|None, data_snapshot:str|None, sql_used:str|None, display_mode:str|None=None) -> int
+#   update_summary_sample(summary_sample_id:int, **cols)
+#   insert_feedback(...)
+# ---------------------------
+FEEDBACK_STORE_AVAILABLE = True
+
+def _noop(*args, **kwargs):
+    return None
+
+# Try to import the actual feedback functions
+try:
+    from app.feedback_store import (
+        insert_turn,
+        insert_sql_sample,
+        update_sql_sample,
+        insert_summary_sample,
+        update_summary_sample,
+        insert_feedback,
+    )
+    FEEDBACK_STORE_AVAILABLE = True
+    logger.info("Feedback store initialized successfully")
+except ImportError as e:
+    logger.warning(f"Feedback store not available: {e}")
+    FEEDBACK_STORE_AVAILABLE = False
+    insert_turn = _noop
+    insert_sql_sample = _noop
+    update_sql_sample = _noop
+    insert_summary_sample = _noop
+    update_summary_sample = _noop
+    insert_feedback = _noop
+
+from fastapi.middleware.cors import CORSMiddleware
+
+# File storage configuration
+import PyPDF2
+
+# ---------------------------
+# app setup
+# ---------------------------
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
 # File storage configuration
 FILE_STORAGE_PATH = Path("uploaded_files")
@@ -398,16 +454,16 @@ def generate_session_id(request: Request) -> Optional[str]:
         # Generate session ID from request characteristics
         client_ip = request.client.host if request and request.client else "unknown"
         user_agent = request.headers.get('user-agent', 'unknown') if request and request.headers else "unknown"
-        timestamp = str(int(time.time() / 300))  # 5-minute windows for session grouping
+        timestamp = str(int(time.time() * 1000))  # Millisecond precision for better uniqueness
         
-        # Create a stable session ID for the same client within a time window
-        session_data = f"{client_ip}:{user_agent}:{timestamp}"
-        session_hash = hashlib.md5(session_data.encode('utf-8')).hexdigest()[:16]
+        # Create a more unique session ID using full timestamp and more entropy
+        session_data = f"{client_ip}:{user_agent}:{timestamp}:{str(uuid.uuid4())}"
+        session_hash = hashlib.md5(session_data.encode('utf-8')).hexdigest()[:20]
         return f"sess_{session_hash}"
     except Exception as e:
         logger.warning(f"Failed to generate session ID: {e}")
         # Fallback to a random UUID
-        return f"sess_{str(uuid.uuid4())[:16]}"
+        return f"sess_{str(uuid.uuid4())}"
 
 app = FastAPI(title="Oracle SQL Assistant (RAG-enabled)", version="2.0")
 
@@ -440,7 +496,7 @@ async def log_requests(request: Request, call_next):
 # ---------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -658,6 +714,8 @@ class FeedbackIn(BaseModel):
     comment: Optional[str] = None
     labeler_role: Optional[str] = "end_user"
     source: Optional[str] = None  # 'api' or 'local'
+    chat_id: Optional[int] = None
+    message_id: Optional[int] = None
 
 # File upload models
 class FileUploadResponse(BaseModel):
@@ -761,6 +819,11 @@ async def oracle_error_handler(request: Request, exc: Exception):
                 "ORA-01427": "Single-row subquery returns more than one row",
                 "ORA-12899": "Value too large for column",
             }.get(error_code, text)
+            
+            # Record system message for Oracle errors
+            dashboard_recorder = get_dashboard_recorder()
+            # We would need to extract session/chat info from request context if available
+            
             return JSONResponse(
                 status_code=400,
                 content={
@@ -793,30 +856,96 @@ async def chat_api(question: Question, request: Request):
         # Log the processing details
         logger.info(f"[MAIN] Processing query with mode={mode}, db={selected_db}")
 
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+
         # === Call the appropriate RAG orchestrator based on mode ===
+        session_id = generate_session_id(request)
+        chat_id = None  # Initialize chat_id
         if mode in ("PRAN_ERP", "RFL_ERP"):
+            # Record session and chat in dashboard first for ERP modes
+            username = _get_username_from_request(request)
+            if username and session_id:
+                # Start user session
+                dashboard_recorder.start_user_session(
+                    session_id=session_id,
+                    user_id=username,
+                    username=username,
+                    ip_address=request.client.host if request and request.client else "unknown",
+                    user_agent=request.headers.get('user-agent', 'unknown') if request and request.headers else "unknown"
+                )
+                
+                # Start chat
+                chat_id = dashboard_recorder.start_chat_session(
+                    session_id=session_id,
+                    user_id=username,
+                    username=username,
+                    database_type=selected_db,
+                    query_mode=mode
+                )
+                
+                # Record system message for ERP mode start
+                if chat_id:
+                    dashboard_recorder.record_system_message(
+                        chat_id=chat_id,
+                        content=f"Started ERP processing session with mode: {mode}, database: {selected_db}",
+                        status="success"
+                    )
+            
             # For both ERP modes, use the ERP R12 engine but with different databases
+            # Pass chat_id to ERP RAG engine for message recording
             output = await erp_rag_answer(
                 question.question, 
                 selected_db=selected_db,
                 mode=mode,
                 # Phase 5: Pass training data collection parameters for hybrid processing
-                session_id=generate_session_id(request),
+                session_id=session_id,
                 client_ip=request.client.host if request and request.client else None,
                 user_agent=request.headers.get('user-agent') if request and request.headers else None,
                 page=question.page or 1,
-                page_size=question.page_size or 1000
+                page_size=question.page_size or 1000,
+                chat_id=chat_id  # Pass chat_id for message recording
             )
         else:
-            # Use SOS RAG engine for General and SOS modes
+            # Record session and chat in dashboard first for SOS modes
+            username = _get_username_from_request(request)
+            if username and session_id:
+                # Start user session
+                dashboard_recorder.start_user_session(
+                    session_id=session_id,
+                    user_id=username,
+                    username=username,
+                    ip_address=request.client.host if request and request.client else "unknown",
+                    user_agent=request.headers.get('user-agent', 'unknown') if request and request.headers else "unknown"
+                )
+                
+                # Start chat
+                chat_id = dashboard_recorder.start_chat_session(
+                    session_id=session_id,
+                    user_id=username,
+                    username=username,
+                    database_type=selected_db,
+                    query_mode=mode
+                )
+                
+                # Record system message for SOS mode start
+                if chat_id:
+                    dashboard_recorder.record_system_message(
+                        chat_id=chat_id,
+                        content=f"Started SOS processing session with mode: {mode}, database: {selected_db}",
+                        status="success"
+                    )
+            
+            # Pass chat_id to RAG engine for message recording
             output = await sos_rag_answer(
                 question.question, 
                 selected_db=selected_db,
                 mode=mode,  # Pass the new mode parameter
                 # Phase 5: Pass training data collection parameters for hybrid processing
-                session_id=generate_session_id(request),
+                session_id=session_id,
                 client_ip=request.client.host if request and request.client else None,
-                user_agent=request.headers.get('user-agent') if request and request.headers else None
+                user_agent=request.headers.get('user-agent') if request and request.headers else None,
+                chat_id=chat_id  # Pass chat_id for message recording
             )
 
         # Log the output
@@ -827,27 +956,172 @@ async def chat_api(question: Question, request: Request):
                 logger.info(f"[MAIN] Generated summary: {output['summary'][:200]}...")
             logger.info(f"[MAIN] Query processing completed successfully")
 
+        # Record user query message
+        user_query_message_id = None
+        ai_response_message_id = None
+        if chat_id is not None and output:
+            # Record user query
+            user_query_message_id = dashboard_recorder.record_user_query(
+                chat_id=chat_id,
+                content=question.question
+            )
+            
+            # Record AI response if available
+            if "sql" in output or "summary" in output:
+                response_content = ""
+                if "summary" in output and output["summary"]:
+                    response_content = output["summary"]
+                if "sql" in output and output["sql"]:
+                    response_content += f"\n\nSQL: {output['sql']}"
+                    
+                ai_response_message_id = dashboard_recorder.record_ai_response(
+                    chat_id=chat_id,
+                    content=response_content,
+                    model_name=output.get("hybrid_metadata", {}).get("model_used") if output.get("hybrid_metadata") else None,
+                    status="success" if output.get("status") != "error" else "error"
+                )
+                
+                # Query history will be recorded after results variable is defined
+                
+                # Record token usage if available in hybrid metadata
+                if output.get("hybrid_metadata") and chat_id and ai_response_message_id:
+                    hybrid_meta = output["hybrid_metadata"]
+                    
+                    # Extract token usage data from various possible locations
+                    token_usage = None
+                    model_name = hybrid_meta.get("model_used", "unknown")
+                    
+                    # Check primary location in hybrid metadata
+                    if "token_usage" in hybrid_meta and isinstance(hybrid_meta["token_usage"], dict):
+                        token_usage = hybrid_meta["token_usage"]
+                    # Check in nested metadata
+                    elif "metadata" in hybrid_meta and isinstance(hybrid_meta["metadata"], dict):
+                        metadata = hybrid_meta["metadata"]
+                        if "token_usage" in metadata and isinstance(metadata["token_usage"], dict):
+                            token_usage = metadata["token_usage"]
+                    
+                    # If we found token usage data, record it
+                    if token_usage and isinstance(token_usage, dict):
+                        # Extract token counts
+                        prompt_tokens = token_usage.get("prompt_tokens", 0)
+                        completion_tokens = token_usage.get("completion_tokens", 0)
+                        total_tokens = token_usage.get("total_tokens", prompt_tokens + completion_tokens)
+                        
+                        # Only record if we have token data
+                        if total_tokens > 0:
+                            # Calculate cost based on token usage
+                            # Simple cost calculation (in a real system, this would use actual pricing)
+                            cost_usd = (
+                                prompt_tokens * 0.0000001 +  # Prompt token cost
+                                completion_tokens * 0.0000002 +  # Completion token cost
+                                0.0001  # Base model cost per request
+                            )
+                            
+                            # Get database type from chat for token usage recording
+                            database_type = None
+                            try:
+                                chat = dashboard_recorder.dashboard_service.chats.get_chat_by_id(chat_id)
+                                database_type = chat.get('database_type') if chat else None
+                            except Exception as e:
+                                logger.error(f"Error getting database type for token usage recording: {str(e)}")
+                            
+                            dashboard_recorder.record_token_usage(
+                                chat_id=chat_id,
+                                message_id=ai_response_message_id,
+                                model_type="api",  # Assuming API model for hybrid processing
+                                model_name=model_name,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                cost_usd=round(cost_usd, 6),
+                                database_type=database_type
+                            )
+                    
+                    # Also check for token usage in the main output (for non-hybrid responses)
+                    elif "token_usage" in output and isinstance(output["token_usage"], dict):
+                        token_usage = output["token_usage"]
+                        model_name = output.get("model_used", "unknown")
+                        
+                        # Extract token counts
+                        prompt_tokens = token_usage.get("prompt_tokens", 0)
+                        completion_tokens = token_usage.get("completion_tokens", 0)
+                        total_tokens = token_usage.get("total_tokens", prompt_tokens + completion_tokens)
+                        
+                        # Only record if we have token data
+                        if total_tokens > 0:
+                            # Calculate cost based on token usage
+                            cost_usd = (
+                                prompt_tokens * 0.0000001 +  # Prompt token cost
+                                completion_tokens * 0.0000002 +  # Completion token cost
+                                0.0001  # Base model cost per request
+                            )
+                            
+                            # Get database type from chat for token usage recording
+                            database_type = None
+                            try:
+                                chat = dashboard_recorder.dashboard_service.chats.get_chat_by_id(chat_id)
+                                database_type = chat.get('database_type') if chat else None
+                            except Exception as e:
+                                logger.error(f"Error getting database type for token usage recording: {str(e)}")
+                            
+                            dashboard_recorder.record_token_usage(
+                                chat_id=chat_id,
+                                message_id=ai_response_message_id,
+                                model_type="api",
+                                model_name=model_name,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                cost_usd=round(cost_usd, 6),
+                                database_type=database_type
+                            )
+
         # Handle case where output is None
         if output is None:
             output = {}
 
         # Error passthrough (keep legacy shape)
         if isinstance(output, dict) and output.get("status") == "error":
-            return {
-                "status": "error",
-                "message": output.get("message") or output.get("error") or "Request failed.",
-                "sql": output.get("sql"),
-                "schema_context": output.get("schema_context", []),
-                "schema_context_ids": output.get("schema_context_ids", []),
-                "suggestions": output.get(
-                    "suggestions",
-                    [
-                        "Try rephrasing your question",
-                        "Be specific about the table or field names",
-                        "Add a time window (e.g., 'last 30 days', 'May-2025')",
-                    ],
-                ),
-            }
+            # Record error in dashboard
+            if chat_id is not None:
+                error_message_id = dashboard_recorder.record_ai_response(
+                    chat_id=chat_id,
+                    content=f"Error: {output.get('message', 'Unknown error')}",
+                    status="error"
+                )
+                
+                # Record query history for failed processing
+                database_type = None
+                try:
+                    chat = dashboard_recorder.dashboard_service.chats.get_chat_by_id(chat_id)
+                    database_type = chat.get('database_type') if chat else None
+                except Exception as e:
+                    logger.error(f"Error getting database type for query history recording: {str(e)}")
+                
+                # Ensure we have a valid session_id
+                query_session_id = session_id if session_id else str(uuid.uuid4())
+                
+                # Record the failed query in history
+                dashboard_recorder.record_query_history(
+                    user_id=username if username else "unknown",
+                    session_id=query_session_id,
+                    user_query=question.question,
+                    final_sql="",
+                    execution_status="error",
+                    execution_time_ms=None,
+                    row_count=0,
+                    database_type=database_type,
+                    query_mode=mode,
+                    feedback_type="wrong",
+                    feedback_comment=output.get('message', 'Unknown error')
+                )
+                
+                # Record system message for error
+                dashboard_recorder.record_system_message(
+                    chat_id=chat_id,
+                    content=f"Processing error occurred: {output.get('message', 'Unknown error')}",
+                    status="error"
+                )
 
         # Success path (normalize fields exactly like before)
         display_mode = output.get("display_mode", "table") if output else "table"
@@ -857,6 +1131,59 @@ async def chat_api(question: Question, request: Request):
             "row_count": (output.get("results") or {}).get("row_count", 0) if output else 0,
         }
 
+        # Record query history for successful processing
+        if output and output.get("status") != "error" and output.get("sql"):
+            # Get database type from chat for query history recording
+            database_type = None
+            try:
+                if chat_id is not None:
+                    chat = dashboard_recorder.dashboard_service.chats.get_chat_by_id(chat_id)
+                    database_type = chat.get('database_type') if chat else None
+            except Exception as e:
+                logger.error(f"Error getting database type for query history recording: {str(e)}")
+            
+            # Ensure we have a valid session_id
+            query_session_id = session_id if session_id else str(uuid.uuid4())
+            
+            # Record the query in history
+            dashboard_recorder.record_query_history(
+                user_id=username if username else "unknown",
+                session_id=query_session_id,
+                user_query=question.question,
+                final_sql=output.get("sql", ""),
+                execution_status="success",
+                execution_time_ms=None,  # Will be updated later if available
+                row_count=results.get("row_count", 0) if results else 0,
+                database_type=database_type,
+                query_mode=mode
+            )
+        # Fix: Add support for recording General mode queries even when there's no SQL
+        elif mode == "General" and output and output.get("status") != "error":
+            # Get database type from chat for query history recording
+            database_type = None
+            try:
+                if chat_id is not None:
+                    chat = dashboard_recorder.dashboard_service.chats.get_chat_by_id(chat_id)
+                    database_type = chat.get('database_type') if chat else None
+            except Exception as e:
+                logger.error(f"Error getting database type for query history recording: {str(e)}")
+            
+            # Ensure we have a valid session_id
+            query_session_id = session_id if session_id else str(uuid.uuid4())
+            
+            # Record the General mode query in history
+            dashboard_recorder.record_query_history(
+                user_id=username if username else "unknown",
+                session_id=query_session_id,
+                user_query=question.question,
+                final_sql="",  # Empty string for General mode (no SQL)
+                execution_status="success",
+                execution_time_ms=None,
+                row_count=None,
+                database_type=database_type,
+                query_mode=mode
+            )
+        
         # ---------------------------
         # Feedback IDs (same as your legacy code)
         # ---------------------------
@@ -943,6 +1270,13 @@ async def chat_api(question: Question, request: Request):
                 }
             except Exception as fe:
                 logging.getLogger(__name__).warning(f"[feedback_store] Could not create feedback IDs: {fe}")
+                # Record system message for feedback error
+                if chat_id:
+                    dashboard_recorder.record_system_message(
+                        chat_id=chat_id,
+                        content=f"Warning: Could not create feedback IDs: {fe}",
+                        status="error"
+                    )
         response_payload = {
             "status": "success",
             "summary": output.get("summary", "") if output else "",
@@ -951,6 +1285,8 @@ async def chat_api(question: Question, request: Request):
             "results": results,
             "schema_context": output.get("schema_context", []) if output else [],
             "schema_context_ids": output.get("schema_context_ids", []) if output else [],
+            "chat_id": chat_id,
+            "message_id": ai_response_message_id
         }
         
         # Phase 4.2: Add hybrid processing metadata if available
@@ -960,12 +1296,33 @@ async def chat_api(question: Question, request: Request):
         if ids:
             response_payload["ids"] = ids
 
+        # End the chat session
+        if chat_id is not None and session_id is not None:
+            dashboard_recorder.end_chat_session(session_id, "completed")
+            dashboard_recorder.end_user_session(session_id)
+            
+            # Record system message for session completion
+            dashboard_recorder.record_system_message(
+                chat_id=chat_id,
+                content="Chat session completed successfully",
+                status="success"
+            )
+
         return response_payload
 
     except HTTPException:
         raise
     except Exception as e:
         logging.getLogger(__name__).error(f"Unexpected error: {e}", exc_info=True)
+        # Record system message for unexpected errors
+        dashboard_recorder = getattr(locals(), 'dashboard_recorder', get_dashboard_recorder())
+        chat_id = locals().get('chat_id')
+        if chat_id:
+            dashboard_recorder.record_system_message(
+                chat_id=chat_id,
+                content=f"Unexpected error occurred: {str(e)}",
+                status="error"
+            )
         # Return envelope your frontend can render as an error bubble
         return JSONResponse(
             status_code=500,
@@ -1011,7 +1368,7 @@ async def post_feedback(payload: FeedbackIn, request: Request):
     if payload.feedback_type == "needs_improvement" and not (payload.comment and payload.comment.strip()):
         logger.warning("Feedback validation failed: comment required for needs_improvement feedback")
         return JSONResponse(status_code=400, content={"error": "comment required for needs_improvement"})
-
+    
     try:
         # Record feedback in the old system (for backward compatibility)
         fid = insert_feedback(
@@ -1029,6 +1386,39 @@ async def post_feedback(payload: FeedbackIn, request: Request):
             },
         )
         
+        # Record feedback in the dashboard system
+        try:
+            from app.dashboard_recorder import get_dashboard_recorder
+            dashboard_recorder = get_dashboard_recorder()
+            
+            if dashboard_recorder:
+                # Use chat_id and message_id directly if provided, otherwise map from old system
+                chat_id = payload.chat_id if payload.chat_id is not None else payload.turn_id
+                message_id = payload.message_id if payload.message_id is not None else (payload.sql_sample_id or payload.summary_sample_id or 0)
+                
+                # Map feedback type to a score (1-5)
+                feedback_score_map = {
+                    "good": 5,
+                    "wrong": 1,
+                    "needs_improvement": 3
+                }
+                feedback_score = feedback_score_map.get(payload.feedback_type, 3)
+                
+                # Record feedback in dashboard
+                dashboard_feedback_id = dashboard_recorder.record_feedback(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    feedback_type=payload.feedback_type,
+                    feedback_score=feedback_score,
+                    feedback_comment=payload.comment
+                )
+                
+                if dashboard_feedback_id:
+                    logger.info(f"Feedback recorded in dashboard - Feedback ID: {dashboard_feedback_id}")
+                else:
+                    logger.warning("Failed to record feedback in dashboard")
+        except Exception as dashboard_error:
+            logger.exception(f"Failed to record feedback in dashboard: {dashboard_error}")
         
         logger.info(f"Feedback processed successfully - Feedback ID: {fid}")
         return {"feedback_id": fid, "status": "created"}
@@ -1985,6 +2375,23 @@ async def analyze_file(request: FileAnalysisRequest, req: Request):
             detail=f"Failed to analyze file: {str(e)}"
         )
 
+@app.post("/admin/logout")
+@app.post("/logout")
+async def logout(request: Request):
+    """
+    User logout endpoint (JWT tokens are stateless, so this just returns success).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Logout success message
+    """
+    # With JWT tokens, logout is stateless - no server-side token invalidation needed
+    # In a more secure implementation, you might want to maintain a token blacklist
+    return {"success": True, "message": "Logged out successfully"}
+
+
 @app.get("/file-upload-status")
 async def get_file_upload_status(request: Request):
     """
@@ -2050,7 +2457,7 @@ async def get_file_upload_status(request: Request):
 
 def _get_username_from_request(request: Request) -> str | None:
     """
-    Extract username from request using token.
+    Extract username from request using JWT token.
     
     Args:
         request: FastAPI Request object
@@ -2059,27 +2466,33 @@ def _get_username_from_request(request: Request) -> str | None:
         Username if found, None otherwise
     """
     try:
-        # Extract token from Authorization header or custom header
+        # Extract token from Authorization header
         auth_header = request.headers.get("Authorization")
+        token = None
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header[7:]  # Remove "Bearer " prefix
         else:
             # Check for custom auth token header
             token = request.headers.get("X-Auth-Token") or request.headers.get("authToken")
         
-        # Look up username from token-username mapping
+        # Decode JWT token to get username
         if token:
-            logger.info(f"Looking up token: {token}")
-            with token_username_map_lock:
-                username = token_username_map.get(token)
-                logger.info(f"Token map contents: {token_username_map}")
-                logger.info(f"Found username for token: {username}")
-            if username:
+            from app.jwt_utils import decode_access_token
+            payload = decode_access_token(token)
+            if payload and "sub" in payload:
+                username = payload["sub"]
+                logger.info(f"Successfully decoded JWT token for user: {username}")
                 return username
+            else:
+                logger.warning("Invalid or expired JWT token")
         else:
             logger.info("No token found in request")
+            logger.info(f"Authorization header: {auth_header}")
+            logger.info(f"All headers: {dict(request.headers)}")
     except Exception as e:
         logger.warning(f"Failed to extract username from request: {e}")
+        import traceback
+        logger.warning(f"Traceback: {traceback.format_exc()}")
     
     return None
 
@@ -2094,7 +2507,9 @@ def _is_admin_user(request: Request) -> bool:
         True if user is admin, False otherwise
     """
     username = _get_username_from_request(request)
-    return username == "AdminMIS"
+    if not username:
+        return False
+    return user_access.is_user_admin(username)
 
 @app.get("/admin/metrics")
 async def get_admin_metrics(request: Request):
@@ -2153,13 +2568,13 @@ async def get_admin_recent_activity(request: Request):
 @app.post("/login", response_model=dict)
 async def login(login_request: dict):
     """
-    Authenticate user by calling external HRIS API directly or admin credentials.
+    Authenticate user by calling external HRIS API directly.
     
     Args:
         login_request: Dictionary containing username and password
         
     Returns:
-        Authentication result with success status and optional token
+        Authentication result with success status and JWT token
     """
     try:
         username = login_request.get("username")
@@ -2171,20 +2586,20 @@ async def login(login_request: dict):
                 detail="Username and password are required"
             )
         
-        # Check for admin credentials first
+        # Check for hardcoded admin credentials
         if username == "AdminMIS" and password == "mis123":
-            # Generate a simple token for admin (in production, use JWT or similar)
-            import uuid
-            token = str(uuid.uuid4())
-            
-            # Store token-username mapping
-            with token_username_map_lock:
-                token_username_map[token] = username
+            # Create JWT token
+            from app.jwt_utils import create_access_token
+            from datetime import timedelta
+            access_token_expires = timedelta(minutes=1440)  # 24 hours
+            access_token = create_access_token(
+                data={"sub": username}, expires_delta=access_token_expires
+            )
             
             return {
                 "success": True,
-                "message": "Admin login successful",
-                "token": token,
+                "message": "Login successful",
+                "token": access_token,
                 "isAdmin": True
             }
         
@@ -2228,19 +2643,22 @@ async def login(login_request: dict):
             is_success = response_data.get("isSuccess", False)
             
             if is_success:
-                # Generate a simple token (in production, use JWT or similar)
-                import uuid
-                token = str(uuid.uuid4())
+                # Create JWT token
+                from app.jwt_utils import create_access_token
+                from datetime import timedelta
+                access_token_expires = timedelta(minutes=1440)  # 24 hours
+                access_token = create_access_token(
+                    data={"sub": username}, expires_delta=access_token_expires
+                )
                 
-                # Store token-username mapping
-                with token_username_map_lock:
-                    token_username_map[token] = username
+                # Check if user has admin access
+                is_admin = user_access.is_user_admin(username)
                 
                 return {
                     "success": True,
                     "message": "Login successful",
-                    "token": token,
-                    "isAdmin": False
+                    "token": access_token,
+                    "isAdmin": is_admin
                 }
             else:
                 raise HTTPException(
@@ -2251,77 +2669,6 @@ async def login(login_request: dict):
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
-    except Exception as e:
-        logger.exception("Login error")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Login failed: {str(e)}"
-        )
-
-@app.post("/admin/logout")
-async def admin_logout(request: Request):
-    """
-    Admin logout endpoint to invalidate token.
-    
-    Args:
-        request: FastAPI Request object
-        
-    Returns:
-        Logout success message
-    """
-    try:
-        # Extract token from Authorization header or custom header
-        auth_header = request.headers.get("Authorization")
-        token = None
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header[7:]  # Remove "Bearer " prefix
-        else:
-            # Check for custom auth token header
-            token = request.headers.get("X-Auth-Token") or request.headers.get("authToken")
-        
-        # Remove token from token-username mapping
-        if token:
-            with token_username_map_lock:
-                if token in token_username_map:
-                    del token_username_map[token]
-        
-        return {"success": True, "message": "Logged out successfully"}
-    except Exception as e:
-        logger.exception("Logout error")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Logout failed: {str(e)}"
-        )
-
-
-@app.post("/logout")
-async def logout(request: Request):
-    """
-    User logout endpoint to invalidate token.
-    
-    Args:
-        request: FastAPI Request object
-        
-    Returns:
-        Logout success message
-    """
-    try:
-        # Extract token from Authorization header or custom header
-        auth_header = request.headers.get("Authorization")
-        token = None
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header[7:]  # Remove "Bearer " prefix
-        else:
-            # Check for custom auth token header
-            token = request.headers.get("X-Auth-Token") or request.headers.get("authToken")
-        
-        # Remove token from token-username mapping
-        if token:
-            with token_username_map_lock:
-                if token in token_username_map:
-                    del token_username_map[token]
-        
-        return {"success": True, "message": "Logged out successfully"}
     except Exception as e:
         logger.exception("Logout error")
         raise HTTPException(
@@ -2480,6 +2827,158 @@ async def get_user_stats(request: Request):
             detail=f"Failed to fetch user statistics: {str(e)}"
         )
 
+@app.get("/admin/authorized-users", response_model=dict)
+async def get_authorized_users_endpoint(request: Request):
+    """
+    Get all authorized users (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        List of authorized users with admin status information
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        
+        # Get authorized users
+        users = user_access.get_authorized_users()
+        
+        # Add admin status information to each user
+        for user in users:
+            user_id = user.get('USER_ID')
+            if user_id:
+                user['is_admin'] = user_access.is_user_admin(user_id)
+        
+        return {
+            "success": True,
+            "users": users
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching authorized users")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch authorized users: {str(e)}"
+        )
+
+
+class AdminAccessUpdate(BaseModel):
+    user_id: str
+
+
+@app.post("/admin/grant-admin-access", response_model=dict)
+async def grant_admin_access_endpoint(user_data: AdminAccessUpdate, request: Request):
+    """
+    Grant admin access to a user (admin only).
+    
+    Args:
+        user_data: User data containing user_id
+        request: FastAPI Request object
+        
+    Returns:
+        Grant admin access result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        user_id = user_data.user_id
+        if not user_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing required field: user_id"
+            )
+        
+        # Grant admin access
+        success = user_access.grant_admin_access(user_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"Admin access granted to user {user_id} successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"User {user_id} not found or already has admin access"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error granting admin access")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to grant admin access: {str(e)}"
+        )
+
+
+@app.post("/admin/revoke-admin-access", response_model=dict)
+async def revoke_admin_access_endpoint(user_data: AdminAccessUpdate, request: Request):
+    """
+    Revoke admin access from a user (admin only).
+    
+    Args:
+        user_data: User data containing user_id
+        request: FastAPI Request object
+        
+    Returns:
+        Revoke admin access result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        user_id = user_data.user_id
+        if not user_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing required field: user_id"
+            )
+        
+        # Revoke admin access
+        success = user_access.revoke_admin_access(user_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": f"Admin access revoked from user {user_id} successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"User {user_id} not found or doesn't have admin access"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error revoking admin access")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to revoke admin access: {str(e)}"
+        )
+
 
 @app.post("/admin/approve-request/{request_id}", response_model=dict)
 async def approve_request(request_id: int, request: Request):
@@ -2577,8 +3076,8 @@ async def add_user(user_data: dict, request: Request):
     Args:
         user_data: Dictionary containing user information
             - user_id: Employee ID
-            - full_name: Full name of the user
-            - email: Email address
+            - full_name: Full name of the user (optional, defaults to "User {user_id}")
+            - email: Email address (optional, defaults to "{user_id}@company.com")
             - designation: Job designation (optional)
             - department: Department name (optional)
         request: FastAPI Request object
@@ -2594,27 +3093,39 @@ async def add_user(user_data: dict, request: Request):
         )
     
     try:
-        
-        # Validate required fields
-        required_fields = ['user_id', 'full_name', 'email']
-        for field in required_fields:
-            if not user_data.get(field):
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Missing required field: {field}"
-                )
-        
-        # Validate email format
-        import re
-        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        if not re.match(email_pattern, user_data['email']):
+        # Validate required field
+        user_id = user_data.get("user_id")
+        if not user_id:
             raise HTTPException(
                 status_code=400, 
-                detail="Invalid email format"
+                detail="Missing required field: user_id"
             )
         
+        # Set default values for optional fields if not provided
+        full_name = user_data.get("full_name", f"User {user_id}")
+        email = user_data.get("email", f"{user_id}@company.com")
+        
+        # Validate email format if provided
+        if email != f"{user_id}@company.com":  # Only validate if not using default
+            import re
+            email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+            if not re.match(email_pattern, email):
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Invalid email format"
+                )
+        
+        # Prepare user data with defaults
+        user_data_with_defaults = {
+            "user_id": user_id,
+            "full_name": full_name,
+            "email": email,
+            "designation": user_data.get("designation", ""),
+            "department": user_data.get("department", "")
+        }
+        
         # Add the user directly
-        success = user_access.add_user_directly(user_data)
+        success = user_access.add_user_directly(user_data_with_defaults)
         
         if success:
             return {
@@ -2633,7 +3144,7 @@ async def add_user(user_data: dict, request: Request):
     except Exception as e:
         logger.exception("Error adding user")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Failed to add user: {str(e)}"
         )
 
@@ -2779,4 +3290,980 @@ async def get_authorized_users_endpoint(request: Request):
             detail=f"Failed to fetch authorized users: {str(e)}"
         )
 
+# ---------------------------
+# Admin Dashboard Query History Endpoints
+# ---------------------------
 
+class QueryHistoryRecord(BaseModel):
+    user_id: Optional[str] = None
+    session_id: str
+    user_query: str
+    final_sql: str
+    execution_status: str = "success"
+    execution_time_ms: Optional[int] = None
+    row_count: Optional[int] = None
+    database_type: Optional[str] = None
+    query_mode: Optional[str] = None
+    feedback_type: Optional[str] = None
+    feedback_comment: Optional[str] = None
+
+class QueryFeedbackUpdate(BaseModel):
+    feedback_type: str
+    feedback_comment: Optional[str] = None
+
+class QueryExecutionResultUpdate(BaseModel):
+    execution_status: str
+    execution_time_ms: Optional[int] = None
+    row_count: Optional[int] = None
+
+@app.post("/admin/dashboard/query-history", response_model=dict)
+async def record_query_history(payload: QueryHistoryRecord, request: Request):
+    """
+    Record a new query in the dashboard query history.
+    
+    Args:
+        payload: Query history record data
+        request: FastAPI Request object
+        
+    Returns:
+        Query recording result with query ID
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Record the query history
+        query_id = dashboard_recorder.record_query_history(
+            user_id=payload.user_id,
+            session_id=payload.session_id,
+            user_query=payload.user_query,
+            final_sql=payload.final_sql,
+            execution_status=payload.execution_status,
+            execution_time_ms=payload.execution_time_ms,
+            row_count=payload.row_count,
+            database_type=payload.database_type,
+            query_mode=payload.query_mode,
+            feedback_type=payload.feedback_type,
+            feedback_comment=payload.feedback_comment
+        )
+        
+        if query_id:
+            return {
+                "success": True,
+                "query_id": query_id,
+                "message": "Query history recorded successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to record query history"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error recording query history")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to record query history: {str(e)}"
+        )
+
+@app.put("/admin/dashboard/query-history/{query_id}/feedback", response_model=dict)
+async def update_query_feedback(query_id: int, payload: QueryFeedbackUpdate, request: Request):
+    """
+    Update feedback for a query in the dashboard query history.
+    
+    Args:
+        query_id: ID of the query to update
+        payload: Feedback update data
+        request: FastAPI Request object
+        
+    Returns:
+        Feedback update result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Update the query feedback
+        success = dashboard_recorder.dashboard_service.query_history.update_query_feedback(
+            query_id=query_id,
+            feedback_type=payload.feedback_type,
+            feedback_comment=payload.feedback_comment
+        )
+        
+        if success:
+            return {
+                "success": True,
+                "message": "Query feedback updated successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=404, 
+                detail="Query not found or failed to update feedback"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error updating query feedback")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to update query feedback: {str(e)}"
+        )
+
+@app.put("/admin/dashboard/query-history/{query_id}/execution-result", response_model=dict)
+async def update_query_execution_result(query_id: int, payload: QueryExecutionResultUpdate, request: Request):
+    """
+    Update execution result for a query in the dashboard query history.
+    
+    Args:
+        query_id: ID of the query to update
+        payload: Execution result update data
+        request: FastAPI Request object
+        
+    Returns:
+        Execution result update result
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Update the query execution result
+        success = dashboard_recorder.dashboard_service.query_history.update_query_execution_result(
+            query_id=query_id,
+            execution_status=payload.execution_status,
+            execution_time_ms=payload.execution_time_ms,
+            row_count=payload.row_count
+        )
+        
+        if success:
+            return {
+                "success": True,
+                "message": "Query execution result updated successfully"
+            }
+        else:
+            raise HTTPException(
+                status_code=404, 
+                detail="Query not found or failed to update execution result"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error updating query execution result")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to update query execution result: {str(e)}"
+        )
+
+@app.get("/admin/dashboard/query-history", response_model=dict)
+async def get_query_history(
+    request: Request,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Get query history from the dashboard query history table.
+    
+    Args:
+        request: FastAPI Request object
+        user_id: Filter by user ID (optional)
+        session_id: Filter by session ID (optional)
+        limit: Maximum number of records to return (default: 100)
+        
+    Returns:
+        Query history records
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get query history based on filters
+        if user_id:
+            queries = dashboard_recorder.dashboard_service.query_history.get_queries_by_user(
+                user_id=user_id, 
+                limit=limit
+            )
+        elif session_id:
+            queries = dashboard_recorder.dashboard_service.query_history.get_queries_by_session(
+                session_id=session_id, 
+                limit=limit
+            )
+        else:
+            queries = dashboard_recorder.dashboard_service.query_history.get_recent_queries(
+                limit=limit
+            )
+        
+        return {
+            "success": True,
+            "queries": queries,
+            "count": len(queries)
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching query history")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch query history: {str(e)}"
+        )
+
+@app.get("/admin/dashboard/query-history/statistics", response_model=dict)
+async def get_query_statistics(request: Request):
+    """
+    Get query statistics from the dashboard query history table.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Query statistics
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get query statistics
+        statistics = dashboard_recorder.dashboard_service.query_history.get_query_statistics()
+        feedback_stats = dashboard_recorder.dashboard_service.query_history.get_feedback_statistics()
+        
+        return {
+            "success": True,
+            "statistics": statistics,
+            "feedback_statistics": feedback_stats
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching query statistics")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch query statistics: {str(e)}"
+        )
+
+# ---------------------------
+# Model Status Management Endpoints
+# ---------------------------
+
+@app.get("/admin/model-status", response_model=dict)
+async def get_model_status(request: Request):
+    """
+    Get current status of all models (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Model status information
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get all model statuses
+        model_statuses = dashboard_recorder.dashboard_service.model_status.get_all_model_statuses()
+        
+        return {
+            "success": True,
+            "model_statuses": model_statuses
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching model status")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch model status: {str(e)}"
+        )
+
+@app.get("/chat-history", response_model=dict)
+async def get_chat_history(
+    request: Request,
+    database_type: Optional[str] = None,
+    query_mode: Optional[str] = None,
+    limit: int = 50
+):
+    """
+    Get filtered chat history for the current user.
+    
+    Args:
+        request: FastAPI Request object
+        database_type: Filter by database type (optional)
+        query_mode: Filter by query mode (optional)
+        limit: Maximum number of records to return (default: 50)
+        
+    Returns:
+        Filtered chat history records
+    """
+    try:
+        # Get current user
+        username = _get_username_from_request(request)
+        if not username:
+            raise HTTPException(
+                status_code=401, 
+                detail="User not authenticated"
+            )
+        
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get filtered query history
+        queries = dashboard_recorder.dashboard_service.query_history.get_filtered_query_history(
+            user_id=username,
+            database_type=database_type,
+            query_mode=query_mode,
+            limit=limit
+        )
+        
+        return {
+            "success": True,
+            "queries": queries,
+            "count": len(queries)
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching chat history")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch chat history: {str(e)}"
+        )
+
+
+@app.post("/chat-history/restore", response_model=dict)
+async def restore_chat_history_item(payload: dict, request: Request):
+    """
+    Restore a chat history item by executing its stored SQL.
+    
+    Args:
+        payload: Contains query_id to restore
+        request: FastAPI Request object
+        
+    Returns:
+        Restored query results
+    """
+    try:
+        query_id = payload.get("query_id")
+        if not query_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="query_id is required"
+            )
+        
+        # Get current user
+        username = _get_username_from_request(request)
+        if not username:
+            raise HTTPException(
+                status_code=401, 
+                detail="User not authenticated"
+            )
+        
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get the query record
+        query_record = dashboard_recorder.dashboard_service.query_history.get_query_by_id(query_id)
+        if not query_record:
+            raise HTTPException(
+                status_code=404, 
+                detail="Query not found"
+            )
+        
+        # Verify user ownership
+        if query_record.get("user_id") != username:
+            raise HTTPException(
+                status_code=403, 
+                detail="Access denied. You can only restore your own queries."
+            )
+        
+        # Check if this is a General Mode query
+        is_general_mode = query_record.get("query_mode") == "General"
+        
+        # Check if this is a special EXECUTE_STORED_SQL command
+        user_query = query_record.get("user_query", "")
+        if user_query.startswith("EXECUTE_STORED_SQL:"):
+            # Extract the SQL to execute
+            final_sql = user_query.replace("EXECUTE_STORED_SQL: ", "").strip()
+            
+            # Return the stored SQL to be executed directly
+            return {
+                "success": True,
+                "action": "execute_sql",
+                "final_sql": final_sql,
+                "user_query": final_sql,  # Use the SQL as the user query for display
+                "query_mode": query_record.get("query_mode"),
+                "database_type": query_record.get("database_type")
+            }
+        
+        # For General Mode, we need to send back to the model
+        # For DB modes, we execute the stored SQL directly
+        if is_general_mode:
+            # Return the user query to be sent back to the model
+            return {
+                "success": True,
+                "action": "regenerate",
+                "user_query": query_record.get("user_query"),
+                "query_mode": query_record.get("query_mode"),
+                "database_type": query_record.get("database_type")
+            }
+        else:
+            # Return the stored SQL to be executed directly
+            return {
+                "success": True,
+                "action": "execute_sql",
+                "final_sql": query_record.get("final_sql"),
+                "user_query": query_record.get("user_query"),
+                "query_mode": query_record.get("query_mode"),
+                "database_type": query_record.get("database_type")
+            }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error restoring chat history item")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to restore chat history item: {str(e)}"
+        )
+
+
+@app.post("/execute-sql", response_model=dict)
+async def execute_stored_sql(payload: dict, request: Request):
+    """
+    Execute a stored SQL query directly.
+    
+    Args:
+        payload: Contains the SQL to execute and related metadata
+        request: FastAPI Request object
+        
+    Returns:
+        SQL execution results
+    """
+    try:
+        # Get current user
+        username = _get_username_from_request(request)
+        if not username:
+            logger.warning("User not authenticated when trying to execute SQL")
+            raise HTTPException(
+                status_code=401, 
+                detail="User not authenticated"
+            )
+        
+        # Extract SQL and metadata from payload
+        sql_query = payload.get("sql")
+        user_query = payload.get("user_query", sql_query) or ""
+        database_type = payload.get("database_type", "")
+        query_mode = payload.get("query_mode", "General")
+        
+        logger.info(f"User {username} executing SQL query. Database: {database_type}, Mode: {query_mode}")
+        
+        if not sql_query:
+            logger.warning("SQL query is required but not provided")
+            raise HTTPException(
+                status_code=400, 
+                detail="SQL query is required"
+            )
+        
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            logger.error("Dashboard recorder not available")
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Create a session ID for this execution
+        import uuid
+        session_id = str(uuid.uuid4())
+        
+        # Record the query in history before execution
+        query_id = dashboard_recorder.record_query_history(
+            user_id=username,
+            session_id=session_id,
+            user_query=user_query,
+            final_sql=sql_query,
+            execution_status="success",
+            database_type=database_type,
+            query_mode=query_mode
+        )
+        
+        # Check if query_id is valid
+        if not query_id:
+            logger.error("Failed to record query in history")
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to record query in history"
+            )
+        
+        # Execute the SQL based on database type
+        start_time = time.time()
+        try:
+            if database_type == "source_db_1" or query_mode == "SOS":
+                # Execute using SOS database
+                from app.SOS.query_engine import execute_query as sos_execute_query
+                logger.info(f"Executing SOS query for user {username}")
+                results = sos_execute_query(sql_query, "source_db_1")
+            elif database_type == "source_db_2" or query_mode == "PRAN ERP":
+                # Execute using PRAN ERP database
+                from app.ERP_R12_Test_DB.query_engine import execute_query as erp_execute_query
+                logger.info(f"Executing PRAN ERP query for user {username}")
+                results = erp_execute_query(sql_query, "source_db_2")
+            elif database_type == "source_db_3" or query_mode == "RFL ERP":
+                # Execute using RFL ERP database
+                from app.ERP_R12_Test_DB.query_engine import execute_query as erp_execute_query
+                logger.info(f"Executing RFL ERP query for user {username}")
+                results = erp_execute_query(sql_query, "source_db_3")
+            else:
+                logger.warning(f"Unsupported database type: {database_type} for user {username}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Unsupported database type: {database_type}"
+                )
+            
+            execution_time = int((time.time() - start_time) * 1000)
+            row_count = results.get("row_count", 0) if results else 0
+            
+            logger.info(f"SQL execution successful for user {username}. Execution time: {execution_time}ms, Rows: {row_count}")
+            
+            # Update query history with execution results
+            dashboard_recorder.dashboard_service.query_history.update_query_execution_result(
+                query_id=query_id,
+                execution_status="success",
+                execution_time_ms=execution_time,
+                row_count=row_count
+            )
+            
+            return {
+                "status": "success",
+                "results": results,
+                "execution_time_ms": execution_time,
+                "row_count": row_count,
+                "query_id": query_id,
+                "session_id": session_id
+            }
+            
+        except Exception as e:
+            # Update query history with error status
+            execution_time = int((time.time() - start_time) * 1000)
+            if query_id:
+                dashboard_recorder.dashboard_service.query_history.update_query_execution_result(
+                    query_id=query_id,
+                    execution_status="error",
+                    execution_time_ms=execution_time
+                )
+            
+            logger.error(f"SQL execution failed for user {username}: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500, 
+                detail=f"SQL execution failed: {str(e)}"
+            )
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error executing stored SQL")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to execute stored SQL: {str(e)}"
+        )
+
+@app.post("/admin/test-models", response_model=dict)
+async def test_all_models_endpoint(request: Request):
+    """
+    Test all configured models for availability (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Test results for all models
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Import test functions from both clients
+        from app.SOS.deepseek_client import test_all_models
+        from app.ERP_R12_Test_DB.deepseek_client import test_erp_models
+        import asyncio
+        
+        # Run tests for both systems concurrently
+        sos_results, erp_results = await asyncio.gather(
+            test_all_models(),
+            test_erp_models(),
+            return_exceptions=True
+        )
+        
+        # Handle exceptions
+        if isinstance(sos_results, Exception):
+            logger.error(f"SOS model test failed: {sos_results}")
+            sos_results = {}
+            
+        if isinstance(erp_results, Exception):
+            logger.error(f"ERP model test failed: {erp_results}")
+            erp_results = {}
+        
+        return {
+            "success": True,
+            "sos_results": sos_results,
+            "erp_results": erp_results
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error testing models")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to test models: {str(e)}"
+        )
+
+@app.get("/admin/dashboard/total-chats", response_model=dict)
+async def get_total_chats(request: Request):
+    """
+    Get the total number of chats from the dashboard_chats table (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Total chats count
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get chat statistics which includes total chats
+        chat_stats = dashboard_recorder.dashboard_service.chats.get_chat_statistics()
+        total_chats = chat_stats.get("total_chats", 0) if chat_stats else 0
+        
+        return {
+            "success": True,
+            "total_chats": total_chats
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching total chats count")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch total chats count: {str(e)}"
+        )
+
+
+
+
+@app.get("/admin/model-statistics", response_model=dict)
+async def get_model_statistics(request: Request):
+    """
+    Get model statistics including availability metrics (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Model statistics
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get model statistics
+        model_stats = dashboard_recorder.dashboard_service.model_status.get_model_statistics()
+        
+        return {
+            "success": True,
+            "statistics": model_stats
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching model statistics")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch model statistics: {str(e)}"
+        )
+
+
+@app.get("/admin/dashboard/token-usage", response_model=dict)
+async def get_token_usage_dashboard(request: Request, time_range: str = "weekly", 
+                                 model_name: Optional[str] = None,
+                                 start_date: Optional[str] = None,
+                                 end_date: Optional[str] = None):
+    """
+    Get token usage dashboard data from the dashboard_token_usage table (admin only).
+    
+    Args:
+        request: FastAPI Request object
+        time_range: Time range for data (daily, weekly, monthly)
+        model_name: Optional model name to filter by
+        start_date: Optional start date for filtering
+        end_date: Optional end date for filtering
+        
+    Returns:
+        Token usage dashboard data
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get token usage dashboard data
+        token_usage_data = dashboard_recorder.dashboard_service.get_token_usage_dashboard_data(
+            time_range=time_range,
+            model_name=model_name,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        return {
+            "success": True,
+            "data": token_usage_data
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching token usage dashboard data")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch token usage dashboard data: {str(e)}"
+        )
+
+
+@app.get("/admin/dashboard/analytics", response_model=dict)
+async def get_analytics_dashboard(request: Request):
+    """
+    Get analytics data for the admin dashboard from all relevant tables.
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Analytics dashboard data
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get analytics data
+        analytics_data = dashboard_recorder.dashboard_service.get_analytics_data()
+        
+        return {
+            "success": True,
+            "data": {
+                "analytics": analytics_data
+            }
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching analytics dashboard data")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch analytics dashboard data: {str(e)}"
+        )
+
+
+@app.get("/admin/dashboard/analytics/time-series", response_model=dict)
+async def get_analytics_time_series(request: Request, time_range: str = "weekly"):
+    """
+    Get time series data for the analytics dashboard.
+    
+    Args:
+        request: FastAPI Request object
+        time_range: Time range for data (daily, weekly, monthly)
+        
+    Returns:
+        Time series data for analytics dashboard
+    """
+    # Check if user is admin
+    if not _is_admin_user(request):
+        raise HTTPException(
+            status_code=403, 
+            detail="Access denied. Admin privileges required."
+        )
+    
+    try:
+        # Get dashboard recorder instance
+        dashboard_recorder = get_dashboard_recorder()
+        if not dashboard_recorder:
+            raise HTTPException(
+                status_code=500, 
+                detail="Dashboard recorder not available"
+            )
+        
+        # Get time series data
+        time_series_data = dashboard_recorder.dashboard_service.get_time_series_data(time_range)
+        
+        return {
+            "success": True,
+            "data": time_series_data
+        }
+                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.exception("Error fetching analytics time series data")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch analytics time series data: {str(e)}"
+        )

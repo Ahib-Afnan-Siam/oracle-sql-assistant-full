@@ -490,6 +490,17 @@ def _fix_common_oracle_issues(sql: str) -> str:
     # Replace TRUNC(SYSDATE) with SYSDATE if it's causing issues
     sql = sql.replace('TRUNC(SYSDATE)', 'SYSDATE')
     
+    # Fix incorrect date function patterns like TRUNC(ADD_MONTHS(SYSDATE, -1), 'MM')
+    # Should be ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -1)
+    import re
+    # Pattern to match: TRUNC(ADD_MONTHS(SYSDATE, <number>), 'MM')
+    sql = re.sub(r"TRUNC\s*\(\s*ADD_MONTHS\s*\(\s*SYSDATE\s*,\s*(-?\d+)\s*\)\s*,\s*'MM'\s*\)", r"ADD_MONTHS(TRUNC(SYSDATE, 'MM'), \1)", sql, flags=re.IGNORECASE)
+    
+    # Fix another common pattern: TRUNC(ADD_MONTHS(SYSDATE, <number>), <format>) where format is not 'MM'
+    # This pattern is also incorrect and should be ADD_MONTHS(TRUNC(SYSDATE, <format>), <number>)
+    # Only match formats other than 'MM' to avoid conflicts with the previous pattern
+    sql = re.sub(r"TRUNC\s*\(\s*ADD_MONTHS\s*\(\s*SYSDATE\s*,\s*(-?\d+)\s*\)\s*,\s*'((?!MM)[^']*)'\s*\)", r"ADD_MONTHS(TRUNC(SYSDATE, '\2'), \1)", sql, flags=re.IGNORECASE)
+    
     # Fix common column reference issues - cost information is in CST_ITEM_COSTS, not MTL_SYSTEM_ITEMS_B
     sql = _fix_cost_column_references(sql)
     
@@ -528,6 +539,14 @@ def _fix_common_oracle_issues(sql: str) -> str:
     # Clean up extra spaces that might have been introduced
     sql = re.sub(r'\s+', ' ', sql)
     
+    # Fix for ORA-00905: missing keyword error
+    # This can happen when there are syntax issues with expressions in GROUP BY or ORDER BY
+    # Ensure that expressions with quotes are properly formatted
+    sql = re.sub(r"TO_CHAR\s*\(\s*([^,]+),\s*'([^']*)'\s*\)\s+AS\s+(\w+)", r"TO_CHAR(\1, '\2') AS \3", sql, flags=re.IGNORECASE)
+    
+    # Fix for trailing commas in GROUP BY clauses
+    sql = re.sub(r'(GROUP BY\s+[^,]+(?:\s*,\s*[^,]+)*)\s*,\s*(ORDER BY|HAVING|;|$)', r'\1 \2', sql, flags=re.IGNORECASE)
+    
     # Note: Do not add semicolon back here as the execution logic handles that
     # The execute_query function will add it when needed
     
@@ -563,12 +582,18 @@ def _fix_sales_date_filters(sql: str) -> str:
             if matches:
                 logger.info(f"Found restrictive date filters in sales query: {matches}")
                 # Replace with a broader date range (last 24 months)
-                sql = re.sub(
-                    pattern,
-                    "AND \\g<0> >= ADD_MONTHS(SYSDATE, -24)",  # Add a broader condition
-                    sql,
-                    flags=re.IGNORECASE
-                )
+                # We need to be more careful about how we modify the date filters
+                # Instead of just adding a condition, let's modify the existing ones
+                def broaden_date_filter(match):
+                    full_match = match.group(0)
+                    # For overly restrictive lower bounds, broaden them
+                    if '>= ADD_MONTHS' in full_match and '-1' in full_match:
+                        return full_match.replace('-1', '-24')
+                    elif '>= TRUNC' in full_match:
+                        return full_match.replace('TRUNC(SYSDATE, \'MM\')', 'ADD_MONTHS(SYSDATE, -24)')
+                    return full_match
+                
+                sql = re.sub(pattern, broaden_date_filter, sql, flags=re.IGNORECASE)
     
     return sql
 
@@ -606,10 +631,20 @@ def _optimize_query_for_better_results(sql: str, user_query: str) -> str:
         if date_matches or upper_date_matches:
             logger.info("Found restrictive date filters, attempting to broaden date range")
             
-            # For sales analysis, let's remove restrictive date filters entirely to get all available data
-            # This is a simple approach - in a production system, you might want more sophisticated logic
-            optimized_sql = re.sub(date_pattern, "", optimized_sql, flags=re.IGNORECASE)
-            optimized_sql = re.sub(upper_date_pattern, "", optimized_sql, flags=re.IGNORECASE)
+            # For sales analysis, let's broaden restrictive date filters to get more data
+            # Instead of removing them entirely, let's modify them to be less restrictive
+            def broaden_lower_date(match):
+                full_match = match.group(0)
+                # Broaden the date range by changing -1 to -24 (last 24 months instead of last 1 month)
+                return full_match.replace('-1', '-24').replace('-3', '-24')
+            
+            def broaden_upper_date(match):
+                full_match = match.group(0)
+                # Broaden the upper date bound
+                return full_match.replace('0', '24')
+            
+            optimized_sql = re.sub(date_pattern, broaden_lower_date, optimized_sql, flags=re.IGNORECASE)
+            optimized_sql = re.sub(upper_date_pattern, broaden_upper_date, optimized_sql, flags=re.IGNORECASE)
             
             # Clean up any double spaces or extra AND operators that might have been created
             optimized_sql = re.sub(r"\s+AND\s+AND\s+", " AND ", optimized_sql, flags=re.IGNORECASE)
@@ -633,6 +668,27 @@ def _optimize_query_for_better_results(sql: str, user_query: str) -> str:
                 logger.info(f"Found {len(matches)} potentially restrictive conditions, attempting to relax some")
                 # Remove some restrictive conditions to broaden results
                 optimized_sql = re.sub(pattern, "", optimized_sql, count=1, flags=re.IGNORECASE)
+        
+        # Additional optimization: When getting 0 results, try to remove JOINs with restrictive conditions
+        # This helps when the AI adds unnecessary JOINs that make the query too restrictive
+        # Specifically target common problematic patterns
+        
+        # Pattern 1: Remove JOIN with oe_order_headers_all and its restrictive conditions
+        if "oe_order_headers_all" in optimized_sql.lower():
+            logger.info("Found oe_order_headers_all JOIN, checking for restrictive conditions")
+            # Check for restrictive conditions on ooha table
+            ooha_conditions = re.findall(r"AND\s+ooha\.[\w_]+\s*=\s*[^\s]+", optimized_sql, re.IGNORECASE)
+            if ooha_conditions:
+                logger.info(f"Found {len(ooha_conditions)} restrictive conditions on ooha table, removing JOIN and conditions")
+                # Remove the JOIN
+                optimized_sql = re.sub(r"JOIN\s+oe_order_headers_all\s+ooha\s+ON\s+[^\s]+\s*=\s*[^\s]+", "", optimized_sql, flags=re.IGNORECASE)
+                # Remove the restrictive conditions
+                for condition in ooha_conditions:
+                    optimized_sql = optimized_sql.replace(condition, "")
+                # Clean up extra spaces and AND operators
+                optimized_sql = re.sub(r"\s+AND\s+AND\s+", " AND ", optimized_sql, flags=re.IGNORECASE)
+                optimized_sql = re.sub(r"WHERE\s+AND\s+", "WHERE ", optimized_sql, flags=re.IGNORECASE)
+                optimized_sql = re.sub(r"\s+", " ", optimized_sql)  # Normalize whitespace
     
     # Log the optimization
     if optimized_sql != sql:
@@ -800,12 +856,35 @@ def _fix_hr_operating_units_conditions(sql: str) -> str:
             # Add a condition that includes NULL values or 'Y' values
             # But only if there's a WHERE clause already
             if "WHERE" in sql.upper():
-                sql = re.sub(r"(WHERE\s+.*?)(\s+AND|\s*$)", r"\1 AND (USABLE_FLAG = 'Y' OR USABLE_FLAG IS NULL)\2", sql, flags=re.IGNORECASE)
+                # Find the end of the WHERE clause (before ORDER BY, HAVING, or end of query)
+                where_end_patterns = [
+                    r"\bORDER\s+BY\b",
+                    r"\bHAVING\b",
+                    r";",
+                    r"$"  # End of string
+                ]
+                
+                # Find the position where the WHERE clause ends
+                where_end_pos = len(sql)  # Default to end of query
+                for pattern in where_end_patterns:
+                    match = re.search(pattern, sql, re.IGNORECASE)
+                    if match and match.start() > sql.upper().find("WHERE"):
+                        where_end_pos = min(where_end_pos, match.start())
+                
+                # Insert the condition at the end of the WHERE clause
+                sql = sql[:where_end_pos] + " AND (USABLE_FLAG = 'Y' OR USABLE_FLAG IS NULL)" + sql[where_end_pos:]
             else:
                 # Add WHERE clause if it doesn't exist
                 from_match = re.search(r"FROM\s+HR_OPERATING_UNITS", sql, re.IGNORECASE)
                 if from_match:
-                    sql = sql[:from_match.end()] + " WHERE (USABLE_FLAG = 'Y' OR USABLE_FLAG IS NULL)" + sql[from_match.end():]
+                    # Find where to insert the WHERE clause (before ORDER BY, HAVING, or end)
+                    insert_pos = len(sql)
+                    for pattern in [r"\bORDER\s+BY\b", r"\bHAVING\b", r";"]:
+                        match = re.search(pattern, sql, re.IGNORECASE)
+                        if match:
+                            insert_pos = min(insert_pos, match.start())
+                    
+                    sql = sql[:insert_pos] + " WHERE (USABLE_FLAG = 'Y' OR USABLE_FLAG IS NULL)" + sql[insert_pos:]
         
         # Check for overly restrictive DATE_TO conditions
         # If all rows have NULL DATE_TO, adjust the condition
@@ -935,20 +1014,81 @@ def _fix_group_by_issues(sql: str) -> str:
                 # Add missing required columns to GROUP BY
                 missing_columns = []
                 for col in all_required_columns:
-                    # Check if column is already in GROUP BY (accounting for aliases)
+                    # Check if column is already in GROUP BY (accounting for aliases and complex expressions)
                     found = False
                     for group_col in group_by_parts:
-                        if col.lower() == group_col.lower() or col.split('.')[-1].lower() == group_col.split('.')[-1].lower():
+                        # Normalize both expressions for comparison
+                        col_normalized = re.sub(r'\s+', ' ', col.strip().lower())
+                        group_col_normalized = re.sub(r'\s+', ' ', group_col.strip().lower())
+                        
+                        # Check for exact match or alias match
+                        if col_normalized == group_col_normalized:
                             found = True
                             break
+                        
+                        # Check for column name match (without table prefix)
+                        if '.' in col and '.' in group_col:
+                            col_name = col.split('.')[-1]
+                            group_col_name = group_col.split('.')[-1]
+                            if col_name == group_col_name:
+                                found = True
+                                break
+                        
+                        # Check for function expressions (like TO_CHAR) by comparing the full expression
+                        if col_normalized in group_col_normalized or group_col_normalized in col_normalized:
+                            found = True
+                            break
+                    
                     if not found:
                         missing_columns.append(col)
                 
+                # Remove duplicates from missing_columns and from existing GROUP BY
+                unique_missing_columns = []
+                for col in missing_columns:
+                    is_duplicate = False
+                    col_normalized = re.sub(r'\s+', ' ', col.strip().lower())
+                    # Check against existing GROUP BY columns
+                    for existing_col in group_by_parts:
+                        existing_normalized = re.sub(r'\s+', ' ', existing_col.strip().lower())
+                        if col_normalized == existing_normalized:
+                            is_duplicate = True
+                            break
+                    # Check against already added missing columns
+                    if not is_duplicate:
+                        for existing_col in unique_missing_columns:
+                            existing_normalized = re.sub(r'\s+', ' ', existing_col.strip().lower())
+                            if col_normalized == existing_normalized:
+                                is_duplicate = True
+                                break
+                    if not is_duplicate:
+                        unique_missing_columns.append(col)
+                
+                # Additional check: Remove any columns that are already present in the GROUP BY clause
+                # This prevents adding duplicates when the function is called multiple times
+                final_missing_columns = []
+                for col in unique_missing_columns:
+                    col_normalized = re.sub(r'\s+', ' ', col.strip().lower())
+                    already_present = False
+                    
+                    # Check if this column is already in the current GROUP BY clause
+                    group_by_clause_normalized = re.sub(r'\s+', ' ', group_by_clause.strip().lower())
+                    if col_normalized in group_by_clause_normalized:
+                        # More precise check - split by comma and check each part
+                        group_by_items = [item.strip().lower() for item in group_by_clause.split(',')]
+                        for item in group_by_items:
+                            item_normalized = re.sub(r'\s+', ' ', item.strip())
+                            if col_normalized == item_normalized:
+                                already_present = True
+                                break
+                    
+                    if not already_present:
+                        final_missing_columns.append(col)
+                
                 # If we found missing columns, add them to GROUP BY
-                if missing_columns:
-                    logger.info(f"Fixing GROUP BY clause - adding missing columns: {missing_columns}")
+                if final_missing_columns:
+                    logger.info(f"Fixing GROUP BY clause - adding missing columns: {final_missing_columns}")
                     # Replace the GROUP BY clause with the updated one
-                    new_group_by = group_by_clause + ', ' + ', '.join(missing_columns)
+                    new_group_by = group_by_clause + ', ' + ', '.join(final_missing_columns)
                     sql = sql[:group_by_end_match.start(1)] + new_group_by + sql[group_by_end_match.end(1):]
         else:
             # No GROUP BY clause but we have aggregate functions and required columns
@@ -974,6 +1114,35 @@ def _fix_group_by_issues(sql: str) -> str:
                     sql = sql[:semicolon_pos] + ' GROUP BY ' + ', '.join(all_required_columns) + ' ' + sql[semicolon_pos:]
                 else:
                     sql = sql + ' GROUP BY ' + ', '.join(all_required_columns)
+    
+    # Additional fix: Handle ORDER BY aliases that reference expressions in SELECT
+    # In Oracle, ORDER BY cannot reference aliases that are expressions in SELECT
+    order_by_match = re.search(r'ORDER\s+BY\s+(.*?)(?:\s*;|$)', sql, re.IGNORECASE)
+    if order_by_match:
+        order_by_clause = order_by_match.group(1)
+        # Check if ORDER BY references any aliases from SELECT
+        for part in select_parts:
+            if ' AS ' in part:
+                alias = part.split(' AS ')[1].strip()
+                # If ORDER BY references this alias, replace it with the full expression
+                if alias in order_by_clause:
+                    full_expression = part.split(' AS ')[0].strip()
+                    # Replace the alias in ORDER BY with the full expression
+                    sql = sql.replace(f'ORDER BY {alias}', f'ORDER BY {full_expression}')
+                    sql = sql.replace(f'ORDER BY {alias.upper()}', f'ORDER BY {full_expression}')
+                    sql = sql.replace(f'ORDER BY {alias.lower()}', f'ORDER BY {full_expression}')
+    
+    # Fix for ORA-00905: missing keyword error
+    # This can happen when there are syntax issues with GROUP BY expressions
+    # Ensure that GROUP BY expressions match exactly with SELECT expressions
+    group_by_match = re.search(r'GROUP\s+BY\s+(.*?)(?:\s+ORDER\s+BY|\s+HAVING|\s*;|$)', sql, re.IGNORECASE)
+    if group_by_match:
+        group_by_clause = group_by_match.group(1)
+        # Check if GROUP BY clause has trailing commas or other syntax issues
+        group_by_clause = re.sub(r',\s*$', '', group_by_clause)  # Remove trailing comma
+        group_by_clause = re.sub(r'\s+', ' ', group_by_clause)  # Normalize whitespace
+        # Update the GROUP BY clause in the SQL
+        sql = sql[:group_by_match.start(1)] + group_by_clause + sql[group_by_match.end(1):]
     
     return sql
 
@@ -1128,15 +1297,97 @@ def execute_query(sql: str, db_id: str = "source_db_2", page: int = 1, page_size
                 try:
                     logger.info("Attempting to execute query directly (without semicolon)")
                     logger.info(f"Executing SQL: {repr(sql)}")
-                    cursor.execute(sql)
+                                
+                    # Additional fix for ORA-00905: missing keyword error
+                    # This can happen when there are syntax issues with expressions
+                    fixed_sql = sql
+                                
+                    # Fix for ORDER BY with aliases that reference expressions
+                    # In Oracle, ORDER BY cannot reference aliases that are expressions in SELECT
+                    import re
+                    order_by_match = re.search(r'ORDER\s+BY\s+(\w+)(?:\s+DESC|\s+ASC|\s*;|$)', fixed_sql, re.IGNORECASE)
+                    if order_by_match:
+                        alias = order_by_match.group(1)
+                        # Check if this alias is an expression in the SELECT clause
+                        select_match = re.search(r'SELECT\s+(.*?)\s+FROM', fixed_sql, re.IGNORECASE | re.DOTALL)
+                        if select_match:
+                            select_clause = select_match.group(1)
+                            select_parts = []
+                            current_part = ""
+                            paren_count = 0
+                            for char in select_clause:
+                                if char == '(':
+                                    paren_count += 1
+                                    current_part += char
+                                elif char == ')':
+                                    paren_count -= 1
+                                    current_part += char
+                                elif char == ',' and paren_count == 0:
+                                    select_parts.append(current_part.strip())
+                                    current_part = ""
+                                else:
+                                    current_part += char
+                            if current_part:
+                                select_parts.append(current_part.strip())
+                                        
+                            # Check if the alias matches an expression with AS
+                            for part in select_parts:
+                                if ' AS ' in part:
+                                    expression, expr_alias = part.split(' AS ', 1)
+                                    if expr_alias.strip() == alias:
+                                        # Replace the alias in ORDER BY with the full expression
+                                        fixed_sql = re.sub(rf'ORDER\s+BY\s+{re.escape(alias)}', f'ORDER BY {expression.strip()}', fixed_sql, flags=re.IGNORECASE)
+                                        break
+                                
+                    cursor.execute(fixed_sql)
                     logger.info("Query executed successfully")
                 except cx_Oracle.Error as direct_error:
                     # If direct execution fails, try with semicolon
                     logger.warning(f"Direct execution failed, trying with semicolon: {direct_error}")
                     sql_with_semicolon = sql + ';'
                     logger.info(f"Executing SQL with semicolon: {repr(sql_with_semicolon)}")
+                    
+                    # Additional fix for ORA-00905: missing keyword error for semicolon execution
+                    fixed_sql_with_semicolon = sql_with_semicolon
+                    
+                    # Apply the same ORDER BY alias fix
+                    import re
+                    order_by_match = re.search(r'ORDER\s+BY\s+(\w+)(?:\s+DESC|\s+ASC|\s*;|$)', fixed_sql_with_semicolon, re.IGNORECASE)
+                    if order_by_match:
+                        alias = order_by_match.group(1)
+                        # Check if this alias is an expression in the SELECT clause
+                        select_match = re.search(r'SELECT\s+(.*?)\s+FROM', fixed_sql_with_semicolon, re.IGNORECASE | re.DOTALL)
+                        if select_match:
+                            select_clause = select_match.group(1)
+                            select_parts = []
+                            current_part = ""
+                            paren_count = 0
+                            for char in select_clause:
+                                if char == '(':
+                                    paren_count += 1
+                                    current_part += char
+                                elif char == ')':
+                                    paren_count -= 1
+                                    current_part += char
+                                elif char == ',' and paren_count == 0:
+                                    select_parts.append(current_part.strip())
+                                    current_part = ""
+                                else:
+                                    current_part += char
+                            if current_part:
+                                select_parts.append(current_part.strip())
+                            
+                            # Check if the alias matches an expression with AS
+                            for part in select_parts:
+                                if ' AS ' in part:
+                                    expression, expr_alias = part.split(' AS ', 1)
+                                    if expr_alias.strip() == alias:
+                                        # Replace the alias in ORDER BY with the full expression
+                                        fixed_sql_with_semicolon = re.sub(rf'ORDER\s+BY\s+{re.escape(alias)}', f'ORDER BY {expression.strip()}', fixed_sql_with_semicolon, flags=re.IGNORECASE)
+                                        break
+                    
                     try:
-                        cursor.execute(sql_with_semicolon)
+                        cursor.execute(fixed_sql_with_semicolon)
                         logger.info("Query with semicolon executed successfully")
                     except cx_Oracle.Error as semicolon_error:
                         # Try various fixes for the SQL
@@ -1195,6 +1446,15 @@ def execute_query(sql: str, db_id: str = "source_db_2", page: int = 1, page_size
                                         except:
                                             logger.error("Connection version info not available")
                                     
+                                    # Mark the connection as potentially invalid
+                                    # This will help the connection pool handle it properly
+                                    try:
+                                        # Try to close the cursor to clean up resources
+                                        if cursor:
+                                            cursor.close()
+                                    except:
+                                        pass
+                                    
                                     # Re-raise the original error
                                     raise direct_error
                 
@@ -1215,7 +1475,10 @@ def execute_query(sql: str, db_id: str = "source_db_2", page: int = 1, page_size
                     # Try to get count with a COUNT(*) query for better performance estimation
                     # For very large result sets, skip the count query as it can be expensive
                     # Instead, fetch a sample to estimate if we have data
-                    count_sql = f"SELECT COUNT(*) FROM ({sql}) count_subquery"
+                    # Remove ORDER BY clause from SQL for subquery as it's not allowed
+                    import re
+                    sql_without_order_by = re.sub(r'\s+ORDER\s+BY\s+[^;]*', '', sql, flags=re.IGNORECASE)
+                    count_sql = f"SELECT COUNT(*) FROM ({sql_without_order_by}) count_subquery"
                     count_cursor = conn.cursor()
                     count_cursor.execute(count_sql)
                     row_count_result = count_cursor.fetchone()
@@ -1243,7 +1506,21 @@ def execute_query(sql: str, db_id: str = "source_db_2", page: int = 1, page_size
                 offset = (page - 1) * page_size
                 
                 # Add OFFSET and FETCH NEXT clauses for pagination
-                paginated_sql = f"{sql} OFFSET {offset} ROWS FETCH NEXT {page_size} ROWS ONLY"
+                # We need to insert these at the end of the query (after ORDER BY)
+                # But first check if the query already has pagination clauses
+                import re
+                
+                # Check if the query already has OFFSET/FETCH clauses
+                if re.search(r"\bOFFSET\s+\d+\s+ROWS\s+FETCH\s+NEXT\s+\d+\s+ROWS\s+ONLY\b", sql, re.IGNORECASE):
+                    # Query already has pagination, use it as-is
+                    paginated_sql = sql
+                else:
+                    # Add pagination clauses at the end of the query
+                    # In Oracle, OFFSET/FETCH must come after ORDER BY
+                    if sql.strip().endswith(';'):
+                        paginated_sql = f"{sql[:-1]} OFFSET {offset} ROWS FETCH NEXT {page_size} ROWS ONLY;"
+                    else:
+                        paginated_sql = f"{sql} OFFSET {offset} ROWS FETCH NEXT {page_size} ROWS ONLY"
                 
                 # Check for cancellation before executing paginated query
                 if cancellation_token and cancellation_token():
@@ -1290,8 +1567,11 @@ def execute_query(sql: str, db_id: str = "source_db_2", page: int = 1, page_size
                 if len(formatted_rows) == 0:
                     try:
                         # Try a simple count query to see if there's any data
+                        # Remove ORDER BY clause from SQL for subquery as it's not allowed
+                        import re
+                        sql_without_order_by = re.sub(r'\s+ORDER\s+BY\s+[^;]*', '', sql, flags=re.IGNORECASE)
                         count_cursor = conn.cursor()
-                        count_cursor.execute(f"SELECT COUNT(*) as count FROM ({sql})")
+                        count_cursor.execute(f"SELECT COUNT(*) as count FROM ({sql_without_order_by})")
                         count_result = count_cursor.fetchone()
                         if count_result and count_result[0] > 0:
                             logger.info(f"Query returned 0 rows but table has {count_result[0]} rows")

@@ -345,9 +345,24 @@ def connect_to_source(db_key: str):
     finally:
         if conn:
             try:
-                pool = _get_connection_pool(db_key)
-                pool.release(conn)
-                logger.debug(f"Released connection back to pool for {db_key}")
+                # Check if the connection is still valid before releasing it back to the pool
+                # This prevents releasing invalid connections which can cause DPI-1002 errors
+                if hasattr(conn, 'ping'):
+                    try:
+                        conn.ping()
+                        # Connection is still valid, release it back to the pool
+                        pool = _get_connection_pool(db_key)
+                        pool.release(conn)
+                        logger.debug(f"Released connection back to pool for {db_key}")
+                    except cx_Oracle.Error:
+                        # Connection is invalid, don't release it back to the pool
+                        logger.warning(f"Connection for {db_key} is invalid, not releasing back to pool")
+                        # The pool will create a new connection when needed
+                else:
+                    # If we can't ping, release it anyway but log the attempt
+                    pool = _get_connection_pool(db_key)
+                    pool.release(conn)
+                    logger.debug(f"Released connection back to pool for {db_key} (unable to ping)")
             except Exception as close_error:
                 logger.warning(f"Error releasing connection to pool for {db_key}: {close_error}")
 
@@ -415,8 +430,22 @@ def connect_vector():
     finally:
         if conn and pool:
             try:
-                pool.release(conn)
-                logger.debug("Released connection back to pool for vector database")
+                # Check if the connection is still valid before releasing it back to the pool
+                # This prevents releasing invalid connections which can cause DPI-1002 errors
+                if hasattr(conn, 'ping'):
+                    try:
+                        conn.ping()
+                        # Connection is still valid, release it back to the pool
+                        pool.release(conn)
+                        logger.debug("Released connection back to pool for vector database")
+                    except cx_Oracle.Error:
+                        # Connection is invalid, don't release it back to the pool
+                        logger.warning("Connection for vector database is invalid, not releasing back to pool")
+                        # The pool will create a new connection when needed
+                else:
+                    # If we can't ping, release it anyway but log the attempt
+                    pool.release(conn)
+                    logger.debug("Released connection back to pool for vector database (unable to ping)")
             except Exception as close_error:
                 logger.warning(f"Error releasing connection to pool for vector database: {close_error}")
 
@@ -449,8 +478,22 @@ def connect_feedback():
     finally:
         if conn and pool:
             try:
-                pool.release(conn)
-                logger.debug("Released connection back to pool for feedback database")
+                # Check if the connection is still valid before releasing it back to the pool
+                # This prevents releasing invalid connections which can cause DPI-1002 errors
+                if hasattr(conn, 'ping'):
+                    try:
+                        conn.ping()
+                        # Connection is still valid, release it back to the pool
+                        pool.release(conn)
+                        logger.debug("Released connection back to pool for feedback database")
+                    except cx_Oracle.Error:
+                        # Connection is invalid, don't release it back to the pool
+                        logger.warning("Connection for feedback database is invalid, not releasing back to pool")
+                        # The pool will create a new connection when needed
+                else:
+                    # If we can't ping, release it anyway but log the attempt
+                    pool.release(conn)
+                    logger.debug("Released connection back to pool for feedback database (unable to ping)")
             except Exception as close_error:
                 logger.warning(f"Error releasing connection to pool for feedback database: {close_error}")
 

@@ -35,6 +35,7 @@ CREATE TABLE user_access_list (
     designation VARCHAR2(200),
     department VARCHAR2(200),
     status CHAR(1) DEFAULT 'Y' CHECK (status IN ('Y', 'N')),
+    admin_access CHAR(1) DEFAULT 'N' CHECK (admin_access IN ('Y', 'N')),
     added_by_admin NUMBER(1) DEFAULT 0 CHECK (added_by_admin IN (0, 1)),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

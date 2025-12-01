@@ -298,7 +298,7 @@ def _optimize_query_for_better_results(sql: str, user_query: str) -> str:
         
     return optimized_sql
 
-async def answer(user_query: str, selected_db: str = "source_db_2", mode: str = "ERP", session_id: Optional[str] = None, client_ip: Optional[str] = None, user_agent: Optional[str] = None, page: int = 1, page_size: int = 1000, cancellation_token: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+async def answer(user_query: str, selected_db: str = "source_db_2", mode: str = "ERP", session_id: Optional[str] = None, client_ip: Optional[str] = None, user_agent: Optional[str] = None, page: int = 1, page_size: int = 1000, chat_id: Optional[int] = None, cancellation_token: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
     """
     Main entry point for ERP R12 RAG pipeline using hybrid processing.
     
@@ -320,7 +320,10 @@ async def answer(user_query: str, selected_db: str = "source_db_2", mode: str = 
         logger.info(f"Processing ERP R12 query with hybrid processor: {user_query}")
         
         # Import the ERP hybrid processor locally to avoid circular imports
-        from app.ERP_R12_Test_DB.hybrid_processor import erp_hybrid_processor
+        from app.ERP_R12_Test_DB.hybrid_processor import ERPHybridProcessor
+        
+        # Create an instance of the ERP hybrid processor
+        erp_hybrid_processor = ERPHybridProcessor()
         
         # Use the hybrid processor for ERP queries
         result = await erp_hybrid_processor.process_query(
@@ -332,6 +335,7 @@ async def answer(user_query: str, selected_db: str = "source_db_2", mode: str = 
             user_agent=user_agent,
             page=page,
             page_size=page_size,
+            chat_id=chat_id,  # Pass chat_id for message recording
             cancellation_token=cancellation_token
         )
         

@@ -72,6 +72,7 @@ class ModelTestResult:
     response_time: float = 0.0
     error: Optional[str] = None
     test_response: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class DeepSeekError(Exception):
     """Custom exception for DeepSeek API errors."""
@@ -190,6 +191,20 @@ class DeepSeekClient:
                                         request_content=first_message_content
                                     )
                                 
+                                # Record model status as available with response time
+                                try:
+                                    from app.dashboard_recorder import get_dashboard_recorder
+                                    recorder = get_dashboard_recorder()
+                                    if recorder:
+                                        recorder.record_model_status(
+                                            model_type="api",
+                                            model_name=payload.get("model", "unknown"),
+                                            status="available",
+                                            response_time_ms=int(response_time * 1000)
+                                        )
+                                except Exception as e:
+                                    logger.warning(f"Failed to record model status: {e}")
+                                
                                 return DeepSeekResponse(
                                     content=content.strip(),
                                     model=payload.get("model", "unknown"),
@@ -239,6 +254,21 @@ class DeepSeekClient:
                             last_error = f"Model not found (HTTP 404): {error_message}"
                             logger.warning(f"Model not available: {last_error}")
                             
+                            # Record model status as unavailable
+                            try:
+                                from app.dashboard_recorder import get_dashboard_recorder
+                                recorder = get_dashboard_recorder()
+                                if recorder:
+                                    recorder.record_model_status(
+                                        model_type="api",
+                                        model_name=payload.get("model", "unknown"),
+                                        status="unavailable",
+                                        response_time_ms=int(response_time * 1000),
+                                        error_message=error_message
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Failed to record model status: {e}")
+                            
                             # Don't retry for 404 errors as they're likely configuration issues
                             break
                         
@@ -258,6 +288,21 @@ class DeepSeekClient:
                                 continue
                         
                         # If we reach here, it's the final attempt or a non-retryable error
+                        # Record model status as degraded
+                        try:
+                            from app.dashboard_recorder import get_dashboard_recorder
+                            recorder = get_dashboard_recorder()
+                            if recorder:
+                                recorder.record_model_status(
+                                    model_type="api",
+                                    model_name=payload.get("model", "unknown"),
+                                    status="degraded",
+                                    response_time_ms=int(response_time * 1000),
+                                    error_message=last_error
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to record model status: {e}")
+                        
                         return DeepSeekResponse(
                             content="",
                             model=payload.get("model", "unknown"),
@@ -291,6 +336,21 @@ class DeepSeekClient:
                     continue
         
         # All retries exhausted
+        # Record model status as unavailable
+        try:
+            from app.dashboard_recorder import get_dashboard_recorder
+            recorder = get_dashboard_recorder()
+            if recorder:
+                recorder.record_model_status(
+                    model_type="api",
+                    model_name=payload.get("model", "unknown"),
+                    status="unavailable",
+                    response_time_ms=int((time.time() - start_time) * 1000),
+                    error_message=last_error or "All retry attempts failed"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to record model status: {e}")
+        
         return DeepSeekResponse(
             content="",
             model=payload.get("model", "unknown"),
@@ -386,29 +446,79 @@ class DeepSeekClient:
                 content_upper = response.content.upper()
                 is_available = "TEST_OK" in content_upper or "OK" in content_upper
                 
+                # Record model status based on test result
+                try:
+                    from app.dashboard_recorder import get_dashboard_recorder
+                    recorder = get_dashboard_recorder()
+                    if recorder:
+                        status = "available" if is_available else "degraded"
+                        error_msg = None if is_available else f"Unexpected response: {response.content}"
+                        recorder.record_model_status(
+                            model_type="api",
+                            model_name=model,
+                            status=status,
+                            response_time_ms=int(response_time * 1000),
+                            error_message=error_msg
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to record model status: {e}")
+                
                 return ModelTestResult(
                     model=model,
                     available=is_available,
                     response_time=response_time,
                     test_response=response.content,
-                    error=None if is_available else f"Unexpected response: {response.content}"
+                    error=None if is_available else f"Unexpected response: {response.content}",
+                    metadata={"priority": "test", "model_type": "test"}
                 )
             else:
+                # Record model status as unavailable
+                try:
+                    from app.dashboard_recorder import get_dashboard_recorder
+                    recorder = get_dashboard_recorder()
+                    if recorder:
+                        recorder.record_model_status(
+                            model_type="api",
+                            model_name=model,
+                            status="unavailable",
+                            response_time_ms=int(response_time * 1000),
+                            error_message=response.error
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to record model status: {e}")
+                
                 return ModelTestResult(
                     model=model,
                     available=False,
                     response_time=response_time,
                     error=response.error,
-                    test_response=None
+                    test_response=None,
+                    metadata={"priority": "test", "model_type": "test"}
                 )
                 
-        except Exception as e:
+        except Exception as outer_e:
+            # Record model status as unavailable due to exception
+            try:
+                from app.dashboard_recorder import get_dashboard_recorder
+                recorder = get_dashboard_recorder()
+                if recorder:
+                    recorder.record_model_status(
+                        model_type="api",
+                        model_name=model,
+                        status="unavailable",
+                        response_time_ms=int((time.time() - start_time) * 1000),
+                        error_message=f"Test exception: {str(outer_e)}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to record model status: {e}")
+            
             return ModelTestResult(
                 model=model,
                 available=False,
                 response_time=time.time() - start_time,
-                error=f"Test exception: {str(e)}",
-                test_response=None
+                error=f"Test exception: {str(outer_e)}",
+                test_response=None,
+                metadata={"priority": "test", "model_type": "test"}
             )
     
     async def get_sql_response(
@@ -509,13 +619,22 @@ VALIDATION CHECKLIST:
         
         logger.info(f"Generating SQL for {model_type} query using {model}")
         
-        return await self.chat_completion(
+        response = await self.chat_completion(
             messages=messages, 
             model=model,
             temperature=0.1,  # Low temperature for precise SQL generation
             max_tokens=1024,
             top_p=0.9
         )
+        
+        # Enhance response with token usage information if available
+        if response.success and response.metadata and "token_usage" in response.metadata:
+            # Add token usage to the response metadata for tracking
+            logger.info(f"Token usage for SQL generation - Prompt: {response.metadata['token_usage'].get('prompt_tokens', 0)}, "
+                       f"Completion: {response.metadata['token_usage'].get('completion_tokens', 0)}, "
+                       f"Total: {response.metadata['token_usage'].get('total_tokens', 0)}")
+        
+        return response
     
     async def get_model_with_fallback(
         self, 
@@ -577,12 +696,14 @@ VALIDATION CHECKLIST:
         Returns:
             List of message dictionaries formatted for multimodal API calls
         """
-        message_content = [{"type": "text", "text": text_content}]
+        message_content: List[Dict[str, Any]] = [{"type": "text", "text": text_content}]
         
         if file_data:
             message_content.append({
-                "type": "file",
-                "file": file_data
+                "type": "image_url",
+                "image_url": {
+                    "url": file_data.get("file_data", "")
+                }
             })
         
         return [

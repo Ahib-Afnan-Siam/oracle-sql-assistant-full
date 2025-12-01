@@ -16,6 +16,9 @@ from app.config import (
 # Use the ERP-specific DeepSeek client
 from app.ERP_R12_Test_DB.deepseek_client import get_erp_deepseek_client, DeepSeekError
 
+# Import dashboard recorder for message recording
+from app.dashboard_recorder import get_dashboard_recorder
+
 logger = logging.getLogger(__name__)
 # Set logger level to INFO to reduce verbosity
 logger.setLevel(logging.INFO)
@@ -31,6 +34,10 @@ class ProcessingResult:
     api_confidence: float = 0.0
     processing_time: float = 0.0
     model_used: str = "unknown"
+    # Add token usage fields for API tracking
+    api_cost_usd: Optional[float] = None
+    api_prompt_tokens: Optional[int] = None
+    api_completion_tokens: Optional[int] = None
 
 def _generate_simple_erp_sql(user_query: str) -> Optional[str]:
     """
@@ -63,7 +70,127 @@ class ERPHybridProcessor:
             "hybrid_processed": 0
         }
         self.query_classifier = QueryClassifier()
+        # Initialize dashboard recorder for message recording
+        self.dashboard_recorder = get_dashboard_recorder()
     
+    def _record_user_query(self, chat_id: int, content: str, processing_time_ms: Optional[int] = None,
+                          tokens_used: Optional[int] = None, model_name: Optional[str] = None) -> Optional[int]:
+        """
+        Record a user query message in the dashboard_messages table.
+        
+        Args:
+            chat_id: Chat identifier
+            content: User query content
+            processing_time_ms: Processing time in milliseconds
+            tokens_used: Number of tokens used
+            model_name: Model name used
+            
+        Returns:
+            Message ID of the newly created message or None if failed
+        """
+        try:
+            if self.dashboard_recorder:
+                message_id = self.dashboard_recorder.record_user_query(
+                    chat_id=chat_id,
+                    content=content,
+                    processing_time_ms=processing_time_ms,
+                    tokens_used=tokens_used,
+                    model_name=model_name
+                )
+                
+                if message_id:
+                    logger.info(f"Recorded user query message {message_id} for chat {chat_id}")
+                else:
+                    logger.warning(f"Failed to record user query message for chat {chat_id}")
+                
+                return message_id
+            return None
+        except Exception as e:
+            logger.error(f"Error recording user query: {str(e)}")
+            return None
+    
+    def _record_ai_response(self, chat_id: int, content: str, processing_time_ms: Optional[int] = None,
+                           tokens_used: Optional[int] = None, model_name: Optional[str] = None,
+                           status: str = 'success') -> Optional[int]:
+        """
+        Record an AI response message in the dashboard_messages table.
+        
+        Args:
+            chat_id: Chat identifier
+            content: AI response content
+            processing_time_ms: Processing time in milliseconds
+            tokens_used: Number of tokens used
+            model_name: Model name used
+            status: Message status ('success', 'error', 'timeout')
+            
+        Returns:
+            Message ID of the newly created message or None if failed
+        """
+        try:
+            if self.dashboard_recorder:
+                message_id = self.dashboard_recorder.record_ai_response(
+                    chat_id=chat_id,
+                    content=content,
+                    processing_time_ms=processing_time_ms,
+                    tokens_used=tokens_used,
+                    model_name=model_name,
+                    status=status
+                )
+                
+                if message_id:
+                    logger.info(f"Recorded AI response message {message_id} for chat {chat_id}")
+                else:
+                    logger.warning(f"Failed to record AI response message for chat {chat_id}")
+                
+                return message_id
+            return None
+        except Exception as e:
+            logger.error(f"Error recording AI response: {str(e)}")
+            return None
+
+    def _record_token_usage(self, chat_id: int, message_id: int, token_usage_data: Dict[str, Any], model_name: str) -> None:
+        """
+        Record token usage for an API response.
+        
+        Args:
+            chat_id: Chat identifier
+            message_id: Message identifier
+            token_usage_data: Dictionary containing token usage information
+            model_name: Model name used
+        """
+        try:
+            if self.dashboard_recorder and token_usage_data:
+                prompt_tokens = token_usage_data.get('prompt_tokens', 0)
+                completion_tokens = token_usage_data.get('completion_tokens', 0)
+                total_tokens = token_usage_data.get('total_tokens', 0)
+                
+                # Only record if we have token data
+                if total_tokens > 0:
+                    # Calculate cost based on token usage
+                    cost_usd = (
+                        prompt_tokens * 0.0000001 +  # Prompt token cost
+                        completion_tokens * 0.0000002 +  # Completion token cost
+                        0.0001  # Base model cost per request
+                    )
+                    
+                    # Record token usage in dashboard
+                    usage_id = self.dashboard_recorder.record_token_usage(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        model_type="api",
+                        model_name=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        cost_usd=round(cost_usd, 6)
+                    )
+                    
+                    if usage_id:
+                        logger.info(f"Recorded token usage {usage_id} for chat {chat_id}, message {message_id}: "
+                                   f"{total_tokens} tokens, ${round(cost_usd, 6)} cost")
+        except Exception as e:
+            logger.error(f"Error recording token usage: {str(e)}")
+
     def _discover_erp_tables(self) -> List[str]:
         """
         Dynamically discover all ERP tables from the vector store.
@@ -468,6 +595,9 @@ class ERPHybridProcessor:
             # Use the get_model_with_fallback method instead of direct chat_completion
             response = await client.get_model_with_fallback("hr", user_query, schema_info)
             
+            # Store the response for token usage extraction
+            self._last_api_response = response
+            
             if response.success:
                 logger.debug(f"API response content: {response.content[:500]}...")
                 
@@ -716,6 +846,27 @@ class ERPHybridProcessor:
                     logger.info(f"Found {len(matches)} potentially restrictive conditions, attempting to relax some")
                     # Remove some restrictive conditions to broaden results
                     optimized_sql = re.sub(pattern, "", optimized_sql, count=1, flags=re.IGNORECASE)
+            
+            # Additional optimization: Remove JOINs with additional tables when getting 0 results
+            # This can help when the AI adds unnecessary JOINs that make the query too restrictive
+            # Specifically target common problematic patterns
+            
+            # Pattern 1: Remove JOIN with oe_order_headers_all and its restrictive conditions
+            if "oe_order_headers_all" in optimized_sql.lower():
+                logger.info("Found oe_order_headers_all JOIN, checking for restrictive conditions")
+                # Check for restrictive conditions on ooha table
+                ooha_conditions = re.findall(r"AND\s+ooha\.[\w_]+\s*=\s*[^\s]+", optimized_sql, re.IGNORECASE)
+                if ooha_conditions:
+                    logger.info(f"Found {len(ooha_conditions)} restrictive conditions on ooha table, removing JOIN and conditions")
+                    # Remove the JOIN
+                    optimized_sql = re.sub(r"JOIN\s+oe_order_headers_all\s+ooha\s+ON\s+[^\s]+\s*=\s*[^\s]+", "", optimized_sql, flags=re.IGNORECASE)
+                    # Remove the restrictive conditions
+                    for condition in ooha_conditions:
+                        optimized_sql = optimized_sql.replace(condition, "")
+                    # Clean up extra spaces and AND operators
+                    optimized_sql = re.sub(r"\s+AND\s+AND\s+", " AND ", optimized_sql, flags=re.IGNORECASE)
+                    optimized_sql = re.sub(r"WHERE\s+AND\s+", "WHERE ", optimized_sql, flags=re.IGNORECASE)
+                    optimized_sql = re.sub(r"\s+", " ", optimized_sql)  # Normalize whitespace
         
         # Log the optimization
         if optimized_sql != sql:
@@ -724,7 +875,7 @@ class ERPHybridProcessor:
             
         return optimized_sql
 
-    async def process_query(self, user_query: str, selected_db: str = "source_db_2", mode: str = "ERP", session_id: Optional[str] = None, client_ip: Optional[str] = None, user_agent: Optional[str] = None, page: int = 1, page_size: int = 1000, cancellation_token: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+    async def process_query(self, user_query: str, selected_db: str = "source_db_2", mode: str = "ERP", session_id: Optional[str] = None, client_ip: Optional[str] = None, user_agent: Optional[str] = None, page: int = 1, page_size: int = 1000, chat_id: Optional[int] = None, cancellation_token: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
         """
         Process an ERP R12 query using hybrid approach with dynamic schema context.
         
@@ -745,8 +896,19 @@ class ERPHybridProcessor:
         start_time = time.time()
         self.processing_stats["total_queries"] += 1
         
+        # Initialize token usage data
+        token_usage_data = None
+        
         try:
             logger.info(f"Processing ERP R12 query: {user_query}")
+            
+            # Record user query in dashboard if chat_id is provided
+            if chat_id is not None:
+                self._record_user_query(
+                    chat_id=chat_id,
+                    content=user_query,
+                    model_name="user"
+                )
             
             # Route the query to determine the best processing approach
             routing_info = route_query(user_query, selected_db)
@@ -767,6 +929,18 @@ class ERPHybridProcessor:
                 
                 # Try to generate SQL with API first
                 api_sql = await self._generate_sql_with_api(user_query, schema_context_texts)
+                
+                # Extract token usage data if available
+                if hasattr(self, '_last_api_response') and self._last_api_response:
+                    response = self._last_api_response
+                    if hasattr(response, 'metadata') and isinstance(response.metadata, dict):
+                        token_usage = response.metadata.get('token_usage', {})
+                        if isinstance(token_usage, dict) and token_usage:
+                            token_usage_data = {
+                                "prompt_tokens": token_usage.get('prompt_tokens', 0),
+                                "completion_tokens": token_usage.get('completion_tokens', 0),
+                                "total_tokens": token_usage.get('total_tokens', 0)
+                            }
                 
                 if api_sql:
                     # Clean up the SQL before execution
@@ -808,9 +982,28 @@ class ERPHybridProcessor:
                                             "processing_time": time.time() - start_time,
                                             "routing_confidence": routing_confidence,
                                             "target_module": target_module,
-                                            "target_db": target_db
+                                            "target_db": target_db,
+                                            "token_usage": token_usage_data
                                         }
                                         self.processing_stats["local_processed"] += 1
+                                        
+                                        # Record AI response in dashboard if chat_id is provided
+                                        if chat_id is not None:
+                                            ai_response_content = local_result.get("summary", "")
+                                            if local_result.get("sql"):
+                                                ai_response_content += f"\n\nSQL: {local_result['sql']}"
+                                            ai_response_message_id = self._record_ai_response(
+                                                chat_id=chat_id,
+                                                content=ai_response_content,
+                                                processing_time_ms=int(local_result.get("hybrid_metadata", {}).get("processing_time", 0) * 1000),
+                                                model_name=local_result.get("hybrid_metadata", {}).get("model_used", "local_erp_r12"),
+                                                status="success"
+                                            )
+                                            
+                                            # Record token usage if we have the data and a valid message ID
+                                            if ai_response_message_id and token_usage_data:
+                                                self._record_token_usage(chat_id, ai_response_message_id, token_usage_data, "local_erp_r12")
+                                        
                                         return local_result
                                     else:
                                         logger.info("Local processing also returned 0 rows or failed, using API results")
@@ -828,9 +1021,28 @@ class ERPHybridProcessor:
                                         "processing_time": time.time() - start_time,
                                         "routing_confidence": routing_confidence,
                                         "target_module": target_module,
-                                        "target_db": target_db
+                                        "target_db": target_db,
+                                        "token_usage": token_usage_data
                                     }
                                     self.processing_stats["local_processed"] += 1
+                                    
+                                    # Record AI response in dashboard if chat_id is provided
+                                    if chat_id is not None:
+                                        ai_response_content = local_result.get("summary", "")
+                                        if local_result.get("sql"):
+                                            ai_response_content += f"\n\nSQL: {local_result['sql']}"
+                                        ai_response_message_id = self._record_ai_response(
+                                            chat_id=chat_id,
+                                            content=ai_response_content,
+                                            processing_time_ms=int(local_result.get("hybrid_metadata", {}).get("processing_time", 0) * 1000),
+                                            model_name=local_result.get("hybrid_metadata", {}).get("model_used", "local_erp_r12"),
+                                            status="success"
+                                        )
+                                        
+                                        # Record token usage if we have the data and a valid message ID
+                                        if ai_response_message_id and token_usage_data:
+                                            self._record_token_usage(chat_id, ai_response_message_id, token_usage_data, "local_erp_r12")
+                                    
                                     return local_result
                                 else:
                                     logger.info("Local processing also returned 0 rows or failed, using API results")
@@ -865,8 +1077,24 @@ class ERPHybridProcessor:
                             "processing_time": processing_time,
                             "routing_confidence": routing_confidence,
                             "target_module": target_module,
-                            "target_db": target_db
+                            "target_db": target_db,
+                            "token_usage": token_usage_data
                         }
+                        
+                        # Record AI response in dashboard if chat_id is provided
+                        if chat_id is not None:
+                            ai_response_content = f"{api_summary if api_summary else 'API summary generation failed.'}\n\nSQL: {api_sql}"
+                            ai_response_message_id = self._record_ai_response(
+                                chat_id=chat_id,
+                                content=ai_response_content,
+                                processing_time_ms=int(processing_time * 1000) if processing_time else None,
+                                model_name="api_erp_r12",
+                                status="success"
+                            )
+                            
+                            # Record token usage if we have the data and a valid message ID
+                            if ai_response_message_id and token_usage_data:
+                                self._record_token_usage(chat_id, ai_response_message_id, token_usage_data, "api_erp_r12")
                         
                         return result
                     except Exception as e:
@@ -889,14 +1117,47 @@ class ERPHybridProcessor:
                             "routing_confidence": routing_confidence,
                             "target_module": target_module,
                             "target_db": target_db,
-                            "error": str(e)
+                            "error": str(e),
+                            "token_usage": token_usage_data
                         }
+                        
+                        # Record AI response in dashboard if chat_id is provided
+                        if chat_id is not None:
+                            ai_response_content = result.get("summary", "")
+                            if result.get("sql"):
+                                ai_response_content += f"\n\nSQL: {result['sql']}"
+                            ai_response_message_id = self._record_ai_response(
+                                chat_id=chat_id,
+                                content=ai_response_content,
+                                processing_time_ms=int(processing_time * 1000) if processing_time else None,
+                                model_name="local_erp_r12",
+                                status="success" if result.get("status") != "error" else "error"
+                            )
+                            
+                            # Record token usage if we have the data and a valid message ID
+                            if ai_response_message_id and token_usage_data:
+                                self._record_token_usage(chat_id, ai_response_message_id, token_usage_data, "local_erp_r12")
+                            
+                            # Record query history for successful processing
+                            if result.get("status") != "error" and result.get("sql"):
+                                # Get database type from chat for query history recording
+                                database_type = None
+                                try:
+                                    chat = self.dashboard_recorder.dashboard_service.chats.get_chat_by_id(chat_id)
+                                    database_type = chat.get('database_type') if chat else None
+                                except Exception as e:
+                                    logger.error(f"Error getting database type for query history recording: {str(e)}")
+                                finally:
+                                    # Fix: Remove duplicate query history recording from ERP processor to prevent duplicates
+                                    # Query history is now recorded in main.py for all processing paths
+                                    # This prevents duplicate entries with mismatched data
+                                    pass
+                        
                         return result
                 else:
-                    # Fall back to local processing if API SQL generation failed
+                    # No API SQL generated, fall back to local processing
+                    logger.info("No API SQL generated, falling back to local processing")
                     from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
-                    # Import the functions locally to ensure they're in scope
-                    from app.ERP_R12_Test_DB.query_engine import execute_query, format_erp_results
                     result = _local_erp_processing(user_query, target_db, mode, page, page_size, cancellation_token)
                     self.processing_stats["local_processed"] += 1
                     
@@ -905,65 +1166,83 @@ class ERPHybridProcessor:
                     result["hybrid_metadata"] = {
                         "processing_mode": "local_erp_fallback",
                         "model_used": "local_erp_r12",
-                        "selection_reasoning": f"API SQL generation failed, falling back to local processing. Routing confidence: {routing_confidence:.2f}",
+                        "selection_reasoning": f"No API SQL generated, falling back to local processing. Routing confidence: {routing_confidence:.2f}",
                         "processing_time": processing_time,
                         "routing_confidence": routing_confidence,
                         "target_module": target_module,
                         "target_db": target_db,
-                        "error": "API SQL generation failed"
+                        "token_usage": token_usage_data
                     }
+                    
+                    # Record AI response in dashboard if chat_id is provided
+                    if chat_id is not None:
+                        ai_response_content = result.get("summary", "")
+                        if result.get("sql"):
+                            ai_response_content += f"\n\nSQL: {result['sql']}"
+                        ai_response_message_id = self._record_ai_response(
+                            chat_id=chat_id,
+                            content=ai_response_content,
+                            processing_time_ms=int(processing_time * 1000) if processing_time else None,
+                            model_name="local_erp_r12",
+                            status="success" if result.get("status") != "error" else "error"
+                        )
+                        
+                        # Record token usage if we have the data and a valid message ID
+                        if ai_response_message_id and token_usage_data:
+                            self._record_token_usage(chat_id, ai_response_message_id, token_usage_data, "local_erp_r12")
+                    
+                    return result
             else:
-                # For non-ERP queries, fall back to local processing
-                from app.ERP_R12_Test_DB.rag_engine import _local_erp_processing
-                result = _local_erp_processing(user_query, target_db, mode, page, page_size, cancellation_token)
-                self.processing_stats["local_processed"] += 1
-                
-                # Add hybrid metadata
-                processing_time = time.time() - start_time
-                result["hybrid_metadata"] = {
-                    "processing_mode": "local_general",
-                    "model_used": "local_erp_r12",
-                    "selection_reasoning": routing_info.get("reason", "Default fallback for non-ERP queries"),
+                # Handle non-ERP_R12 modules
+                logger.info(f"Routing to non-ERP module: {target_module}")
+                return {
+                    "status": "error",
+                    "error": f"Unsupported target module: {target_module}",
+                    "mode": mode,
+                    "hybrid_metadata": {
+                        "processing_mode": "unsupported_module",
+                        "model_used": "none",
+                        "selection_reasoning": f"Query routed to unsupported module: {target_module}",
+                        "processing_time": time.time() - start_time,
+                        "routing_confidence": routing_confidence,
+                        "target_module": target_module,
+                        "target_db": target_db
+                    }
+                }
+
+        except Exception as e:
+            logger.error(f"ERP R12 query processing failed: {e}")
+            logger.exception("Full traceback:")
+            processing_time = time.time() - start_time
+            
+            # Initialize variables that might be unbound
+            routing_confidence = 0.0
+            target_module = "ERP_R12"
+            target_db = selected_db
+            
+            # Try to get values from locals if they exist
+            if 'routing_confidence' in locals():
+                routing_confidence = locals()['routing_confidence']
+            if 'target_module' in locals():
+                target_module = locals()['target_module']
+            if 'target_db' in locals():
+                target_db = locals()['target_db']
+            
+            # Return error result
+            return {
+                "status": "error",
+                "error": str(e),
+                "mode": mode,
+                "hybrid_metadata": {
+                    "processing_mode": "error",
+                    "model_used": "none",
+                    "selection_reasoning": f"ERP R12 query processing failed: {str(e)}",
                     "processing_time": processing_time,
                     "routing_confidence": routing_confidence,
                     "target_module": target_module,
                     "target_db": target_db
                 }
-            
-            logger.info(f"Query processed in {processing_time:.2f} seconds")
-            return result
-            
-        except Exception as e:
-            logger.error(f"ERP hybrid processing failed: {e}", exc_info=True)
-            return {
-                "status": "error",
-                "message": f"ERP processing failed: {str(e)}",
-                "hybrid_metadata": {
-                    "processing_mode": "error",
-                    "processing_time": time.time() - start_time,
-                    "error": str(e)
-                }
             }
-    
-    def get_processing_stats(self) -> Dict[str, Any]:
-        """
-        Get processing statistics.
-        
-        Returns:
-            Dictionary containing processing statistics
-        """
-        return self.processing_stats.copy()
-    
-    def reset_stats(self):
-        """
-        Reset processing statistics.
-        """
-        self.processing_stats = {
-            "total_queries": 0,
-            "local_processed": 0,
-            "api_processed": 0,
-            "hybrid_processed": 0
-        }
 
-# Global instance
+# Create a global instance of the ERP hybrid processor
 erp_hybrid_processor = ERPHybridProcessor()

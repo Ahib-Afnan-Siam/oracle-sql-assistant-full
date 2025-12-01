@@ -2174,3 +2174,43 @@ def _quick_value_probe(selected_db: str, needle: str, candidates: List[Dict[str,
         try: cur.close()
         except Exception: pass
     return results[:50]
+
+
+def execute_query(sql: str, selected_db: str = "source_db_1") -> Dict[str, Any]:
+    """
+    Execute a SQL query against the SOS database.
+    
+    Args:
+        sql: The SQL query to execute
+        selected_db: The database ID to connect to (default: source_db_1)
+        
+    Returns:
+        Dictionary containing query results with columns and rows
+    """
+    try:
+        # Execute the SQL query
+        rows = run_sql_with_cancellation(sql, selected_db)
+        
+        # Convert rows to the expected format
+        if rows:
+            # Extract column names from the first row
+            columns = list(rows[0].keys()) if rows else []
+            # Convert rows to list of lists
+            rows_as_lists = [list(row.values()) for row in rows]
+            
+            return {
+                "columns": columns,
+                "rows": rows_as_lists,
+                "row_count": len(rows)
+            }
+        else:
+            return {
+                "columns": [],
+                "rows": [],
+                "row_count": 0
+            }
+    except Exception as e:
+        logger.error(f"Error executing query: {e}")
+        raise e
+
+    return results[:50]

@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { PanelLeftClose, PanelLeftOpen, Info } from "lucide-react";
 import { getPrompts } from "../utils/prompts";
+import ChatHistory from "./ChatHistory";
 
 // Define mode information with descriptions and colors
 const MODE_INFO = {
@@ -386,29 +387,9 @@ export default function Sidebar() {
             New chat
           </button>
 
-          {/* Chat Menu */}
-          <div className="mt-4 text-sm font-semibold text-gray-600 transition-smooth dark:text-gray-300">Chat Menu</div>
-          <div className="mt-2 flex-1 min-h-0 overflow-y-auto pr-1 space-y-2 pb-3 transition-smooth">
-            {prompts.map((text, index) => (
-              <button
-                key={text}
-                onClick={() => processMessage(text, selectedDB, mode)}
-                disabled={isTyping}
-                className={clsx(
-                  "w-full text-left px-3 py-2 rounded-xl border shadow-sm transition-all duration-300",
-                  "bg-white/70 text-gray-800 border-white/50",
-                  "text-xs md:text-[13px] leading-snug",
-                  "hover:bg-primary-purple-600 hover:text-white hover:shadow-lg hover:translate-x-0.5 smooth-hover hover-lift button-press",
-                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-purple-600/50",
-                  "staggered-animation animate dark:bg-gray-700/70 dark:text-gray-100 dark:border-gray-600/50 dark:hover:bg-primary-purple-600",
-                  "dark:focus-visible:ring-primary-purple-400/50",
-                  isTyping && "opacity-60 cursor-not-allowed"
-                )}
-                style={{ animationDelay: `${index * 0.05}s` }}
-              >
-                {text}
-              </button>
-            ))}
+          {/* Chat History Section */}
+          <div className="flex-1 min-h-0 overflow-hidden">
+            <ChatHistory />
           </div>
         </div>
 

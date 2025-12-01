@@ -42,7 +42,7 @@ export type Message = {
   };
 };
 
-type LastIds = { turn_id?: number; sql_sample_id?: number | null; sql_summary_id?: number | null };
+type LastIds = { turn_id?: number; sql_sample_id?: number | null; summary_sample_id?: number | null; chat_id?: number; message_id?: number };
 
 // New Mode type - reordered to reflect preference
 export type Mode = "General" | "PRAN ERP" | "RFL ERP" | "SOS";
@@ -231,13 +231,15 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
       }
 
       // ✅ keep FeedbackBox IDs flowing in non-stream mode
-      if (payload?.ids || payload?.turn_id) {
+      if (payload?.ids || payload?.turn_id || payload?.chat_id) {
         setLastIds((prev) => ({
           ...prev,
           ...(payload.ids ?? {}),
           ...(payload.turn_id ? { turn_id: payload.turn_id } : {}),
           ...(payload.sql_sample_id ? { sql_sample_id: payload.sql_sample_id } : {}),
-          ...(payload.summary_sample_id ? { summary_sample_id: payload.summary_sample_id } : {}),
+          ...(payload.summary_sample_id ? { summary_sample_id: payload.summary_sample_id } : {}), // Fixed property mapping
+          ...(payload.chat_id ? { chat_id: payload.chat_id } : {}),
+          ...(payload.message_id ? { message_id: payload.message_id } : {})
         }));
       }
 
@@ -393,192 +395,148 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
       file: {
         name: file.name,
         size: file.size,
-        type: file.type
-      }
+        type: file.type,
+      },
     });
-
-    const thinkingId = addMessage({
-      sender: "bot",
-      content: "Analyzing file...",
-      id: generateId(),
-      type: "status",
-    });
-    thinkingMsgIdRef.current = thinkingId;
 
     try {
-      // Phase 4.2: Track request start time for response time calculation
-      const requestStartTime = Date.now();
+      // Prepare form data for file upload
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("question", q);
+      formData.append("mode", effectiveMode);
       
+      // Only include selected_db when not in General
+      if (effectiveMode !== "General" && effectiveDB) {
+        formData.append("selected_db", effectiveDB);
+      }
+
       // Get auth token from localStorage
       const authToken = localStorage.getItem("authToken");
       
-      // First, upload the file
-      const formData = new FormData();
-      formData.append('file', file);
-      
-      // Add auth token to file upload request
-      const uploadHeaders: Record<string, string> = {};
+      const headers: Record<string, string> = {};
       if (authToken) {
-        uploadHeaders["Authorization"] = `Bearer ${authToken}`;
+        headers["Authorization"] = `Bearer ${authToken}`;
       }
-      
-      const uploadResponse = await fetch("/api/upload-file", {
+
+      const res = await fetch("/api/file-chat", {
         method: "POST",
-        headers: uploadHeaders,
+        headers,
         body: formData,
         signal: controller.signal,
       });
 
-      if (!uploadResponse.ok) {
-        throw new Error(`File upload failed: ${uploadResponse.statusText}`);
-      }
+      const payload = await res.json();
 
-      const uploadResult = await uploadResponse.json();
-      
-      // Then, analyze the file with the user's question
-      const analyzePayload = {
-        file_id: uploadResult.file_id,
-        question: q
-      };
-      
-      // Add auth token to file analysis request
-      const analyzeHeaders: Record<string, string> = { "Content-Type": "application/json" };
-      if (authToken) {
-        analyzeHeaders["Authorization"] = `Bearer ${authToken}`;
-      }
-
-      const analyzeResponse = await fetch("/api/analyze-file", {
-        method: "POST",
-        headers: analyzeHeaders,
-        body: JSON.stringify(analyzePayload),
-        signal: controller.signal,
-      });
-
-      const payload = await analyzeResponse.json();
-
-      // Phase 4.2: Calculate total response time
-      const responseTime = Date.now() - requestStartTime;
-
-      if (!analyzeResponse.ok) {
-        const text =
-          typeof payload === "string" ? payload : payload?.detail || analyzeResponse.statusText;
-        updateMessage(
-          thinkingId,
-          { error: "HTTPError", message: text } as any,
-          {
-            type: "error",
-            response_time: responseTime,
-          }
-        );
+      if (!res.ok) {
+        addMessage({
+          sender: "bot",
+          content: {
+            error: "HTTPError",
+            message: typeof payload === "string" ? payload : payload?.detail || res.statusText,
+          } as any,
+          type: "error",
+          id: generateId(),
+        });
         setIsTyping(false);
         return;
       }
 
       // handle backend error envelope
       if (payload?.status === "error") {
-        updateMessage(
-          thinkingId,
-          {
-            error: payload.error, // may be undefined
+        addMessage({
+          sender: "bot",
+          content: {
+            error: payload.error,
             message: payload.message ?? "Request failed.",
+            sql: payload.sql,
+            valid_columns: payload.valid_columns,
           } as any,
-          {
-            type: "error",
-            response_time: responseTime,
-          }
-        );
+          type: "error",
+          id: generateId(),
+        });
         setIsTyping(false);
         return;
       }
 
-      // ✅ keep FeedbackBox IDs flowing in non-stream mode
-      if (payload?.ids || payload?.turn_id) {
+      // ✅ keep FeedbackBox IDs flowing in non-stream mode for file uploads too
+      if (payload?.ids || payload?.turn_id || payload?.chat_id) {
         setLastIds((prev) => ({
           ...prev,
           ...(payload.ids ?? {}),
           ...(payload.turn_id ? { turn_id: payload.turn_id } : {}),
           ...(payload.sql_sample_id ? { sql_sample_id: payload.sql_sample_id } : {}),
-          ...(payload.summary_sample_id ? { summary_sample_id: payload.summary_sample_id } : {}),
+          ...(payload.summary_sample_id ? { summary_sample_id: payload.summary_sample_id } : {}), // Fixed property mapping
+          ...(payload.chat_id ? { chat_id: payload.chat_id } : {}),
+          ...(payload.message_id ? { message_id: payload.message_id } : {})
         }));
       }
 
-      if (payload?.error) {
-        // normalize into a consistent object
-        const msg: string =
-          typeof payload.error === "string"
-            ? payload.error
-            : payload.error?.message || "Request failed.";
-        updateMessage(
-          thinkingId,
-          {
-            error: "FileAnalysisError",
-            message: msg,
-          } as any,
-          {
-            type: "error",
-            response_time: responseTime,
+      // Handle successful file analysis response
+      if (payload?.status === "success") {
+        // Add summary message if present
+        if (payload?.summary) {
+          addMessage({
+            sender: "bot",
+            content: payload.summary,
+            type: "summary",
+            id: generateId(),
+          });
+        }
+
+        // Add table message if data is present
+        if (payload?.results?.columns && payload?.results?.rows) {
+          const columns: string[] = payload.results.columns;
+          const rows: any[] = payload.results.rows;
+          
+          // Convert array of objects to array of arrays if needed
+          let tableRows: (string | number | null)[][] = [];
+          if (rows.length > 0) {
+            // Check if rows are objects (from backend) or already arrays
+            if (typeof rows[0] === 'object' && rows[0] !== null && !Array.isArray(rows[0])) {
+              // Convert objects to arrays using column order
+              tableRows = rows.map(row => 
+                columns.map(col => 
+                  row[col] !== undefined ? row[col] : null
+                )
+              );
+            } else {
+              // Rows are already arrays
+              tableRows = rows as (string | number | null)[][];
+            }
           }
-        );
-        setIsTyping(false);
-        return;
+          
+          if (columns.length) {
+            addMessage({
+              sender: "bot",
+              content: [columns, ...tableRows],
+              type: "table",
+              id: generateId(),
+            });
+          }
+        }
       }
-
-      // Phase 4.2: Extract hybrid metadata from response
-      const hybridMetadata = payload?.hybrid_metadata;
-
-      // Update the thinking bubble with the analysis result
-      updateMessage(thinkingId, payload.summary as string, {
-        type: "summary",
-        hybrid_metadata: hybridMetadata,
-        response_time: responseTime,
-      });
     } catch (err: any) {
       if (err?.name === "AbortError") {
-        // user pressed Stop → show stopped on the same bubble
-        if (thinkingMsgIdRef.current) {
-          updateMessage(thinkingMsgIdRef.current, "⏹️ Stopped.", { type: "status" });
-        } else {
-          addMessage({
-            sender: "bot",
-            content: "⏹️ Stopped.",
-            type: "status",
-            id: generateId(),
-          });
-        }
+        addMessage({
+          sender: "bot",
+          content: "⏹️ Stopped.",
+          type: "status",
+          id: generateId(),
+        });
       } else {
-        // transform the status bubble into an error bubble
-        if (thinkingMsgIdRef.current) {
-          updateMessage(thinkingMsgIdRef.current, "⚠️ Error during file processing.", { type: "error" });
-        } else {
-          addMessage({
-            sender: "bot",
-            content: "⚠️ Error during file processing.",
-            type: "error",
-            id: generateId(),
-          });
-        }
+        addMessage({
+          sender: "bot",
+          content: "⚠️ Error during file processing.",
+          type: "error",
+          id: generateId(),
+        });
       }
     } finally {
       setIsTyping(false);
       abortControllerRef.current = null;
-      thinkingMsgIdRef.current = null;
       _setIsPaused(false);
     }
-  };
-
-  // Helper function to read file as base64
-  const readFileAsBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        // Remove the data URL prefix (e.g., "data:image/png;base64,")
-        const base64Content = result.split(',')[1];
-        resolve(base64Content);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
   };
 
   return (
@@ -605,8 +563,10 @@ export const ChatProvider = ({ children }: { children: ReactNode }) => {
   );
 };
 
-export const useChat = (): ChatContextType => {
-  const ctx = useContext(ChatContext);
-  if (!ctx) throw new Error("useChat must be used within ChatProvider");
-  return ctx;
+export const useChat = () => {
+  const context = useContext(ChatContext);
+  if (!context) {
+    throw new Error("useChat must be used within a ChatProvider");
+  }
+  return context;
 };

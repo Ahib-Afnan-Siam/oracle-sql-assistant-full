@@ -1,0 +1,322 @@
+@import '../index.css';
+
+/* Custom theme extensions for consistent styling */
+:root {
+  /* Primary purple theme colors */
+  --primary-purple-50: #f5f3ff;
+  --primary-purple-100: #ede9fe;
+  --primary-purple-200: #ddd6fe;
+  --primary-purple-300: #c4b5fd;
+  --primary-purple-400: #a78bfa;
+  --primary-purple-500: #8b5cf6;
+  --primary-purple-600: #7c3aed;
+  --primary-purple-700: #6d28d9;
+  --primary-purple-800: #5b21b6;
+  --primary-purple-900: #4c1d95;
+  
+  /* Primary color - the main purple used in the design */
+  --primary-color: var(--primary-purple-600); /* #7c3aed */
+  --primary-color-dark: var(--primary-purple-700); /* #6d28d9 */
+  --primary-color-light: var(--primary-purple-500); /* #8b5cf6 */
+  
+  /* Hover states */
+  --primary-hover: var(--primary-purple-700);
+  --primary-hover-dark: var(--primary-purple-800);
+  
+  /* Focus states */
+  --primary-focus: var(--primary-purple-300);
+  
+  /* Background and text for buttons */
+  --primary-btn-bg: var(--primary-color);
+  --primary-btn-text: white;
+  --primary-btn-hover-bg: var(--primary-hover);
+  
+  /* Border colors */
+  --primary-border: var(--primary-purple-300);
+  --primary-border-dark: var(--primary-purple-400);
+  
+  /* Animation timing */
+  --animation-duration-fast: 200ms;
+  --animation-duration-normal: 300ms;
+  --animation-duration-slow: 500ms;
+  
+  /* Easing functions */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out-quad: cubic-bezier(0.45, 0.55, 0.45, 1);
+  
+  /* Light mode specific colors */
+  --background-color: #ffffff;
+  --text-color: #374151;
+  --text-color-light: #6b7280;
+  --surface-color: #f9fafb;
+  --border-color: #e5e7eb;
+  --shadow-color: rgba(0, 0, 0, 0.1);
+  --background-image: url('/gradient-bg.png');
+}
+
+.dark {
+  /* Dark mode specific colors */
+  --background-color: #111827;
+  --text-color: #f3f4f6; /* Lighter text for better readability */
+  --text-color-light: #d1d5db;
+  --surface-color: #1f2937;
+  --border-color: #374151;
+  --shadow-color: rgba(0, 0, 0, 0.3);
+  /* Dark mode uses a solid dark background instead of an image */
+  --background-image: none;
+  
+  /* Adjust purple colors for better visibility in dark mode */
+  --primary-purple-50: #f5f3ff;
+  --primary-purple-100: #ede9fe;
+  --primary-purple-200: #ddd6fe;
+  --primary-purple-300: #c4b5fd;
+  --primary-purple-400: #a78bfa;
+  --primary-purple-500: #8b5cf6;
+  --primary-purple-600: #7c3aed;
+  --primary-purple-700: #6d28d9;
+  --primary-purple-800: #5b21b6;
+  --primary-purple-900: #4c1d95;
+}
+
+/* Ensure background covers entire viewport */
+body {
+  background-color: var(--background-color);
+  background-image: var(--background-image);
+  background-repeat: no-repeat;
+  background-size: cover;
+  background-position: center;
+  position: relative;
+}
+
+/* Consistent button styles */
+.btn-primary {
+  background-color: var(--primary-btn-bg);
+  color: var(--primary-btn-text);
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 0.375rem;
+  font-weight: 500;
+  transition: background-color 0.2s ease-in-out;
+}
+
+.btn-primary:hover {
+  background-color: var(--primary-btn-hover-bg);
+}
+
+.btn-primary:focus {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px var(--primary-focus);
+}
+
+/* Consistent card styles */
+.card {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 3px 0 var(--shadow-color);
+  padding: 1.5rem;
+}
+
+/* Consistent panel styles */
+.panel {
+  background-color: var(--surface-color);
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 3px 0 var(--shadow-color);
+}
+
+/* Consistent input styles */
+.input {
+  display: block;
+  width: 100%;
+  border-radius: 0.375rem;
+  border: 1px solid var(--border-color);
+  padding: 0.5rem 0.75rem;
+  background-color: var(--surface-color);
+  color: var(--text-color);
+  box-shadow: 0 1px 2px 0 var(--shadow-color);
+}
+
+.input:focus {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 3px var(--primary-focus);
+}
+
+/* Consistent label styles */
+.label {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-color);
+  margin-bottom: 0.25rem;
+}
+
+/* Responsive grid utilities */
+.grid-gap-sm {
+  gap: 1rem;
+}
+
+.grid-gap-md {
+  gap: 1.5rem;
+}
+
+.grid-gap-lg {
+  gap: 2rem;
+}
+
+/* Consistent typography */
+.text-display {
+  font-size: 2.25rem;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.text-heading {
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.text-subheading {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.text-body {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.text-caption {
+  font-size: 0.875rem;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+/* Consistent spacing utilities */
+.m-auto {
+  margin: auto;
+}
+
+.mx-auto {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.my-auto {
+  margin-top: auto;
+  margin-bottom: auto;
+}
+
+/* Consistent border utilities */
+.border-primary {
+  border-color: var(--primary-color);
+}
+
+.border-secondary {
+  border-color: var(--border-color);
+}
+
+/* Consistent shadow utilities */
+.shadow-sm {
+  box-shadow: 0 1px 2px 0 var(--shadow-color);
+}
+
+.shadow-md {
+  box-shadow: 0 4px 6px -1px var(--shadow-color), 0 2px 4px -1px var(--shadow-color);
+}
+
+.shadow-lg {
+  box-shadow: 0 10px 15px -3px var(--shadow-color), 0 4px 6px -2px var(--shadow-color);
+}
+
+.shadow-xl {
+  box-shadow: 0 20px 25px -5px var(--shadow-color), 0 10px 10px -5px var(--shadow-color);
+}
+
+/* Consistent rounded utilities */
+.rounded-sm {
+  border-radius: 0.125rem;
+}
+
+.rounded-md {
+  border-radius: 0.25rem;
+}
+
+.rounded-lg {
+  border-radius: 0.5rem;
+}
+
+.rounded-xl {
+  border-radius: 0.75rem;
+}
+
+.rounded-2xl {
+  border-radius: 1rem;
+}
+
+.rounded-full {
+  border-radius: 9999px;
+}
+
+/* Consistent transition utilities */
+.transition-fast {
+  transition: all var(--animation-duration-fast) ease-in-out;
+}
+
+.transition-normal {
+  transition: all var(--animation-duration-normal) ease-in-out;
+}
+
+.transition-slow {
+  transition: all var(--animation-duration-slow) ease-in-out;
+}
+
+/* Consistent animation utilities */
+.animate-fade-in {
+  animation: fadeIn var(--animation-duration-normal) ease-in-out forwards;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-fade-out {
+  animation: fadeOut var(--animation-duration-normal) ease-in-out forwards;
+}
+
+@keyframes fadeOut {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* Consistent hover effects */
+.hover-lift {
+  transition: transform 0.2s ease-in-out;
+}
+
+.hover-lift:hover {
+  transform: translateY(-2px);
+}
+
+.hover-shadow {
+  transition: box-shadow 0.2s ease-in-out;
+}
+
+.hover-shadow:hover {
+  box-shadow: 0 10px 25px var(--shadow-color);
+}

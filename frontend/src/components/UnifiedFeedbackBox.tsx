@@ -16,13 +16,30 @@ type HybridMetadata = {
 interface Props {
   messageId?: string;
   hybridMetadata?: HybridMetadata;
+  turnId?: number; // Accept turnId as prop
+  sqlSampleId?: number | null; // Accept sqlSampleId as prop
+  summary_sample_id?: number | null; // Accept summarySampleId as prop
+  chatId?: number; // Accept chatId as prop
+  messageIdForFeedback?: number; // Accept messageId as prop
 }
 
-const UnifiedFeedbackBox: React.FC<Props> = ({ messageId, hybridMetadata }) => {
+const UnifiedFeedbackBox: React.FC<Props> = ({ 
+  messageId, 
+  hybridMetadata,
+  turnId: propTurnId, // Use prop turnId if provided
+  sqlSampleId: propSqlSampleId, // Use prop sqlSampleId if provided
+  summary_sample_id: propSummarySampleId, // Use prop summarySampleId if provided
+  chatId: propChatId, // Use prop chatId if provided
+  messageIdForFeedback: propMessageId // Use prop messageId if provided
+}) => {
   const { lastIds, messages } = useChat();
-  const turnId = lastIds?.turn_id;
-  const sqlSampleId = lastIds?.sql_sample_id ?? null;
-  const summarySampleId = lastIds?.sql_summary_id ?? null;
+  
+  // Use prop values if provided, otherwise fall back to context values
+  const turnId = propTurnId ?? lastIds?.turn_id;
+  const sqlSampleId = propSqlSampleId ?? lastIds?.sql_sample_id ?? null;
+  const summarySampleId = propSummarySampleId ?? lastIds?.summary_sample_id ?? null; // Use correct property name
+  const chatId = propChatId ?? lastIds?.chat_id;
+  const messageIdForFeedback = propMessageId ?? lastIds?.message_id;
 
   // Find the message corresponding to this feedback box
   const currentMessage = messages?.find((m: any) => m.id === messageId);
@@ -122,6 +139,11 @@ const UnifiedFeedbackBox: React.FC<Props> = ({ messageId, hybridMetadata }) => {
         labeler_role: "end_user",
         source: source // Add source information
       };
+      
+      // Add new chat_id and message_id if available
+      if (chatId !== undefined && chatId !== null) body.chat_id = chatId;
+      if (messageIdForFeedback !== undefined && messageIdForFeedback !== null) body.message_id = messageIdForFeedback;
+      
       if (taskType === "sql") body.sql_sample_id = sqlSampleId;
       if (taskType === "summary") body.summary_sample_id = summarySampleId;
       if (feedbackType === "needs_improvement") {
@@ -134,6 +156,7 @@ const UnifiedFeedbackBox: React.FC<Props> = ({ messageId, hybridMetadata }) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
+
 
       const response = await fetch("/api/feedback", {
         method: "POST",
@@ -181,7 +204,8 @@ const UnifiedFeedbackBox: React.FC<Props> = ({ messageId, hybridMetadata }) => {
   };
 
   // 🔹 Early exits
-  if (!turnId || feedbackGiven) return null;
+  // Use either the old turnId or the new chatId/messageIdForFeedback
+  if ((!turnId && (!chatId || !messageIdForFeedback)) || feedbackGiven) return null;
 
   return (
     <div className="flex justify-center">

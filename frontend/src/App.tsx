@@ -6,14 +6,21 @@ import { useChat } from "./components/ChatContext";
 import { AnimatePresence, motion } from "framer-motion";
 import ChatInput from "./components/ChatInput";
 import { useTheme } from './components/ThemeContext';
-import { Sun, Moon, LogOut } from 'lucide-react';
+import { Sun, Moon, LogOut, Shield } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 
 function App() {
   const { messages } = useChat();
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  // Check if user is admin on component mount
+  useEffect(() => {
+    const adminStatus = localStorage.getItem("isAdmin") === "true";
+    setIsAdmin(adminStatus);
+  }, []);
 
   // Handle logout
   const handleLogout = async () => {
@@ -37,6 +44,11 @@ function App() {
     }
   };
 
+  // Handle admin dashboard navigation
+  const handleAdminDashboard = () => {
+    navigate("/admin");
+  };
+
   return (
     <div className="relative w-full h-screen overflow-hidden bg-background-color text-text-color">
       <div className="flex h-full w-full">
@@ -48,6 +60,17 @@ function App() {
           {/* Header for chat panel only */}
           <header className="bg-surface-color p-4 flex justify-end items-center border-b border-border-color">
             <div className="flex items-center space-x-4">
+              {/* Admin Dashboard Button - Only visible to admins */}
+              {isAdmin && (
+                <button 
+                  onClick={handleAdminDashboard}
+                  className="flex items-center space-x-1 px-3 py-2 rounded-lg bg-surface-color border border-border-color text-text-color hover:bg-purple-600 hover:text-white transition-colors duration-200"
+                >
+                  <Shield size={18} />
+                  <span>Admin Dashboard</span>
+                </button>
+              )}
+              
               {/* Theme Toggle Button */}
               <button
                 onClick={toggleTheme}

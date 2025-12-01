@@ -193,6 +193,20 @@ class ERPDeepSeekClient:
                                         request_content=first_message_content
                                     )
                                 
+                                # Record model status as available with response time
+                                try:
+                                    from app.dashboard_recorder import get_dashboard_recorder
+                                    recorder = get_dashboard_recorder()
+                                    if recorder:
+                                        recorder.record_model_status(
+                                            model_type="api",
+                                            model_name=payload.get("model", "unknown"),
+                                            status="available",
+                                            response_time_ms=int(response_time * 1000)
+                                        )
+                                except Exception as e:
+                                    logger.warning(f"Failed to record model status: {e}")
+                                
                                 return DeepSeekResponse(
                                     content=content.strip(),
                                     model=payload.get("model", "unknown"),
@@ -232,6 +246,22 @@ class ERPDeepSeekClient:
                             last_error = f"Content policy violation (HTTP 403): {response_text}"
                             logger.warning(f"API content policy violation: {last_error}")
                             # Don't retry immediately, let the calling function handle model fallback
+                            
+                            # Record model status as degraded due to content policy violation
+                            try:
+                                from app.dashboard_recorder import get_dashboard_recorder
+                                recorder = get_dashboard_recorder()
+                                if recorder:
+                                    recorder.record_model_status(
+                                        model_type="api",
+                                        model_name=payload.get("model", "unknown"),
+                                        status="degraded",
+                                        response_time_ms=int(response_time * 1000),
+                                        error_message=last_error
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Failed to record model status: {e}")
+                            
                             return DeepSeekResponse(
                                 content="",
                                 model=payload.get("model", "unknown"),
@@ -250,15 +280,60 @@ class ERPDeepSeekClient:
                                 logger.warning(f"Server error, retrying in {wait_time}s")
                                 await asyncio.sleep(wait_time)
                                 continue
-                        
+                            
+                            # Record model status as degraded due to server error
+                            try:
+                                from app.dashboard_recorder import get_dashboard_recorder
+                                recorder = get_dashboard_recorder()
+                                if recorder:
+                                    recorder.record_model_status(
+                                        model_type="api",
+                                        model_name=payload.get("model", "unknown"),
+                                        status="degraded",
+                                        response_time_ms=int(response_time * 1000),
+                                        error_message=last_error
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Failed to record model status: {e}")
+
                         else:  # Other client errors
                             last_error = f"HTTP {response.status}: {response_text}"
                             logger.warning(f"API error (attempt {attempt + 1}): {last_error}")
                             if attempt < self.max_retries:
                                 await asyncio.sleep(self.retry_delay)
                                 continue
-                        
+                            
+                            # Record model status as degraded
+                            try:
+                                from app.dashboard_recorder import get_dashboard_recorder
+                                recorder = get_dashboard_recorder()
+                                if recorder:
+                                    recorder.record_model_status(
+                                        model_type="api",
+                                        model_name=payload.get("model", "unknown"),
+                                        status="degraded",
+                                        response_time_ms=int(response_time * 1000),
+                                        error_message=last_error
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Failed to record model status: {e}")
+
                         # If we reach here, it's the final attempt or a non-retryable error
+                        # Record model status as degraded
+                        try:
+                            from app.dashboard_recorder import get_dashboard_recorder
+                            recorder = get_dashboard_recorder()
+                            if recorder:
+                                recorder.record_model_status(
+                                    model_type="api",
+                                    model_name=payload.get("model", "unknown"),
+                                    status="degraded",
+                                    response_time_ms=int(response_time * 1000),
+                                    error_message=last_error
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to record model status: {e}")
+                        
                         return DeepSeekResponse(
                             content="",
                             model=payload.get("model", "unknown"),
@@ -277,6 +352,21 @@ class ERPDeepSeekClient:
                     await asyncio.sleep(self.retry_delay)
                     continue
                     
+                # Record model status as unavailable due to timeout
+                try:
+                    from app.dashboard_recorder import get_dashboard_recorder
+                    recorder = get_dashboard_recorder()
+                    if recorder:
+                        recorder.record_model_status(
+                            model_type="api",
+                            model_name=payload.get("model", "unknown"),
+                            status="unavailable",
+                            response_time_ms=int((time.time() - start_time) * 1000),
+                            error_message=last_error
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to record model status: {e}")
+
             except aiohttp.ClientError as e:
                 last_error = f"Connection error: {str(e)}"
                 if attempt < self.max_retries:
@@ -284,14 +374,59 @@ class ERPDeepSeekClient:
                     await asyncio.sleep(self.retry_delay)
                     continue
                     
+                # Record model status as unavailable due to connection error
+                try:
+                    from app.dashboard_recorder import get_dashboard_recorder
+                    recorder = get_dashboard_recorder()
+                    if recorder:
+                        recorder.record_model_status(
+                            model_type="api",
+                            model_name=payload.get("model", "unknown"),
+                            status="unavailable",
+                            response_time_ms=int((time.time() - start_time) * 1000),
+                            error_message=last_error
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to record model status: {e}")
+
             except Exception as e:
                 last_error = f"Unexpected error: {str(e)}"
                 logger.exception(f"Unexpected error (attempt {attempt + 1})")
                 if attempt < self.max_retries:
                     await asyncio.sleep(self.retry_delay)
                     continue
-        
+                    
+                # Record model status as unavailable due to unexpected error
+                try:
+                    from app.dashboard_recorder import get_dashboard_recorder
+                    recorder = get_dashboard_recorder()
+                    if recorder:
+                        recorder.record_model_status(
+                            model_type="api",
+                            model_name=payload.get("model", "unknown"),
+                            status="unavailable",
+                            response_time_ms=int((time.time() - start_time) * 1000),
+                            error_message=last_error
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to record model status: {e}")
+
         # All retries exhausted
+        # Record model status as unavailable
+        try:
+            from app.dashboard_recorder import get_dashboard_recorder
+            recorder = get_dashboard_recorder()
+            if recorder:
+                recorder.record_model_status(
+                    model_type="api",
+                    model_name=payload.get("model", "unknown"),
+                    status="unavailable",
+                    response_time_ms=int((time.time() - start_time) * 1000),
+                    error_message=last_error or "All retry attempts failed"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to record model status: {e}")
+        
         return DeepSeekResponse(
             content="",
             model=payload.get("model", "unknown"),
@@ -387,29 +522,79 @@ class ERPDeepSeekClient:
                 content_upper = response.content.upper()
                 is_available = "TEST_OK" in content_upper or "OK" in content_upper
                 
+                # Record model status based on test result
+                try:
+                    from app.dashboard_recorder import get_dashboard_recorder
+                    recorder = get_dashboard_recorder()
+                    if recorder:
+                        status = "available" if is_available else "degraded"
+                        error_msg = None if is_available else f"Unexpected response: {response.content}"
+                        recorder.record_model_status(
+                            model_type="api",
+                            model_name=model,
+                            status=status,
+                            response_time_ms=int(response_time * 1000),
+                            error_message=error_msg
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to record model status: {e}")
+                
                 return ModelTestResult(
                     model=model,
                     available=is_available,
                     response_time=response_time,
                     test_response=response.content,
-                    error=None if is_available else f"Unexpected response: {response.content}"
+                    error=None if is_available else f"Unexpected response: {response.content}",
+                    metadata={"priority": "test", "model_type": "test"}
                 )
             else:
+                # Record model status as unavailable
+                try:
+                    from app.dashboard_recorder import get_dashboard_recorder
+                    recorder = get_dashboard_recorder()
+                    if recorder:
+                        recorder.record_model_status(
+                            model_type="api",
+                            model_name=model,
+                            status="unavailable",
+                            response_time_ms=int(response_time * 1000),
+                            error_message=response.error
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to record model status: {e}")
+                
                 return ModelTestResult(
                     model=model,
                     available=False,
                     response_time=response_time,
                     error=response.error,
-                    test_response=None
+                    test_response=None,
+                    metadata={"priority": "test", "model_type": "test"}
                 )
                 
-        except Exception as e:
+        except Exception as outer_e:
+            # Record model status as unavailable due to exception
+            try:
+                from app.dashboard_recorder import get_dashboard_recorder
+                recorder = get_dashboard_recorder()
+                if recorder:
+                    recorder.record_model_status(
+                        model_type="api",
+                        model_name=model,
+                        status="unavailable",
+                        response_time_ms=int((time.time() - start_time) * 1000),
+                        error_message=f"Test exception: {str(outer_e)}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to record model status: {e}")
+            
             return ModelTestResult(
                 model=model,
                 available=False,
                 response_time=time.time() - start_time,
-                error=f"Test exception: {str(e)}",
-                test_response=None
+                error=f"Test exception: {str(outer_e)}",
+                test_response=None,
+                metadata={"priority": "test", "model_type": "test"}
             )
     
     async def generate_sql_with_api(

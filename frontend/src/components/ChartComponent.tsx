@@ -27,6 +27,7 @@ interface ChartComponentProps {
       backgroundColor?: string | string[];
       borderColor?: string | string[];
       borderWidth?: number;
+      yAxisID?: string;
     }[];
   };
   options?: any;
@@ -68,7 +69,8 @@ const ChartComponent = forwardRef<ChartComponentHandle, ChartComponentProps>(
                 duration: 0 // Disable animations for large datasets
               },
               hover: {
-                animationDuration: 0 // Disable hover animations
+                mode: 'index' as const,
+                intersect: false
               },
               responsiveAnimationDuration: 0, // Disable resize animations
               // Reduce the number of ticks for better performance
@@ -92,6 +94,19 @@ const ChartComponent = forwardRef<ChartComponentHandle, ChartComponentProps>(
                     maxTicksLimit: 15, // Limit y-axis ticks
                     autoSkip: true
                   }
+                },
+                // Add secondary y-axis for dual-axis charts
+                y1: {
+                  ...options.scales?.y1,
+                  position: 'right',
+                  grid: {
+                    drawOnChartArea: false,
+                  },
+                  ticks: {
+                    ...options.scales?.y1?.ticks,
+                    maxTicksLimit: 15,
+                    autoSkip: true
+                  }
                 }
               },
               plugins: {
@@ -109,6 +124,25 @@ const ChartComponent = forwardRef<ChartComponentHandle, ChartComponentProps>(
                         return chart.data.datasets.findIndex((d: any) => d.label === item.text) < 3;
                       }
                       return true;
+                    }
+                  }
+                },
+                tooltip: {
+                  ...options.plugins?.tooltip,
+                  mode: 'index',
+                  intersect: false,
+                  callbacks: {
+                    label: function(context: any) {
+                      let label = context.dataset.label || '';
+                      if (label) {
+                        label += ': ';
+                      }
+                      if (context.parsed.y !== null) {
+                        label += new Intl.NumberFormat('en-US', { 
+                          maximumFractionDigits: context.dataset.yAxisID === 'y1' ? 6 : 2 
+                        }).format(context.parsed.y);
+                      }
+                      return label;
                     }
                   }
                 }

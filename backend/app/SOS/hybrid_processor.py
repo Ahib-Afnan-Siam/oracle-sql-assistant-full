@@ -7,13 +7,14 @@ import re
 import time
 import asyncio
 
-import asyncio
-
 from .query_classifier import QueryClassifier, ConfidenceThresholdManager, QueryIntent, ModelSelectionStrategy
-from .deepseek_client import get_deepseek_client
+from .deepseek_client import get_deepseek_client, DeepSeekResponse
 from app.ollama_llm import ask_sql_model
 from app import config
 from app.sql_generator import extract_sql as _extract_sql_basic  # Import the existing function
+
+# Import dashboard recorder for token usage tracking
+from app.dashboard_recorder import get_dashboard_recorder
 
 # Phase 5: Import hybrid data recorder for training data collection
 # Comment out the old imports as we're fully integrating the new AI training recorder
@@ -33,8 +34,6 @@ ai_training_data_recorder = None
 
 # Add a constant to indicate we're not using the training system
 TRAINING_DATA_COLLECTION_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -1524,6 +1523,9 @@ class HybridProcessor:
         }
         # Initialize training data recorder
         self.training_data_recorder = None
+        
+        # Initialize dashboard recorder for token usage tracking
+        self.dashboard_recorder = get_dashboard_recorder()
 
     def _create_fallback_selector(self):
         class FallbackResponseSelector:
@@ -1553,12 +1555,19 @@ class HybridProcessor:
                                      classification_time_ms: float = 0.0,
                                      # File analysis parameters
                                      file_content: Optional[str] = None,
-                                     file_name: Optional[str] = None) -> ProcessingResult:
+                                     file_name: Optional[str] = None,
+                                     # Dashboard recording parameters
+                                     chat_id: Optional[int] = None) -> ProcessingResult:
         """
         Advanced parallel processing with sophisticated response selection.
         """
         start_time = time.time()
         processing_result = None
+        
+        # Log dashboard recorder status
+        self.logger.info(f"Dashboard recorder status: {self.dashboard_recorder is not None}")
+        if self.dashboard_recorder is None:
+            self.logger.warning("Dashboard recorder is not available - token usage will not be recorded")
         
         # Handle general queries - bypass SQL-specific processing
         # Note: General query handling should be done in the HybridProcessor class
@@ -1678,12 +1687,75 @@ class HybridProcessor:
             # Execute with timeouts
             local_response: Optional[str] = None
             api_response: Optional[str] = None
+            api_response_obj = None  # To store the full API response object for token usage
+            
             if decision['use_local'] and decision['use_api']:
-                local_response, api_response = await self._execute_parallel_with_timeout(
+                # For parallel execution, we need to get the API response object separately
+                try:
+                    # Call the API processing method directly to get the full response for token usage tracking
+                    model_type = self._get_model_type_for_intent(classification.intent)
+                    enhanced_query = self._preprocess_dates_for_oracle(user_query)
+                    
+                    # Multi-field detection
+                    mf_indicators = [' vs ', 'versus', 'compare', ' and ', '&', ' with ', 'vs.']
+                    has_multi_fields = any(ind in user_query.lower() for ind in mf_indicators)
+                    if has_multi_fields:
+                        enhanced_query = f"{enhanced_query} (Please provide SQL that returns multiple fields as requested, not just a single value)"
+                    
+                    api_response_obj = await self.deepseek_client.get_sql_response(
+                        user_query=enhanced_query,
+                        schema_context=schema_context,
+                        model_type=model_type
+                    )
+                    
+                    # Extract the SQL from the response
+                    if api_response_obj.success:
+                        api_response = _extract_sql_from_response(api_response_obj.content)
+                        if api_response:
+                            api_response = self._normalize_sql(api_response)
+                    else:
+                        api_response = None
+                        api_response_obj = None  # Clear the object if the response failed
+                except Exception as e:
+                    self.logger.error(f"Error getting full API response for token tracking: {e}")
+                    api_response_obj = None  # Clear the object if there was an error
+                
+                # Execute the parallel processing
+                local_response, api_response_parallel = await self._execute_parallel_with_timeout(
                     user_query, schema_context, classification
                 )
+                
+                # Use the parallel response if we didn't get a successful API response object
+                if api_response is None and api_response_parallel:
+                    api_response = api_response_parallel
             elif decision['use_api']:
-                api_response = await self._execute_api_with_timeout(user_query, schema_context, classification)
+                # For API-only execution, we need to get the full response object
+                try:
+                    # Call the API processing method directly to get the full response
+                    model_type = self._get_model_type_for_intent(classification.intent)
+                    enhanced_query = self._preprocess_dates_for_oracle(user_query)
+                    
+                    # Multi-field detection
+                    mf_indicators = [' vs ', 'versus', 'compare', ' and ', '&', ' with ', 'vs.']
+                    has_multi_fields = any(ind in user_query.lower() for ind in mf_indicators)
+                    if has_multi_fields:
+                        enhanced_query = f"{enhanced_query} (Please provide SQL that returns multiple fields as requested, not just a single value)"
+                    
+                    api_response_obj = await self.deepseek_client.get_sql_response(
+                        user_query=enhanced_query,
+                        schema_context=schema_context,
+                        model_type=model_type
+                    )
+                    
+                    if api_response_obj.success:
+                        api_response = _extract_sql_from_response(api_response_obj.content)
+                        if api_response:
+                            api_response = self._normalize_sql(api_response)
+                    else:
+                        api_response = None
+                except Exception as e:
+                    self.logger.error(f"Error getting full API response: {e}")
+                    api_response = await self._execute_api_with_timeout(user_query, schema_context, classification)
             else:
                 local_response = await self._execute_local_with_timeout(user_query, schema_context)
 
@@ -1732,6 +1804,30 @@ class HybridProcessor:
 
             processing_time = time.time() - start_time
 
+            # Extract token usage data if available
+            api_cost_usd = None
+            api_prompt_tokens = None
+            api_completion_tokens = None
+            
+            self.logger.info(f"Extracting token usage data: api_response_obj={api_response_obj is not None}")
+            if api_response_obj and hasattr(api_response_obj, 'metadata') and api_response_obj.metadata:
+                token_usage = api_response_obj.metadata.get('token_usage', {})
+                self.logger.info(f"Token usage from api_response_obj: {token_usage}")
+                if isinstance(token_usage, dict) and token_usage:
+                    api_prompt_tokens = token_usage.get('prompt_tokens')
+                    api_completion_tokens = token_usage.get('completion_tokens')
+                    self.logger.info(f"Extracted prompt_tokens: {api_prompt_tokens}, completion_tokens: {api_completion_tokens}")
+                    # Calculate cost based on token usage
+                    if api_prompt_tokens is not None and api_completion_tokens is not None:
+                        api_cost_usd = (
+                            api_prompt_tokens * 0.0000001 +  # Prompt token cost
+                            api_completion_tokens * 0.0000002 +  # Completion token cost
+                            0.0001  # Base model cost per request
+                        )
+                        self.logger.info(f"Calculated API cost: {api_cost_usd}")
+            else:
+                self.logger.info("No api_response_obj or metadata available for token usage extraction")
+            
             processing_result = ProcessingResult(
                 selected_response=selected_response or "",
                 local_response=local_response,
@@ -1743,16 +1839,88 @@ class HybridProcessor:
                 processing_time=processing_time,
                 model_used="hybrid_parallel",
                 local_model_name="ollama" if local_response else None,
-                api_model_name="deepseek-chat" if api_response else None,
+                api_model_name=api_response_obj.model if api_response_obj else ("deepseek-chat" if api_response else None),
                 local_processing_time=processing_time if local_response else None,
-                api_processing_time=processing_time if api_response else None
+                api_processing_time=processing_time if api_response else None,
+                api_cost_usd=api_cost_usd,
+                api_prompt_tokens=api_prompt_tokens,
+                api_completion_tokens=api_completion_tokens
             )
+
+            # Record user query and AI response in dashboard if chat_id is provided
+            if chat_id is not None:
+                self.logger.info(f"Recording dashboard data for chat_id: {chat_id}")
+                # Record user query
+                self._record_user_query(
+                    chat_id=chat_id,
+                    content=user_query,
+                    processing_time_ms=int(processing_time * 1000) if processing_time else None,
+                    model_name="user"
+                )
+                
+                # Record AI response and capture message ID for token usage recording
+                ai_response_content = processing_result.selected_response or ""
+                ai_response_message_id = None
+                if ai_response_content:
+                    ai_response_message_id = self._record_ai_response(
+                        chat_id=chat_id,
+                        content=ai_response_content,
+                        processing_time_ms=int(processing_time * 1000) if processing_time else None,
+                        model_name=processing_result.api_model_name or processing_result.local_model_name,
+                        status="success" if processing_result.selected_response else "error"
+                    )
+                
+                # Record token usage if we have API response data and a valid message ID
+                self.logger.info(f"Checking token usage recording conditions: ai_response_message_id={ai_response_message_id}, api_response_obj={api_response_obj is not None}")
+                if ai_response_message_id and api_response_obj and hasattr(api_response_obj, 'metadata') and api_response_obj.metadata:
+                    token_usage = api_response_obj.metadata.get('token_usage', {})
+                    self.logger.info(f"Token usage data available: {bool(token_usage)}, type: {type(token_usage)}, content: {token_usage}")
+                    if isinstance(token_usage, dict) and token_usage:
+                        # Only record if we have token data
+                        total_tokens = token_usage.get('total_tokens', 0)
+                        self.logger.info(f"Total tokens: {total_tokens}")
+                        if total_tokens > 0:
+                            self.logger.info(f"Recording token usage for chat {chat_id}, message {ai_response_message_id}")
+                            self._record_token_usage(chat_id, ai_response_message_id, api_response_obj)
+                        else:
+                            self.logger.info("Not recording token usage - no tokens or zero tokens")
+                    else:
+                        self.logger.info("Not recording token usage - no valid token usage data")
+                else:
+                    self.logger.info("Not recording token usage - conditions not met")
+                
+                # Fix: Remove query history recording from SOS processor to prevent duplicates
+                # Query history is now recorded in main.py for all processing paths
+                # This prevents duplicate entries with mismatched data
 
             return processing_result
 
         except Exception as e:
             self.logger.error(f"[HYBRID_PROCESSOR] Advanced query processing failed: {e}")
             processing_time = time.time() - start_time
+            
+            # Fix: Remove query history recording from SOS processor error path to prevent duplicates
+            # Query history for failed queries is now recorded in main.py for all processing paths
+            # This prevents duplicate entries with mismatched data
+            
+            # Fallback event recording is disabled
+            
+            return ProcessingResult(
+                selected_response=f"Sorry, I couldn't process that query: {str(e)}",
+                local_response=None,
+                api_response=None,
+                processing_mode="processing_error",
+                selection_reasoning=f"Error during processing: {str(e)}",
+                local_confidence=0.0,
+                api_confidence=0.0,
+                processing_time=processing_time,
+                model_used="error",
+                local_model_name=None,
+                api_model_name=None,
+                local_processing_time=None,
+                api_processing_time=None
+            )
+
             
             # Fallback event recording is disabled
             
@@ -1791,6 +1959,78 @@ class HybridProcessor:
             #     except Exception as record_error:
             #         self.logger.error(f"[AI_TRAINING] Failed to record hybrid turn with new recorder: {record_error}")
             pass  # Properly close the finally block
+
+
+    def _record_user_query(self, chat_id: int, content: str, processing_time_ms: Optional[int] = None,
+                          tokens_used: Optional[int] = None, model_name: Optional[str] = None) -> Optional[int]:
+        """
+        Record a user query message in the dashboard_messages table.
+        
+        Args:
+            chat_id: Chat identifier
+            content: User query content
+            processing_time_ms: Processing time in milliseconds
+            tokens_used: Number of tokens used
+            model_name: Model name used
+            
+        Returns:
+            Message ID of the newly created message or None if failed
+        """
+        try:
+            message_id = self.dashboard_recorder.record_user_query(
+                chat_id=chat_id,
+                content=content,
+                processing_time_ms=processing_time_ms,
+                tokens_used=tokens_used,
+                model_name=model_name
+            )
+            
+            if message_id:
+                self.logger.info(f"Recorded user query message {message_id} for chat {chat_id}")
+            else:
+                self.logger.warning(f"Failed to record user query message for chat {chat_id}")
+                
+            return message_id
+        except Exception as e:
+            self.logger.error(f"Error recording user query: {str(e)}")
+            return None
+
+    def _record_ai_response(self, chat_id: int, content: str, processing_time_ms: Optional[int] = None,
+                           tokens_used: Optional[int] = None, model_name: Optional[str] = None,
+                           status: str = 'success') -> Optional[int]:
+        """
+        Record an AI response message in the dashboard_messages table.
+        
+        Args:
+            chat_id: Chat identifier
+            content: AI response content
+            processing_time_ms: Processing time in milliseconds
+            tokens_used: Number of tokens used
+            model_name: Model name used
+            status: Message status ('success', 'error', 'timeout')
+            
+        Returns:
+            Message ID of the newly created message or None if failed
+        """
+        try:
+            message_id = self.dashboard_recorder.record_ai_response(
+                chat_id=chat_id,
+                content=content,
+                processing_time_ms=processing_time_ms,
+                tokens_used=tokens_used,
+                model_name=model_name,
+                status=status
+            )
+            
+            if message_id:
+                self.logger.info(f"Recorded AI response message {message_id} for chat {chat_id}")
+            else:
+                self.logger.warning(f"Failed to record AI response message for chat {chat_id}")
+                
+            return message_id
+        except Exception as e:
+            self.logger.error(f"Error recording AI response: {str(e)}")
+            return None
 
     # Confidence threshold calibration method
     def calibrate_confidence_thresholds(self, query_analysis: Dict) -> Dict:
@@ -2249,19 +2489,88 @@ class HybridProcessor:
 
 
     def assess_query_complexity(self, user_query: str, analysis: Dict) -> str:
-        complexity_factors = {
-            'multiple_entities': len(analysis.get('entities', {}).get('companies', [])) +
-                                 len(analysis.get('entities', {}).get('floors', [])) > 2,
-            'date_operations': bool(analysis.get('entities', {}).get('dates')),
-            'aggregations': bool(analysis.get('entities', {}).get('aggregations')),
-            'ctl_codes': bool(analysis.get('entities', {}).get('ctl_codes')),
-            'multiple_metrics': len(analysis.get('entities', {}).get('metrics', [])) > 1,
-            'ambiguous_intent': analysis.get('intent_confidence', 1.0) < 0.7
-        }
-        complexity_score = sum(complexity_factors.values())
-        if complexity_score >= 4:
-            return "api_preferred"
-        elif complexity_score >= 2:
+        """Assess query complexity to determine processing mode."""
+        # Simple heuristic: if query mentions multiple entities or has complex logic, use hybrid
+        complexity_indicators = [
+            'compare', 'versus', 'vs', 'and', 'with', 'between',
+            'trend', 'analysis', 'over time', 'monthly', 'weekly',
+            'defect', 'production', 'efficiency', 'dhu'
+        ]
+        
+        if any(indicator in user_query.lower() for indicator in complexity_indicators):
             return "hybrid_parallel"
         else:
             return "local_preferred"
+
+    def _record_token_usage(self, chat_id: int, message_id: int, response) -> None:
+        """
+        Record token usage for a DeepSeek API response.
+        
+        Args:
+            chat_id: Chat identifier
+            message_id: Message identifier
+            response: DeepSeekResponse object containing token usage data
+        """
+        try:
+            self.logger.info(f"_record_token_usage called with chat_id={chat_id}, message_id={message_id}, response={type(response)}")
+            # Extract token usage data from response
+            if hasattr(response, 'metadata') and isinstance(response.metadata, dict):
+                token_usage = response.metadata.get('token_usage', {})
+                self.logger.info(f"Token usage from response metadata: {token_usage}")
+                if isinstance(token_usage, dict) and token_usage:
+                    prompt_tokens = token_usage.get('prompt_tokens', 0)
+                    completion_tokens = token_usage.get('completion_tokens', 0)
+                    total_tokens = token_usage.get('total_tokens', 0)
+                    
+                    self.logger.info(f"Extracted token data: prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}")
+                    
+                    # Only record if we have token data
+                    if total_tokens > 0:
+                        # Calculate cost based on token usage
+                        cost_usd = (
+                            prompt_tokens * 0.0000001 +  # Prompt token cost
+                            completion_tokens * 0.0000002 +  # Completion token cost
+                            0.0001  # Base model cost per request
+                        )
+                        
+                        self.logger.info(f"Calculated cost: ${round(cost_usd, 6)}")
+                        
+                        # Get database type from chat
+                        database_type = None
+                        if self.dashboard_recorder:
+                            try:
+                                chat = self.dashboard_recorder.dashboard_service.chats.get_chat_by_id(chat_id)
+                                database_type = chat.get('database_type') if chat else None
+                            except Exception as e:
+                                self.logger.error(f"Error getting database type for token usage recording: {str(e)}")
+                        
+                        # Record token usage in dashboard
+                        if self.dashboard_recorder:
+                            self.logger.info("Calling dashboard_recorder.record_token_usage")
+                            usage_id = self.dashboard_recorder.record_token_usage(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                model_type="api",
+                                model_name=getattr(response, 'model', 'unknown'),
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens,
+                                total_tokens=total_tokens,
+                                cost_usd=round(cost_usd, 6),
+                                database_type=database_type
+                            )
+                            
+                            if usage_id:
+                                self.logger.info(f"Recorded token usage {usage_id} for chat {chat_id}, message {message_id}: "
+                                           f"{total_tokens} tokens, ${round(cost_usd, 6)} cost")
+                            else:
+                                self.logger.warning(f"Failed to record token usage for chat {chat_id}, message {message_id}")
+                        else:
+                            self.logger.warning("No dashboard_recorder available for token usage recording")
+                    else:
+                        self.logger.info("Not recording token usage - total tokens is zero or negative")
+                else:
+                    self.logger.info("No valid token usage data in response")
+            else:
+                self.logger.info("Response doesn't have valid metadata for token usage")
+        except Exception as e:
+            self.logger.error(f"Error recording token usage: {str(e)}", exc_info=True)

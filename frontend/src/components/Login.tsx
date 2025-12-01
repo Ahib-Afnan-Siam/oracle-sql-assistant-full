@@ -18,62 +18,16 @@ const Login = () => {
     setLoading(true);
     setError("");
     
-    // Check for admin credentials by making a request to the backend
-    if (username === "AdminMIS" && password === "mis123") {
-      try {
-        const response = await fetch("/api/login", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            username: username,
-            password: password,
-          }),
-        });
-        
-        const data = await response.json();
-        
-        if (response.ok && data.success) {
-          setSuccess(true);
-          // Store token in localStorage
-          localStorage.setItem("authToken", data.token);
-          localStorage.setItem("isAdmin", data.isAdmin ? "true" : "false");
-          // Redirect to admin dashboard
-          setTimeout(() => {
-            window.location.href = "/admin";
-          }, 1000);
-        } else {
-          setError(data.message || "Admin login failed");
-          // Trigger shake animation on error
-          const card = document.querySelector('.login-card');
-          if (card) {
-            card.classList.add('shake');
-            setTimeout(() => {
-              card.classList.remove('shake');
-            }, 500);
-          }
-        }
-      } catch (err) {
-        setError("Network error. Please try again.");
-        // Trigger shake animation on error
-        const card = document.querySelector('.login-card');
-        if (card) {
-          card.classList.add('shake');
-          setTimeout(() => {
-            card.classList.remove('shake');
-          }, 500);
-        }
-        console.error("Admin login error:", err);
-      } finally {
-        setLoading(false);
-      }
+    // Validate that username is provided
+    if (!username) {
+      setError("Username is required");
+      setLoading(false);
       return;
     }
     
-    // Validate that username is a number (employee ID) for regular users
-    if (!/^\d+$/.test(username)) {
-      setError("Username must be a valid employee ID number");
+    // Validate that password is provided
+    if (!password) {
+      setError("Password is required");
       setLoading(false);
       return;
     }
@@ -97,7 +51,8 @@ const Login = () => {
         // Store token in localStorage
         localStorage.setItem("authToken", data.token);
         localStorage.setItem("isAdmin", data.isAdmin ? "true" : "false");
-        // Redirect to main app
+        
+        // Always redirect to chat panel for all users
         setTimeout(() => {
           window.location.href = "/app";
         }, 1000);

@@ -8,7 +8,7 @@ import { BarChart, Table as TableIcon } from "lucide-react"; // Added icon impor
 import { motion, AnimatePresence } from "framer-motion"; // Added framer-motion import
 
 function ChatPanel() {
-  const { messages, mode } = useChat();
+  const { messages, mode, lastIds } = useChat();
 
   // ---- Visualization state ----
   const [showVisualization, setShowVisualization] = useState(false);
@@ -91,6 +91,11 @@ function ChatPanel() {
                   <UnifiedFeedbackBox 
                     messageId={(m as any).id}
                     hybridMetadata={(m as any).hybrid_metadata}
+                    turnId={lastIds?.turn_id} // Pass turnId explicitly
+                    sqlSampleId={lastIds?.sql_sample_id}
+                    summary_sample_id={lastIds?.summary_sample_id} // Fixed property name
+                    chatId={lastIds?.chat_id} // Pass chatId explicitly
+                    messageIdForFeedback={lastIds?.message_id} // Pass messageId explicitly
                   />
                 </div>
               )}
