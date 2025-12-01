@@ -2,28 +2,28 @@
   {
     "id": "source_db_1",
     "type": "oracle",
-    "host": "172.17.2.111",
-    "port": 1521,
+    "host": "172.17.*.***",
+    "port": ****,
     "service_name": "PRAN",
-    "user": "sos",
-    "password": "sos"
+    "user": "***",
+    "password": "***"
   },
   {
     "id": "source_db_2",
     "type": "oracle",
-    "host": "172.17.8.24",
-    "port": 1530,
+    "host": "172.17.*.**",
+    "port": ****,
     "service_name": "BDEV",
-    "user": "apps",
-    "password": "apps"
+    "user": "****",
+    "password": "****"
   },
   {
     "id": "source_db_3",
     "type": "oracle",
-    "host": "172.17.8.106",
-    "port": 1615,
+    "host": "172.17.*.***",
+    "port": ****,
     "service_name": "EDEV",
-    "user": "apps",
-    "password": "apps"
+    "user": "****",
+    "password": "****"
   }
 ]
