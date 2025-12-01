@@ -1,4 +1,5 @@
 # Oracle SQL Assistant - Advanced AI Chatbot System
+<img width="3497" height="1041" alt="Uttoron 1-01_v2" src="https://github.com/user-attachments/assets/38b0aa9d-fe44-4345-ad41-f84e68a0de81" />
 
 ## Overview
 
@@ -56,6 +57,7 @@ The Oracle SQL Assistant is an intelligent AI chatbot that transforms natural la
 ## Authentication
 
 The application uses JWT (JSON Web Tokens) for secure authentication:
+<img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/9e46e422-ba78-48cb-80f8-c5b0e9ed2ee3" />
 
 1. Users log in with username and password
 2. On successful authentication, the server generates a JWT token
@@ -164,6 +166,7 @@ oracle-sql-assistant/
 - **Monitoring**: Oracle Enterprise Manager for performance tracking
 
 ## AI Chatbot API Endpoints
+<img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/9d2936d1-621b-4258-a7ad-18e80e43b3b8" />
 
 ### Authentication & User Management
 - `POST /login` - User authentication, returns secure JWT token
@@ -450,6 +453,7 @@ Advanced capabilities for handling technical database queries:
 - **No Hardcoding Principle**: All implementations are fully dynamic and AI-driven without fixed templates
 
 ## Chatbot Analytics & Monitoring
+<img width="1366" height="768" alt="image" src="https://github.com/user-attachments/assets/1426bd60-6af4-4516-8ae5-ee8452691eb6" />
 
 - Real-time conversation metrics and user engagement tracking
 - AI model token usage monitoring and cost analysis
